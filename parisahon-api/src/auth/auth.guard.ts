@@ -86,7 +86,7 @@ export class AuthGuard implements CanActivate {
       throw new UnauthorizedException();
     }
 
-    let payload: { sub?: number; exp?: number };
+    let payload: { sub?: number; exp?: number; tv?: number };
     try {
       payload = await this.jwtService.verifyAsync(token, {
         secret: process.env.JWT_SECRET,
@@ -108,11 +108,17 @@ export class AuthGuard implements CanActivate {
       .addSelect('u.role', 'role')
       .addSelect('u.permissions', 'permissions')
       .addSelect('u.group_id', 'group_id')
+      .addSelect('u.token_version', 'token_version')
       .where('u.id = :id', { id })
       .andWhere('u.deleted_at IS NULL')
       .getRawOne();
 
     if (!row || !AuthGuard.AGENT_LEVEL.includes(row.role)) {
+      throw new UnauthorizedException();
+    }
+
+    // signed out everywhere (password change, logout, rights change) after this token was issued
+    if (Number(payload.tv ?? 0) !== Number(row.token_version ?? 0)) {
       throw new UnauthorizedException();
     }
 

@@ -1,4 +1,8 @@
 import {
+  CanActivate,
+  ExecutionContext,
+  Injectable,
+  UseGuards,
   BadRequestException,
   Body,
   Controller,
@@ -37,6 +41,25 @@ import { parseRecordingName, plausibleCallTime } from './recording-name';
  * GET /calls/recorder — whose recorder token this is (the FTP receiver checks the
  * password of an FTP login with it).
  */
+
+/**
+ * POST /calls/upload: refuses a request without a valid credential BEFORE multer writes the file
+ * (up to 50 MB) to disk. Which user the upload belongs to is still decided in the handler.
+ */
+@Injectable()
+export class CallsUploadAuthGuard implements CanActivate {
+  constructor(private calls: CallsService) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const req: Request = context.switchToHttp().getRequest();
+    const recorder = String(req.headers['x-recorder-token'] ?? '').trim();
+    if (recorder && (await this.calls.userOfToken(recorder, false))) return true;
+    if (TelegramServiceTokenGuard.tokenMatches(req)) return true;
+    if (CallsService.serviceTokenMatches(req.headers['x-calls-service-token'])) return true;
+    throw new UnauthorizedException();
+  }
+}
+
 @Public()
 @Controller('calls')
 export class CallsUploadController {
@@ -50,6 +73,7 @@ export class CallsUploadController {
   }
 
   @Post('upload')
+  @UseGuards(CallsUploadAuthGuard)
   @UseInterceptors(
     FileFieldsInterceptor([{ name: 'file', maxCount: 1 }, { name: 'meta', maxCount: 1 }], {
       storage: diskStorage({

@@ -6,13 +6,15 @@ import { SeedService } from './seed/seed.service';
 import { FileService } from './file/file.service';
 import * as express from 'express';
 import * as process from 'process';
+import { corsOrigin } from './helper/cors';
 
 async function bootstrap() {
   process.env.TZ = 'Asia/Karachi';
   const app = await NestFactory.create(AppModule);
 
   app.setGlobalPrefix('/api/v1');
-  app.enableCors();
+  app.enableCors({ origin: corsOrigin, credentials: false });
+  app.getHttpAdapter().getInstance().disable('x-powered-by');
   // `whitelist: true` is deliberately NOT enabled yet. Checked against the
   // compiled DTOs with this very pipe: it would silently drop data that the
   // services rely on, because three DTOs do not declare what they receive:

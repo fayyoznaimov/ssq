@@ -18,6 +18,6 @@ export class LoginUserDto {
 
   @ValidateIf((o) => o.role !== RoleEnum.CTR_AGENT)
   @IsNotEmpty()
-  @Length(3, 255)
+  @Length(10, 255)
   password: string;
 }

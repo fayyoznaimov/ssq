@@ -190,6 +190,10 @@ export class User {
   wa_id: string;
 
   // client's profile photo from Telegram / WhatsApp: a file name in public/uploads
+  // raised to sign the user out everywhere (see migrations/1795100000000-token-version.ts)
+  @Column({ type: 'integer', default: 0, select: false })
+  token_version: number;
+
   @Column({ type: 'varchar', length: 255, nullable: true, default: null })
   avatar: string;
 

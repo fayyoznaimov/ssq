@@ -1,3 +1,4 @@
+import { corsOrigin } from '../helper/cors';
 import { Logger } from '@nestjs/common';
 import {
   OnGatewayConnection,
@@ -37,7 +38,7 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
  * Payload: a whitelisted summary, never the entity that the caller passed in
  * (TaskService passes JSON.stringify(savedTask) with nested user objects).
  */
-@WebSocketGateway({ cors: { origin: '*' } })
+@WebSocketGateway({ cors: { origin: corsOrigin } })
 export class NotificationGateWay
   implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer() server: Server;

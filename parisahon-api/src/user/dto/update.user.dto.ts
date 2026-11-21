@@ -38,7 +38,7 @@ export class UpdateUserDto extends LoginUserDto {
 
   @IsOptional()
   @IsNotEmpty()
-  @Length(3, 255)
+  @Length(10, 255)
   password: string;
 
   @IsOptional()
@@ -88,6 +88,6 @@ export class ChangeOwnPasswordDto {
   old_password: string;
 
   @IsString()
-  @Length(8, 255)
+  @Length(10, 255)
   new_password: string;
 }

@@ -301,9 +301,10 @@ export class UserService {
       );
     }
 
+    // the new password signs out every other device (token_version, see AuthGuard)
     await this.userRepository.update(
       { id: user.id },
-      { password: await bcrypt.hash(data.new_password, 10) },
+      { password: await bcrypt.hash(data.new_password, 10), token_version: () => 'token_version + 1' } as any,
     );
   }
 
@@ -359,6 +360,12 @@ export class UserService {
     user.email = data.email;
     user.phone = data.phone;
 
+    // a new password, role or rights signs the account out everywhere (token_version, see AuthGuard)
+    const signOut =
+      !!data.password ||
+      user.role !== data.role ||
+      JSON.stringify(user.permissions ?? null) !== JSON.stringify(data.permissions ?? null);
+
     if (data.password) {
       user.password = await bcrypt.hash(data.password, salt);
     }
@@ -369,6 +376,14 @@ export class UserService {
     user.updated_by = performer;
 
     await this.userRepository.save(user);
+    if (signOut) {
+      await this.userRepository
+        .createQueryBuilder()
+        .update(User)
+        .set({ token_version: () => 'token_version + 1' } as any)
+        .where('id = :id', { id: user.id })
+        .execute();
+    }
     return;
   }
 
