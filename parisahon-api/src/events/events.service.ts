@@ -51,6 +51,7 @@ export class EventsService {
   async fetchDealEvents(
     deal_id: number,
     query: SearchEventDto,
+    canReadMail = true,
   ): Promise<PaginationResponseDto<Event[]>> {
     // 404 for missing and (soft) deleted deals
     await this.helperService.getById(Deal, deal_id);
@@ -59,7 +60,17 @@ export class EventsService {
       .createQueryBuilder('t0')
       .where('t0.deal_id = :deal_id', { deal_id });
 
-    return this.applyEventFilters(query, qb);
+    const page = await this.applyEventFilters(query, qb);
+    if (!canReadMail) {
+      // the "mail" switch of the user card is off: an e-mail stays in the history, its text does not
+      for (const event of page.data ?? []) {
+        if (event.type === EventTypes.NEW_EMAIL) {
+          event.after_state = { hidden: true, reason: 'no_mail_access' };
+          event.before_state = null;
+        }
+      }
+    }
+    return page;
   }
 
   /**
@@ -279,11 +290,11 @@ export class EventsService {
     return false;
   }
 
-  async markAsReplied(event_id: number): Promise<void> {
+  async markAsReplied(event_id: number, deal_id?: number): Promise<void> {
     const result = await this.eventRepository
       .createQueryBuilder()
       .update(Event)
-      .where({ id: event_id })
+      .where(deal_id === undefined ? 'id = :event_id' : 'id = :event_id AND deal_id = :deal_id', { event_id, deal_id })
       .set({ replied_at: () => 'CURRENT_TIMESTAMP' })
       .execute();
 

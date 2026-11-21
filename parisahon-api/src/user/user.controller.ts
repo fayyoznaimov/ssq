@@ -11,6 +11,7 @@ import {
   Query,
   Req,
 } from '@nestjs/common';
+import { RecordAccess } from '../auth/access';
 import { Request } from 'express';
 import { UserService } from './user.service';
 import { CreateUserDto } from './dto/create.user.dto';
@@ -65,11 +66,13 @@ export class UserController {
 
   /** Every deal a contact is linked to (tab "Сделки" of the contact card). */
   @Get(':id/deals')
+  @RecordAccess('staffData', 'view')
   async fetchUserDeals(@Param('id', ParseIntPipe) id: number) {
     return this.clientHistory.forContact(id);
   }
 
   @Get(':id/events')
+  @RecordAccess('staffData', 'view')
   async fetchUserEvents(
     @Param('id', ParseIntPipe) id: number,
     @Query() query: SearchEventDto,
@@ -100,6 +103,7 @@ export class UserController {
   }
 
   @Get(':id/files')
+  @RecordAccess('staffData', 'view')
   async fetchUserFiles(
     @Param('id', ParseIntPipe) id: number,
     @Query() query: PaginationRequestDto,
@@ -108,6 +112,7 @@ export class UserController {
   }
 
   @Get(':id/recordings')
+  @RecordAccess('staffData', 'view')
   async getAgentCallRecordings(
     @Param('id', ParseIntPipe) id: number,
     @Query() query: PaginationRequestDto,
@@ -139,6 +144,7 @@ export class UserController {
   }
 
   @Patch(':id')
+  @RecordAccess('contact', 'update')
   async update(
     @Body() data: UpdateUserDto,
     @Param('id', ParseIntPipe) id: number,
@@ -148,6 +154,7 @@ export class UserController {
   }
 
   @Delete(':id')
+  @RecordAccess('contact', 'delete')
   async delete(
     @Param('id', ParseIntPipe) id: number,
     @Req() request: Request,

@@ -1,5 +1,6 @@
 import { ClientHistoryService } from '../deal/client-history.service';
 import {
+  ForbiddenException,
   Body,
   Controller,
   Delete,
@@ -12,6 +13,7 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
+import { Access, RecordAccess } from '../auth/access';
 import { CompanyService } from './company.service';
 import { CreateCompanyDto } from './dto/create.company.dto';
 import {
@@ -51,10 +53,14 @@ export class CompanyController {
     @Body() data: CreateCompanyDto,
     @Req() request: Request,
   ): Promise<Record<string, any>> {
+    if (!new Access(request['user']).can('company', 'create')) {
+      throw new ForbiddenException('No right to create companies');
+    }
     return instanceToPlain(this.companyService.create(data, request));
   }
 
   @Get(':id')
+  @RecordAccess('company', 'view')
   async fetchById(
     @Param('id', ParseIntPipe) id: number,
   ): Promise<Record<string, any>> {
@@ -63,11 +69,13 @@ export class CompanyController {
 
   /** Every deal of the company: its own and those of its contacts (deals from Telegram / WhatsApp have no company). */
   @Get(':id/deals')
+  @RecordAccess('company', 'view')
   async fetchCompanyDeals(@Param('id', ParseIntPipe) id: number) {
     return this.clientHistory.forCompany(id);
   }
 
   @Get(':id/events')
+  @RecordAccess('company', 'view')
   async fetchCompanyEvents(
     @Param('id', ParseIntPipe) id: number,
     @Query() query: SearchEventDto,
@@ -76,6 +84,7 @@ export class CompanyController {
   }
 
   @Get(':id/agent/:agent_id/source')
+  @RecordAccess('company', 'view')
   async fetchSourceOfAgent(
     @Param() params: { id: string; agent_id: string },
     @Query() query: PaginationRequestDto,
@@ -90,6 +99,7 @@ export class CompanyController {
   }
 
   @Patch(':id')
+  @RecordAccess('company', 'update')
   async update(
     @Body() data: CreateCompanyFlatDto,
     @Param('id', ParseIntPipe) id: number,
@@ -99,11 +109,13 @@ export class CompanyController {
   }
 
   @Delete(':id')
+  @RecordAccess('company', 'delete')
   async delete(@Param('id', ParseIntPipe) id: number): Promise<void> {
     return this.companyService.delete(id);
   }
 
   @Delete('fillers/:id')
+  @RecordAccess('companyFiller', 'update')
   async deleteCompanyFiller(
     @Param('id', ParseIntPipe) id: number,
   ): Promise<void> {

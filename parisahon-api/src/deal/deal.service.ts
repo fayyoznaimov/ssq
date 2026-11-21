@@ -1,3 +1,4 @@
+import { Access } from '../auth/access';
 import {
   ForbiddenException,
   Injectable,
@@ -109,11 +110,15 @@ export class DealService {
     private eventEmitter: EventEmitter2,
   ) {}
 
-  async fetchAll(query: SearchDealDto): Promise<PaginationResponseDto<Deal[]>> {
+  async fetchAll(query: SearchDealDto, user?: AuthUser): Promise<PaginationResponseDto<Deal[]>> {
     const qb = this.applyFiltersToQb(
       this.dealRepository.createQueryBuilder('t0'),
       query,
     );
+    if (user) {
+      const visible = new Access(user).dealSql('t0', 'view');
+      qb.andWhere(visible.sql, visible.params);
+    }
 
     return this.helperService.withPagination(
       this.helperService.withRelations(qb, DealListRelations, 't0'),
@@ -460,11 +465,15 @@ export class DealService {
     return deal;
   }
 
-  async fetchDealStats(query: SearchDealDto): Promise<Record<string, any>> {
+  async fetchDealStats(query: SearchDealDto, user?: AuthUser): Promise<Record<string, any>> {
     const qb = this.applyFiltersToQb(
       this.dealRepository.createQueryBuilder('t0'),
       query,
     );
+    if (user) {
+      const visible = new Access(user).dealSql('t0', 'view');
+      qb.andWhere(visible.sql, visible.params);
+    }
 
     // Deleted deals are not part of main_query: TypeORM adds "deleted_at IS NULL"
     qb.select('t0.id', 'id');

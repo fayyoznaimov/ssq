@@ -20,6 +20,7 @@ import { CreateProductDto } from './dto/create.product.dto';
 import { Request } from 'express';
 import { UpdateProductDto } from './dto/update.product.dto';
 import { AuthGuard } from '../auth/auth.guard';
+import { Roles } from '../auth/decorator/roles.decorator';
 import { instanceToPlain } from 'class-transformer';
 import { SearchProductDto } from './dto/search.product.dto';
 
@@ -67,11 +68,13 @@ export class ProductController {
   }
 
   @Delete(':id')
+  @Roles(AuthGuard.MANAGER_LEVEL)
   async deleteProduct(@Param('id', ParseIntPipe) id: number): Promise<void> {
     return this.productService.deleteProduct(id);
   }
 
   @Delete('fillers/:id')
+  @Roles(AuthGuard.MANAGER_LEVEL)
   async deleteProductFiller(
     @Param('id', ParseIntPipe) id: number,
   ): Promise<void> {

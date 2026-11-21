@@ -1,4 +1,5 @@
 import {
+  ForbiddenException,
   Body,
   Controller,
   Delete,
@@ -12,12 +13,14 @@ import {
   UploadedFiles,
   UseGuards,
 } from '@nestjs/common';
+import { RecordAccess } from '../auth/access';
 import { DealService } from './deal.service';
 import { ClientHistoryService } from './client-history.service';
 import { Request } from 'express';
 import { CreateDealDto } from './dto/create.deal.dto';
 import { UpdateDealDto, UpdateStageOfDeal } from './dto/update.deal.dto';
 import { AuthGuard } from '../auth/auth.guard';
+import { Access, DealAccess } from '../auth/access';
 import { instanceToPlain } from 'class-transformer';
 import { EventsService } from '../events/events.service';
 import { CreateCommentDto } from '../events/dto/create.comment.dto';
@@ -41,15 +44,16 @@ export class DealController {
   ) {}
 
   @Get()
-  async fetchAll(@Query() query: SearchDealDto): Promise<Record<string, any>> {
-    return instanceToPlain(this.dealService.fetchAll(query));
+  async fetchAll(@Query() query: SearchDealDto, @Req() request: Request): Promise<Record<string, any>> {
+    return instanceToPlain(this.dealService.fetchAll(query, request['user']));
   }
 
   @Get('/stats')
   async fetchDealStats(
     @Query() query: SearchDealDto,
+    @Req() request: Request,
   ): Promise<Record<string, any>> {
-    return instanceToPlain(this.dealService.fetchDealStats(query));
+    return instanceToPlain(this.dealService.fetchDealStats(query, request['user']));
   }
 
   @Get('available-filters')
@@ -59,11 +63,13 @@ export class DealController {
 
   /** "Клиент" block of the deal card: the client's contacts, company and other deals. */
   @Get(':id/client-history')
+  @DealAccess('view')
   async clientHistoryOf(@Param('id', ParseIntPipe) id: number) {
     return this.clientHistory.forDeal(id);
   }
 
   @Get(':id')
+  @DealAccess('view')
   async fetchOneById(
     @Param('id', ParseIntPipe) id: number,
   ): Promise<Record<string, any>> {
@@ -71,11 +77,15 @@ export class DealController {
   }
 
   @Get(':id/events')
+  @DealAccess('view')
   async fetchDealEvents(
     @Param('id', ParseIntPipe) id: number,
     @Query() query: SearchEventDto,
+    @Req() request: Request,
   ): Promise<Record<string, any>> {
-    return instanceToPlain(this.eventService.fetchDealEvents(id, query));
+    return instanceToPlain(
+      this.eventService.fetchDealEvents(id, query, new Access(request['user']).canReadMail),
+    );
   }
 
   @Patch('events/remap')
@@ -87,10 +97,12 @@ export class DealController {
   }
 
   @Patch(':id/events/:event_id')
+  @DealAccess('update')
   async markAsReplied(
+    @Param('id', ParseIntPipe) dealId: number,
     @Param('event_id', ParseIntPipe) id: number,
   ): Promise<void> {
-    return this.eventService.markAsReplied(id);
+    return this.eventService.markAsReplied(id, dealId);
   }
 
   @Post()
@@ -98,10 +110,14 @@ export class DealController {
     @Body() data: CreateDealDto,
     @Req() request: Request,
   ): Promise<Record<string, any>> {
+    if (!new Access(request['user']).can('deal', 'create')) {
+      throw new ForbiddenException('No right to create deals');
+    }
     return instanceToPlain(this.dealService.create(request['user'].sub, data));
   }
 
   @Post(':id/comments')
+  @DealAccess('update')
   @UploadFiles()
   async postComment(
     @UploadedFiles() files: Array<Express.Multer.File>,
@@ -122,6 +138,7 @@ export class DealController {
   }
 
   @Patch(':id/comments/:event_id')
+  @DealAccess('update')
   @UploadFiles()
   async updateComment(
     @UploadedFiles() files: Array<Express.Multer.File>,
@@ -147,6 +164,7 @@ export class DealController {
   }
 
   @Delete(':id/comments/:event_id')
+  @DealAccess('update')
   async deleteComment(
     @Param('id', ParseIntPipe) id: number,
     @Param('event_id', ParseIntPipe) event_id: number,
@@ -156,6 +174,7 @@ export class DealController {
   }
 
   @Post(':id/message')
+  @DealAccess('update')
   @UploadFiles()
   async postChatMessage(
     @UploadedFiles() files: Array<Express.Multer.File>,
@@ -176,6 +195,7 @@ export class DealController {
   }
 
   @Patch(':id')
+  @DealAccess('update')
   async update(
     @Body() data: UpdateDealDto,
     @Param('id', ParseIntPipe) id: number,
@@ -185,6 +205,7 @@ export class DealController {
   }
 
   @Patch(':id/stage')
+  @DealAccess('update')
   async updateStage(
     @Body() data: UpdateStageOfDeal,
     @Param('id', ParseIntPipe) id: number,
@@ -203,6 +224,7 @@ export class DealController {
   }
 
   @Delete('fillers/:id')
+  @RecordAccess('dealFiller', 'update')
   async deleteCompanyFiller(
     @Param('id', ParseIntPipe) id: number,
   ): Promise<void> {
@@ -210,6 +232,7 @@ export class DealController {
   }
 
   @Get(':id/files')
+  @DealAccess('view')
   async getFiles(
     @Param('id', ParseIntPipe) id: number,
     @Query() query: PaginationRequestDto,
@@ -218,6 +241,7 @@ export class DealController {
   }
 
   @Get(':id/files/:file_id')
+  @DealAccess('view')
   async getSingleFile(
     @Param('id', ParseIntPipe) deal_id: number,
     @Param('file_id', ParseIntPipe) file_id: number,
@@ -228,6 +252,7 @@ export class DealController {
   }
 
   @Post(':id/files')
+  @DealAccess('update')
   @UploadFiles()
   async uploadFile(
     @UploadedFiles() files: Array<Express.Multer.File>,
@@ -245,6 +270,7 @@ export class DealController {
   }
 
   @Delete(':id/files/:file_id')
+  @DealAccess('update')
   deleteSingleFile(
     @Param('id', ParseIntPipe) deal_id: number,
     @Param('file_id', ParseIntPipe) file_id: number,

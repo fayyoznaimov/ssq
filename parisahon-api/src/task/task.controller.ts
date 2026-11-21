@@ -11,6 +11,7 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
+import { RecordAccess } from '../auth/access';
 import { TaskService } from './task.service';
 import { AuthGuard } from '../auth/auth.guard';
 import { CreateTaskDto } from './dto/create.task.dto';
@@ -51,6 +52,7 @@ export class TaskController {
   }
 
   @Patch(':id')
+  @RecordAccess('task', 'update')
   async update(
     @Body() data: CreateTaskDto,
     @Param('id', ParseIntPipe) id: number,
@@ -61,6 +63,7 @@ export class TaskController {
   }
 
   @Patch(':id/close')
+  @RecordAccess('task', 'update')
   async close(
     @Body() data: CloseTaskDto,
     @Param('id', ParseIntPipe) id: number,
@@ -70,6 +73,7 @@ export class TaskController {
   }
 
   @Delete(':id')
+  @RecordAccess('task', 'delete')
   async delete(@Param('id', ParseIntPipe) id: number): Promise<void> {
     return this.taskService.delete(id);
   }
