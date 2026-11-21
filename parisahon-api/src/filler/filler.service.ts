@@ -4,7 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { ChildFiller, Filler } from './filler.entity';
+import { ChildFiller, Filler, FillableTablesEnum } from './filler.entity';
 import { In, Repository } from 'typeorm';
 import { UpdateFillerDto } from './dto/update.filler.dto';
 import { CompanyFiller } from '../company/company.filler.entity';
@@ -36,6 +36,8 @@ export class FillerService {
    */
   async getFillersHashMap(
     childFillers: ChildFiller[],
+    // whose fields these must be: a contact's field cannot be attached to a company
+    target?: FillableTablesEnum,
   ): Promise<Map<number, Filler>> {
     const requestedFillerIds = [
       ...new Set(childFillers.map((childFiller) => childFiller.filler_id)),
@@ -46,6 +48,13 @@ export class FillerService {
       this.throwExceptionWithNonExistingFillers(
         requestedFillerIds,
         existingFillers,
+      );
+    }
+
+    const foreign = target ? existingFillers.filter((filler) => filler.target !== target) : [];
+    if (foreign.length) {
+      throw new BadRequestException(
+        `Доп. поля ${foreign.map((f) => f.id).join(', ')} относятся к другой сущности`,
       );
     }
 

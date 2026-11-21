@@ -7,6 +7,7 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { CreateProductFillerDto } from './create.product.dto';
+import { Trim } from '../../helper/validators';
 
 export class UpdateProductFillerDto {
   @IsNumber()
@@ -18,6 +19,7 @@ export class UpdateProductFillerDto {
 }
 
 export class UpdateProductDto {
+  @Trim()
   @IsString()
   @Length(1, 255)
   name: string;

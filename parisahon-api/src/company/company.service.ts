@@ -589,7 +589,7 @@ export class CompanyService {
       await this.helperService.extractUserFromRequest(request);
 
     if (data.fillers.length !== 0) {
-      const fillers = await this.fillerService.getFillersHashMap(data.fillers);
+      const fillers = await this.fillerService.getFillersHashMap(data.fillers, FillableTablesEnum.COMPANY);
 
       newCompany.company_fillers = this.createCompanyFillers(
         fillers,
@@ -622,7 +622,7 @@ export class CompanyService {
         );
         newCtrAgent.user_fillers = agentFillers.length
           ? this.userService.createUserFillers(
-              await this.fillerService.getFillersHashMap(agentFillers),
+              await this.fillerService.getFillersHashMap(agentFillers, FillableTablesEnum.USER),
               agentFillers,
             )
           : [];
@@ -804,6 +804,39 @@ export class CompanyService {
         companyFiller.value = newFillerValue;
       }
     });
+
+    // Values for extra fields the company has none for yet (fillers_create was accepted and ignored before)
+    const toCreate = ((data as any).fillers_create ?? []).filter(
+      (f: { filler_id?: number; value?: string }) => f?.filler_id && String(f.value ?? '').trim(),
+    );
+    if (toCreate.length) {
+      const fillers = await this.fillerService.getFillersHashMap(toCreate, FillableTablesEnum.COMPANY);
+      const existing = await this.companyFillerRepository.find({
+        where: { company: { id } },
+        relations: { filler: true },
+      });
+      const fresh: CompanyFiller[] = [];
+      for (const item of toCreate) {
+        const value = String(item.value).trim();
+        const filler = fillers.get(item.filler_id);
+        const row = existing.find((e) => e.filler?.id === item.filler_id);
+        if (row) {
+          if (row.value !== value) {
+            updatedFields.push(new Field(filler.field, value, row.value));
+            row.value = value;
+            fresh.push(row);
+          }
+          continue;
+        }
+        const created = new CompanyFiller();
+        created.value = value;
+        created.filler = filler;
+        created.company = { id } as Company;
+        updatedFields.push(new Field(filler.field, value, null));
+        fresh.push(created);
+      }
+      if (fresh.length) await this.companyFillerRepository.save(fresh);
+    }
 
     const originated_by =
       await this.helperService.extractUserFromRequest(request);

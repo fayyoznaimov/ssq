@@ -263,8 +263,15 @@ export class ContactService {
     }
 
     if (data.phone) {
-      queries.push(`phone ILIKE $${argumentNumber}`);
-      argumentToValues.set(argumentNumber, `%${data.phone}%`);
+      // "+998 90 111 00 03" finds "+998901110003": digits are compared
+      const digits = String(data.phone).replace(/[^0-9]/g, '');
+      if (digits) {
+        queries.push(`regexp_replace(COALESCE(phone, ''), '[^0-9]', '', 'g') LIKE $${argumentNumber}`);
+        argumentToValues.set(argumentNumber, `%${digits}%`);
+      } else {
+        queries.push(`phone ILIKE $${argumentNumber}`);
+        argumentToValues.set(argumentNumber, `%${data.phone}%`);
+      }
       argumentNumber++;
     }
 

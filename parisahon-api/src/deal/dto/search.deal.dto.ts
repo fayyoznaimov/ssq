@@ -10,7 +10,7 @@ import {
   Min,
   ValidateNested,
 } from 'class-validator';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 
 export enum TaskTypes {
   TODAY = 'today',
@@ -241,8 +241,9 @@ export class SearchDealDto extends PaginationRequestDto {
   closed_before: Date;
 
   @IsOptional()
+  // stages=5 is the same as stages[]=5
+  @Transform(({ value }) => (value === undefined || value === null ? value : (Array.isArray(value) ? value : [value]).map(Number)))
   @IsArray()
-  @Type(() => Number)
   @IsInt({ each: true })
   stages: number[];
 

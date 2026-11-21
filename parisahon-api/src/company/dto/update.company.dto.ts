@@ -13,6 +13,7 @@ import { CreateCompanyFillerDto } from './create.company.dto';
 import { Type } from 'class-transformer';
 import { CompanyRequisitesDto } from './company.requisites.dto';
 import { UpdateUserDto } from 'src/user/dto/update.user.dto';
+import { EmptyToUndefined, IsPhoneLike, Trim } from '../../helper/validators';
 
 export class UpdateCompanyFillerDto {
   @IsNumber()
@@ -24,6 +25,7 @@ export class UpdateCompanyFillerDto {
 }
 
 export class UpdateCompanyDto {
+  @Trim()
   @IsString()
   @Length(3, 255)
   name: string;
@@ -38,8 +40,10 @@ export class UpdateCompanyDto {
   @IsBoolean()
   is_old: boolean;
 
+  @EmptyToUndefined()
   @IsOptional()
   @IsString()
+  @IsPhoneLike()
   @Length(3, 255)
   phone: string;
 

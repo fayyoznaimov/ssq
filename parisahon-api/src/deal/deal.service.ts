@@ -1,15 +1,14 @@
 import {
   ForbiddenException,
   Injectable,
-  NotFoundException,
-} from '@nestjs/common';
+  NotFoundException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Deal } from './deal.entity';
 import { DataSource, In, Repository, SelectQueryBuilder } from 'typeorm';
 import { CreateDealDto, LinkProductsDto } from './dto/create.deal.dto';
 import { UserService } from '../user/user.service';
 import { HelperService } from '../helper/helper.service';
-import { User } from '../user/user.entity';
+import { User, RoleEnum } from '../user/user.entity';
 import { DealStageService } from '../deal_stage/deal_stage.service';
 import { Company } from '../company/company.entity';
 import { FillerService } from '../filler/filler.service';
@@ -138,7 +137,7 @@ export class DealService {
     const where: string[] = [];
 
     if (query.label) {
-      where.push(`t0.label ILIKE ${params.add(`%${query.label}%`)}`);
+      where.push(`t0.label ILIKE ${params.add(`%${DealService.likeText(query.label)}%`)}`);
     }
 
     if (query.display_id) {
@@ -590,6 +589,29 @@ export class DealService {
     await this.createDealStageRecord(deal, stage);
   }
 
+  /** "%" and "_" typed into a search box are text, not wildcards. */
+  static likeText(value: string): string {
+    return String(value).replace(/[\\%_]/g, (ch) => '\\' + ch);
+  }
+
+  /** The responsible is an employee, the clients of the deal are contacts — not the other way round. */
+  private static assertDealPeople(people: Map<number, User>, agentId?: number, contactIds?: number[]): void {
+    if (agentId !== undefined && agentId !== null) {
+      const agent = people.get(agentId);
+      if (!agent) throw new BadRequestException(`Сотрудник ${agentId} не найден`);
+      if (agent.role === RoleEnum.CTR_AGENT) {
+        throw new BadRequestException('Ответственным за сделку может быть только сотрудник, а не контакт клиента');
+      }
+    }
+    for (const id of contactIds ?? []) {
+      const contact = people.get(id);
+      if (!contact) throw new BadRequestException(`Контакт ${id} не найден`);
+      if (contact.role !== RoleEnum.CTR_AGENT) {
+        throw new BadRequestException('Клиентом сделки может быть только контакт, а не сотрудник');
+      }
+    }
+  }
+
   async create(
     creator_id: number,
     data: CreateDealDto,
@@ -600,6 +622,7 @@ export class DealService {
     const users = await this.userService.findByIds(userIds);
     // HashMap with ids linked to entities
     const usersMap = this.helperService.createHashMap<User>(users);
+    DealService.assertDealPeople(usersMap, data.agent_id, data.ctr_agent_ids);
 
     // Company is optional: deals created from mail / telegram have none
     const company = data.company_id
@@ -634,6 +657,7 @@ export class DealService {
     }
     const fillerIdsToEntities = await this.fillerService.getFillersHashMap(
       data.fillers,
+      FillableTablesEnum.DEAL,
     );
     newDeal.deal_fillers = this.createDealFillers(
       fillerIdsToEntities,
@@ -749,6 +773,7 @@ export class DealService {
     const users =
       userIds.length > 0 ? await this.userService.findByIds(userIds) : [];
     const userMap = this.helperService.createHashMap<User>(users);
+    DealService.assertDealPeople(userMap, data.agent_id, data.ctr_agent_ids);
 
     const company =
       data.company_id !== undefined
@@ -792,7 +817,7 @@ export class DealService {
     const fillersToCreate = data.fillers_create ?? [];
     const fillerIdsToEntities =
       fillersToCreate.length > 0
-        ? await this.fillerService.getFillersHashMap(fillersToCreate)
+        ? await this.fillerService.getFillersHashMap(fillersToCreate, FillableTablesEnum.DEAL)
         : new Map<number, Filler>();
 
     /**

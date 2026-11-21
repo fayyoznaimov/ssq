@@ -156,7 +156,7 @@ export class ProductService {
     );
 
     if (data.fillers.length > 0) {
-      const fillers = await this.fillerService.getFillersHashMap(data.fillers);
+      const fillers = await this.fillerService.getFillersHashMap(data.fillers, FillableTablesEnum.PRODUCT);
       newProduct.product_fillers = this.createProductFillers(
         fillers,
         data.fillers,
@@ -194,6 +194,7 @@ export class ProductService {
     const productFillers = await this.getProductFillersByIds(productFillerIds);
     const fillerIdsToEntities = await this.fillerService.getFillersHashMap(
       data.fillers_create,
+      FillableTablesEnum.PRODUCT,
     );
 
     // Update necessary product fillers

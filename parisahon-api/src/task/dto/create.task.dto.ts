@@ -14,6 +14,7 @@ import { User } from '../../user/user.entity';
 import { Group } from '../../group/group.entity';
 import { Type } from '@nestjs/common';
 import { Type as TypeDecorator } from 'class-transformer';
+import { Trim } from '../../helper/validators';
 
 export type ExchangeableEntities = Company | User | Group | Deal;
 
@@ -69,6 +70,7 @@ export class LinkToDto {
 }
 
 export class CreateTaskDto {
+  @Trim()
   @IsString()
   @Length(3, 255)
   label: string;

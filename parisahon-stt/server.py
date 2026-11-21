@@ -57,6 +57,8 @@ THREADS = int(os.environ.get("STT_THREADS", "4"))
 BEAM = int(os.environ.get("STT_BEAM", "1"))
 LANGUAGES = [x.strip() for x in os.environ.get("STT_LANGUAGES", "ru,uz").split(",") if x.strip()]
 PROMPT = os.environ.get("STT_PROMPT", "").strip() or None
+# STT_MIN_PROB: below this language probability the speech is treated as not one of STT_LANGUAGES (empty text)
+MIN_PROB = float(os.environ.get("STT_MIN_PROB", "0"))
 MAX_SEC = float(os.environ.get("STT_MAX_SEC", "300"))
 MAX_BYTES = int(os.environ.get("STT_MAX_BYTES", str(25 * 1024 * 1024)))
 QUEUE_SEC = float(os.environ.get("STT_QUEUE_SEC", "90"))
@@ -148,6 +150,11 @@ def transcribe(data: bytes, max_sec: float):
             return 200, {"text": "", "language": None, "language_probability": 0, "duration": duration, "seconds": round(time.time() - started, 1)}
         speech = np.concatenate([audio[c["start"]:c["end"]] for c in chunks])
         language, probability = pick_language(model, speech)
+        if MIN_PROB and probability < MIN_PROB:
+            seconds = round(time.time() - started, 1)
+            log.info("rejected %.1f s: best allowed language %s has probability %.2f < %.2f (%.1f s)", duration, language, probability, MIN_PROB, seconds)
+            return 200, {"text": "", "language": None, "language_probability": round(probability, 3), "unsupported_language": True,
+                         "duration": duration, "seconds": seconds}
         # the speech without the pauses, exactly what the detector saw: its encoder output is reused
         segments, _ = model.transcribe(speech, language=language, beam_size=BEAM, vad_filter=False,
                                        condition_on_previous_text=False, initial_prompt=PROMPT)

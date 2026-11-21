@@ -11,6 +11,7 @@ import {
 } from 'class-validator';
 import { ChildFiller } from '../../filler/filler.entity';
 import { Type } from 'class-transformer';
+import { EmptyToUndefined, IsPhoneLike, Trim } from '../../helper/validators';
 
 export class CreateDealFillerDto implements ChildFiller {
   @IsNumber()
@@ -26,17 +27,27 @@ export class LinkProductsDto {
   product_id: number;
 
   @IsNumber()
+  @Min(0)
+  @Max(Number.MAX_SAFE_INTEGER)
   quantity: number;
 
   @IsNumber()
+  @Min(0)
+  @Max(Number.MAX_SAFE_INTEGER)
   price: number;
 }
 
 export class CreateDealDto {
+  // empty is allowed: a deal made from a letter is named by its number
+  @Trim()
   @IsString()
+  @Length(0, 255)
   label: string;
 
-  @IsNumber()
+  // a whole amount: the column is bigint
+  @IsInt()
+  @Min(0)
+  @Max(Number.MAX_SAFE_INTEGER)
   budget: number;
 
   /** A number of one's own; without it the deal gets the next one (max + 1) */

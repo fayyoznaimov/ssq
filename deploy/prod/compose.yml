@@ -1,0 +1,82 @@
+# New version of the CRM (2026-11-21), next to the old one in /root/crm. Same database (crm-db), same uploads.
+services:
+  crm2-app:
+    build:
+      context: .
+      dockerfile: api.Dockerfile
+    image: crm2-api:ffmpeg
+    container_name: crm2-app
+    working_dir: /app
+    command: node dist/main.js
+    restart: unless-stopped
+    env_file: ./parisahon-api/.env
+    volumes:
+      - ./parisahon-api:/app
+      - /root/crm/parisahon-api/public/uploads:/app/public/uploads
+      - /root/crm/parisahon-api/keys:/app/keys:ro
+      - /root/crm/parisahon-telegram-service/ffmpeg-6.1-amd64-static:/opt/ffmpeg:ro
+      - ./claude:/opt/claude:ro
+      - ./claude-home:/root/.claude
+    networks: [crm-network]
+  crm2-telegram:
+    build: ./parisahon-telegram-service
+    container_name: crm2-telegram
+    restart: unless-stopped
+    env_file: ./telegram.env
+    volumes:
+      - ./tg-data:/data
+      - /root/crm/parisahon-api/public/uploads:/app/uploads
+    networks: [crm-network]
+  crm2-whatsapp:
+    image: node:20-bookworm-slim
+    container_name: crm2-whatsapp
+    working_dir: /app
+    command: node src/index.js
+    restart: unless-stopped
+    env_file: ./whatsapp.env
+    volumes:
+      - ./parisahon-whatsapp-service:/app
+      - ./wa-sessions:/data/sessions
+      - /root/crm/parisahon-api/public/uploads:/app/uploads
+      - /root/crm/parisahon-telegram-service/ffmpeg-6.1-amd64-static:/opt/ffmpeg:ro
+    networks: [crm-network]
+  crm2-stt:
+    image: python:3.11-slim
+    container_name: crm2-stt
+    working_dir: /app
+    command: /venv/bin/python -u /app/server.py
+    restart: unless-stopped
+    mem_limit: 1800m
+    environment:
+      STT_HOST: 0.0.0.0
+      STT_PORT: "8096"
+      STT_MODEL: small
+      STT_MODELS_DIR: /models
+      STT_THREADS: "2"
+      STT_LANGUAGES: ru,en
+      STT_MIN_PROB: "0.8"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      TZ: Asia/Karachi
+    volumes:
+      - ./parisahon-stt:/app
+      - ./stt-venv:/venv
+      - ./stt-models:/models
+    networks: [crm-network]
+  crm2-ftp:
+    image: python:3.11-slim
+    container_name: crm2-ftp
+    working_dir: /app
+    command: /venv/bin/python -u /app/server.py
+    restart: unless-stopped
+    env_file: ./ftp.env
+    ports:
+      - "2121:2121"
+      - "21210-21219:21210-21219"
+    volumes:
+      - ./parisahon-ftp:/app
+      - ./ftp-venv:/venv
+      - ./ftp-data:/data
+    networks: [crm-network]
+networks:
+  crm-network:
+    external: true

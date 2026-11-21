@@ -435,6 +435,7 @@ export class UserService {
     request: Request,
   ): Promise<User> {
     const company = await this.helperService.getById(Company, data.company_id);
+    await this.assertPhoneIsFree(data.phone);
     const newCtrAgent = new User();
 
     newCtrAgent.username = data.username;
@@ -453,10 +454,28 @@ export class UserService {
       FillableTablesEnum.USER,
       data.fillers,
     );
-    const fillers = await this.fillerService.getFillersHashMap(data.fillers);
+    const fillers = await this.fillerService.getFillersHashMap(data.fillers, FillableTablesEnum.USER);
     newCtrAgent.user_fillers = this.createUserFillers(fillers, data.fillers);
 
     return this.userRepository.save(newCtrAgent);
+  }
+
+  /**
+   * Telegram, WhatsApp and call recordings find the client by the digits of the phone:
+   * two contacts with one number make them pick the wrong one.
+   */
+  async assertPhoneIsFree(phone: string | null | undefined, exceptId?: number): Promise<void> {
+    const digits = String(phone ?? '').replace(/[^0-9]/g, '');
+    if (digits.length < 7) return;
+    const qb = this.userRepository
+      .createQueryBuilder('u')
+      .where('u.role = :role', { role: RoleEnum.CTR_AGENT })
+      .andWhere("regexp_replace(COALESCE(u.phone, ''), '[^0-9]', '', 'g') = :digits", { digits });
+    if (exceptId) qb.andWhere('u.id <> :exceptId', { exceptId });
+    const same = await qb.getOne();
+    if (same) {
+      throw new BadRequestException(`Контакт с таким телефоном уже есть: ${same.username} (№${same.id})`);
+    }
   }
 
   async updateCtrAgent(
@@ -465,6 +484,7 @@ export class UserService {
     data: UpdateUserDto,
   ): Promise<void> {
     const company = await this.helperService.getById(Company, data.company_id);
+    if (data.phone !== ctrAgent.phone) await this.assertPhoneIsFree(data.phone, ctrAgent.id);
 
     /**
      * This is later used to add events that the fields were updated in deal history
@@ -511,6 +531,7 @@ export class UserService {
       // Create necessary user fillers
       const fillers = await this.fillerService.getFillersHashMap(
         data.fillers_create,
+        FillableTablesEnum.USER,
       );
       data.fillers_create.forEach((filler) => {
         const newUserFiller = new UserFiller();

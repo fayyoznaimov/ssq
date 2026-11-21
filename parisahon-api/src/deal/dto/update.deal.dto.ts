@@ -5,10 +5,13 @@ import {
   IsOptional,
   IsString,
   Length,
+  Max,
+  Min,
   ValidateNested,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { CreateDealFillerDto, LinkProductsDto } from './create.deal.dto';
+import { Trim } from '../../helper/validators';
 
 export class UpdateDealFillerDto {
   @IsNumber()
@@ -30,12 +33,15 @@ export class UpdateDealFillerDto {
  */
 export class UpdateDealDto {
   @IsOptional()
+  @Trim()
   @IsString()
   @Length(1, 255)
   label?: string;
 
   @IsOptional()
-  @IsNumber()
+  @IsInt()
+  @Min(0)
+  @Max(Number.MAX_SAFE_INTEGER)
   budget?: number;
 
   @IsOptional()

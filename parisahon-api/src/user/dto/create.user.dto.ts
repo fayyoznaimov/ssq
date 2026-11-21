@@ -15,6 +15,7 @@ import { LoginUserDto } from '../../auth/dto/login.user.dto';
 import { CreateUserPermissionsDto } from './create.user.permissions.dto';
 import { Type } from 'class-transformer';
 import { ChildFiller } from '../../filler/filler.entity';
+import { Trim } from '../../helper/validators';
 
 export class CreateUserFillerDto implements ChildFiller {
   @IsNumber()
@@ -30,6 +31,7 @@ export class CreateUserDto extends LoginUserDto {
   @IsEnum(RoleEnum)
   role: RoleEnum;
 
+  @Trim()
   @IsString()
   @Length(3, 255)
   username: string;

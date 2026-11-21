@@ -11,7 +11,7 @@ import {
 import { Type } from 'class-transformer';
 import { CompanyRequisitesDto } from './company.requisites.dto';
 import { ChildFiller } from '../../filler/filler.entity';
-import { User } from 'src/user/user.entity';
+import { EmptyToUndefined, IsPhoneLike, Trim } from '../../helper/validators';
 
 export class CreateCompanyFillerDto implements ChildFiller {
   @IsNumber()
@@ -21,7 +21,34 @@ export class CreateCompanyFillerDto implements ChildFiller {
   @Length(1, 255)
   value: string;
 }
+/**
+ * A contact created together with its company. Before, `users` was typed as the User entity,
+ * which has no validation decorators: an empty name, the e-mail "bad" and the phone "abc" went in.
+ * Fields this class does not list (fillers, avatar ...) still pass: `whitelist` is off.
+ */
+export class CompanyContactDto {
+  @Trim()
+  @IsString()
+  @Length(2, 255)
+  username: string;
+
+  @EmptyToUndefined()
+  @IsOptional()
+  @IsEmail()
+  @Length(3, 255)
+  email?: string;
+
+  @EmptyToUndefined()
+  @IsOptional()
+  @IsString()
+  @IsPhoneLike()
+  phone?: string;
+
+  [key: string]: any;
+}
+
 export class CreateCompanyDto extends CompanyRequisitesDto {
+  @Trim()
   @IsString()
   @Length(3, 255)
   name: string;
@@ -35,8 +62,10 @@ export class CreateCompanyDto extends CompanyRequisitesDto {
   @Length(3, 255)
   email: string;
 
+  @EmptyToUndefined()
   @IsOptional()
   @IsString()
+  @IsPhoneLike()
   @Length(3, 255)
   phone: string;
 
@@ -47,7 +76,7 @@ export class CreateCompanyDto extends CompanyRequisitesDto {
 
   @IsOptional()
   @ValidateNested({ each: true })
-  @Type(() => User)
+  @Type(() => CompanyContactDto)
   @IsArray()
-  users: User[];
+  users: CompanyContactDto[];
 }

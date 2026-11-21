@@ -15,6 +15,7 @@ import { LoginUserDto } from '../../auth/dto/login.user.dto';
 import { CreateUserPermissionsDto } from './create.user.permissions.dto';
 import { Type } from 'class-transformer';
 import { CreateUserFillerDto } from './create.user.dto';
+import { Trim } from '../../helper/validators';
 
 export class UpdateUserFillerDto {
   @IsNumber()
@@ -30,6 +31,7 @@ export class UpdateUserDto extends LoginUserDto {
   @IsEnum(RoleEnum)
   role: RoleEnum;
 
+  @Trim()
   @IsString()
   @Length(3, 255)
   username: string;

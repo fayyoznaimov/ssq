@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DefaultTaskRelations, Task } from './task.entity';
 import { DataSource, Repository } from 'typeorm';
@@ -6,9 +6,8 @@ import { HelperService } from '../helper/helper.service';
 import {
   CreateTaskDto,
   TargetToEntityAttributeMapping,
-  TargetToEntityMapping,
-} from './dto/create.task.dto';
-import { User } from '../user/user.entity';
+  TargetToEntityMapping, ViableAssignTargets } from './dto/create.task.dto';
+import { User, RoleEnum } from '../user/user.entity';
 import { TaskType as TaskTypeEntity } from '../task_type/task_type.entity';
 import { PaginationResponseDto } from '../helper/dto/pagination.dto';
 import { CloseTaskDto } from './dto/close.task.dto';
@@ -253,10 +252,17 @@ export class TaskService {
     data: CreateTaskDto,
     creator?: User,
   ): Promise<Task> {
+    if (new Date(data.end_time).getTime() < new Date(data.start_time).getTime()) {
+      throw new BadRequestException('Срок задачи раньше её начала');
+    }
+
     // Assign newTask to a Group/User[role=agent]
     const assignTargetEntity = TargetToEntityMapping[data.assign_to.target];
-    task[TargetToEntityAttributeMapping[data.assign_to.target]] =
-      await this.helperService.getById(assignTargetEntity, data.assign_to.id);
+    const assignee = await this.helperService.getById(assignTargetEntity, data.assign_to.id);
+    if (data.assign_to.target === ViableAssignTargets.AGENT && (assignee as User).role === RoleEnum.CTR_AGENT) {
+      throw new BadRequestException('Исполнителем задачи может быть только сотрудник, а не контакт клиента');
+    }
+    task[TargetToEntityAttributeMapping[data.assign_to.target]] = assignee;
 
     // Link newTask to a Company/Deal/User[role=ctr_agent]
     const linkTargetEntity = TargetToEntityMapping[data.link_to.target];

@@ -7,6 +7,7 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ChildFiller } from '../../filler/filler.entity';
+import { Trim } from '../../helper/validators';
 
 export class CreateProductFillerDto implements ChildFiller {
   @IsNumber()
@@ -18,6 +19,7 @@ export class CreateProductFillerDto implements ChildFiller {
 }
 
 export class CreateProductDto {
+  @Trim()
   @IsString()
   @Length(1, 255)
   name: string;

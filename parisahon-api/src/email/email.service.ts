@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, HttpException, Injectable, Logger } from '@nestjs/common';
 import { Request } from 'express';
 import { PaginationResponseDto } from '../helper/dto/pagination.dto';
 import { HelperService } from '../helper/helper.service';
@@ -29,6 +29,8 @@ import { MailTransporterService } from './mail-transporter.service';
  */
 @Injectable()
 export class EmailService {
+  private readonly logger = new Logger(EmailService.name);
+
   constructor(
     private sync: MailSyncService,
     private mailbox: MailboxService,
@@ -46,7 +48,12 @@ export class EmailService {
   ): Promise<PaginationResponseDto<Email[]>> {
     const user = await this.helperService.extractUserFromRequest(request);
 
-    await this.sync.syncAllMailboxes();
+    // the mail server may be away or not set up for this user: the letters already stored are shown anyway
+    try {
+      await this.sync.syncAllMailboxes();
+    } catch (error) {
+      this.logger.warn(`mail sync: ${(error as Error)?.message ?? error}`);
+    }
 
     return this.mailbox.fetchLocalEmails(query, user);
   }
@@ -69,8 +76,13 @@ export class EmailService {
     return this.mailbox.deleteEmail(id, user);
   }
 
-  getEmailFolders() {
-    return this.mailbox.getEmailFolders();
+  async getEmailFolders() {
+    try {
+      return await this.mailbox.getEmailFolders();
+    } catch (error) {
+      if (error instanceof HttpException) throw error;
+      throw new BadRequestException('Почтовый сервер недоступен или почта не настроена');
+    }
   }
 
   fetchEmailTo(query: FetchEmailToDto) {
