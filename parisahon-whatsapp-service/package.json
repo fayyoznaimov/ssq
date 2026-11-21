@@ -1,0 +1,19 @@
+{
+  "name": "parisahon-whatsapp-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Connects the managers' own WhatsApp accounts (Baileys, WhatsApp Web protocol) to the Parisa CRM",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test tests/"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "sharp": "0.35.5"
+  }
+}

@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  crm-telegram:
+    build: .
+    container_name: crm-telegram
+    # порт наружу не публикуем: 3030 на хосте занят api сайта, а crm-app
+    # ходит сюда по имени контейнера внутри сети crm-network
+    volumes:
+      - /root/crm/parisahon-telegram-service:/app
+      - /root/crm/parisahon-api/public/uploads:/app/uploads # Modify this depending on your setup
+    networks:
+      - crm-network
+
+networks:
+  crm-network:
+    external: true

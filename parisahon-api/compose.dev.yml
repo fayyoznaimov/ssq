@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  crm-app:
+    build: .
+    container_name: crm-app
+    depends_on:
+      - crm-db 
+    volumes:
+      - .:/app
+    networks:
+      - crm-network
+
+  crm-db:
+    image: postgres:16.3
+    container_name: crm-db 
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_DB: ${POSTGRES_DATABASE}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - crm-network
+    env_file:
+      - .env
+
+  nginx:
+    image: nginx:1.27.0
+    container_name: crm-nginx
+    ports:
+     - "443:443"
+    volumes:
+      - ./public/uploads:/usr/share/nginx/html/api/v1/uploads:ro
+      - ../parisahon-client/app/.output/public:/usr/share/nginx/html/client:ro
+      - ./docker/nginx/nginx.dev.conf:/etc/nginx/nginx.conf:ro
+      - ./keys/server.crt:/etc/nginx/ssl/server.crt:ro
+      - ./keys/server.key:/etc/nginx/ssl/server.key:ro
+    networks:
+      - crm-network
+
+volumes:
+  postgres_data:
+
+networks:
+    crm-network:
+        external: true

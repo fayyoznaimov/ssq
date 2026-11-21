@@ -1,0 +1,6 @@
+# Speech-to-text service of the CRM bot (server.py). CPU only, Python 3.10+.
+faster-whisper==1.2.1
+ctranslate2==4.9.0
+# PyAV 16+ dropped an argument faster-whisper 1.2.1 passes to av.open()
+av==15.1.0
+numpy

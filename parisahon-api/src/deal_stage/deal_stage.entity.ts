@@ -1,0 +1,60 @@
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  CreateDateColumn,
+  OneToMany,
+  ManyToOne,
+  JoinColumn,
+  Index,
+} from 'typeorm';
+import { Deal } from '../deal/deal.entity';
+import { Trigger } from '../trigger/trigger.entity';
+import { DealStageCollection } from './deal_stage.collection.entity';
+import { DealStageRecord } from './deal_stage.records.entity';
+
+@Index('IDX_deal_stage_collection', ['collection'])
+@Entity({ name: 'deal_stage' })
+export class DealStage {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column({ type: 'varchar', length: 255 })
+  name: string;
+
+  @Column({ type: 'varchar', length: 255, nullable: true })
+  color: string;
+
+  @OneToMany(() => Deal, (deal) => deal.stage)
+  deals: Deal[];
+
+  @OneToMany(
+    () => DealStageRecord,
+    (dealStageRecord) => dealStageRecord.stage,
+    { cascade: true },
+  )
+  deal_records: DealStageRecord[];
+
+  @ManyToOne(
+    () => DealStageCollection,
+    (collection) => collection.deal_stages,
+    {
+      nullable: true,
+      onDelete: 'CASCADE',
+    },
+  )
+  @JoinColumn({ name: 'collection_id' })
+  collection: DealStageCollection;
+
+  @Column({ type: 'smallint', nullable: true })
+  order: number;
+
+  @Column({ type: 'varchar', length: 1000, nullable: true })
+  description: string;
+
+  @OneToMany(() => Trigger, (trigger) => trigger.deal_stage)
+  triggers: Trigger[];
+
+  @CreateDateColumn()
+  created_at: Date;
+}

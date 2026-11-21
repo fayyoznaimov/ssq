@@ -1,0 +1,3 @@
+# FTP server (pure Python); pyOpenSSL is what its FTPS (AUTH TLS) handler needs
+pyftpdlib==2.2.0
+pyOpenSSL==26.4.0

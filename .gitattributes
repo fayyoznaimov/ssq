@@ -1,0 +1,2 @@
+local/fake-claude/claude text eol=lf
+*.sh text eol=lf

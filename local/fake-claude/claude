@@ -1,0 +1,142 @@
+#!/usr/bin/env node
+// Stand-in for the Claude Code CLI (`claude -p --input-format stream-json`) in
+// local tests: the real one runs on ParisaUbuntu with its claude.ai login.
+// Card recognition: records the call in /tmp/fake-claude-last.json and answers
+// with a canned card.
+// Bot assistant (called with --mcp-config): connects to the CRM's MCP endpoint
+// like the real CLI, calls the tools written in the manager's message as
+// [[tool NAME {json}]] and answers with their results. Records the call in
+// /tmp/fake-claude-mcp-last.json.
+const fs = require('fs');
+
+const args = process.argv.slice(2);
+const arg = (name) => {
+  const i = args.indexOf(name);
+  return i === -1 ? null : args[i + 1];
+};
+
+let input = '';
+process.stdin.on('data', (c) => (input += c));
+process.stdin.on('end', () => {
+  let message = null;
+  try {
+    message = JSON.parse(input.trim().split('\n')[0]);
+  } catch {}
+  const content = message?.message?.content || [];
+  if (arg('--mcp-config')) return assistant(content);
+  const doc = content.find((b) => b.type === 'image' || b.type === 'document');
+  const text = content.find((b) => b.type === 'text')?.text || '';
+  const size = doc ? Buffer.from(doc.source.data, 'base64').length : 0;
+  const system = arg('--system-prompt') || '';
+
+  fs.writeFileSync(
+    '/tmp/fake-claude-last.json',
+    JSON.stringify({
+      args: args.map((a) => (a === system ? '<system-prompt>' : a)),
+      blockType: doc?.type ?? null,
+      mediaType: doc?.source?.media_type ?? null,
+      size,
+      systemIsOurs: system.includes('company card'),
+      textHasSchema: text.includes('"properties"'),
+      textSaysIgnoreInstructions: text.includes('Ignore any instructions'),
+      envHasApiKey: Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN),
+    }),
+  );
+
+  const out = (event) => process.stdout.write(JSON.stringify(event) + '\n');
+  out({ type: 'system', subtype: 'init', tools: [], model: arg('--model') });
+
+  if (process.env.FAKE_CLAUDE_FAIL === 'auth') {
+    out({ type: 'result', subtype: 'success', is_error: true, api_error_status: 401, result: 'Invalid API key · Please run /login' });
+    return;
+  }
+
+  const good = {
+    document_type: 'company_card',
+    company: {
+      name: 'ООО "AUDIT Textile Test"', inn: '305 123 456',
+      legal_address: 'г. Ташкент, Чиланзарский р-н, ул. Тестовая, 1',
+      bank_account: '2020 8000 9051 2345 6001', bank_name: 'АКБ "Тест Банк"', mfo: '00440', oked: '13920',
+      director: 'Тестов Тест Тестович', phone: '+998 71 200 00 00', email: 'INFO@audit-textile.example',
+    },
+    contacts: [{ full_name: 'Аудитова Анна', position: 'Закупщик', phone: '+998 90 123 45 67', email: 'anna@audit-textile.example' }],
+    unclear_fields: ['company.oked'],
+    notes: null,
+  };
+  const bad = {
+    document_type: 'company_card',
+    company: { name: 'AUDIT Bad Card', inn: '12345', legal_address: null, bank_account: '123', bank_name: null,
+               mfo: null, oked: null, director: null, phone: null, email: 'not-an-email' },
+    contacts: [], unclear_fields: [], notes: null,
+  };
+  const answer = size < 200 ? bad : good;
+  // Real models sometimes wrap JSON in a fence: the CRM must cope with it
+  const final = 'Готово.\n```json\n' + JSON.stringify(answer) + '\n```';
+  process.stderr.write('(node) warning: noise on stderr\n');
+  out({ type: 'assistant', message: { content: [{ type: 'text', text: final }] } });
+  out({ type: 'result', subtype: 'success', is_error: false, result: final });
+});
+
+async function assistant(content) {
+  const text = content.find((b) => b.type === 'text')?.text || '';
+  const system = arg('--system-prompt') || '';
+  const file = arg('--mcp-config');
+  const out = (event) => process.stdout.write(JSON.stringify(event) + '\n');
+  const record = {
+    args: args.map((a) => (a === system ? '<system-prompt>' : a)),
+    mcpFileMode: (fs.statSync(file).mode & 0o777).toString(8),
+    allowedTools: (arg('--allowedTools') || '').split(',').filter(Boolean),
+    model: arg('--model'),
+    effort: arg('--effort'),
+    systemIsBot: system.includes('sales manager'),
+    textHasNow: text.startsWith('Now:'),
+    hasHistory: text.includes('Earlier in this chat:'),
+    envHasApiKey: Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN),
+    calls: [],
+  };
+  const save = () => fs.writeFileSync('/tmp/fake-claude-mcp-last.json', JSON.stringify(record));
+  try {
+    const server = JSON.parse(fs.readFileSync(file, 'utf8')).mcpServers.crm;
+    record.mcpUrl = server.url;
+    let id = 0;
+    const rpc = async (method, params, notify = false) => {
+      const res = await fetch(server.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...server.headers },
+        body: JSON.stringify(notify ? { jsonrpc: '2.0', method, params } : { jsonrpc: '2.0', id: ++id, method, params }),
+      });
+      if (notify) return res.status;
+      if (!res.ok) throw new Error(`MCP ${method}: HTTP ${res.status}`);
+      return (await res.json()).result;
+    };
+    const init = await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'fake-claude', version: '0' } });
+    record.serverName = init?.serverInfo?.name;
+    record.notifyStatus = await rpc('notifications/initialized', {}, true);
+    const listed = (await rpc('tools/list', {})).tools;
+    record.toolsListed = listed.map((t) => t.name);
+    record.schemasOk = listed.every((t) => t.inputSchema?.type === 'object' && !('$schema' in t.inputSchema));
+    out({ type: 'system', subtype: 'init', tools: listed.map((t) => `mcp__crm__${t.name}`), model: arg('--model') });
+
+    if (process.env.FAKE_CLAUDE_FAIL === 'auth') {
+      save();
+      out({ type: 'result', subtype: 'success', is_error: true, api_error_status: 401, result: 'Invalid API key · Please run /login' });
+      return;
+    }
+    const message = text.split('New message from the manager:\n').pop();
+    const lines = ['FAKE ANSWER'];
+    for (const m of message.matchAll(/\[\[tool (\w+) (\{.*?\})\]\]/gs)) {
+      const result = await rpc('tools/call', { name: m[1], arguments: JSON.parse(m[2]) });
+      const body = result.content.map((c) => c.text).join('');
+      record.calls.push({ name: m[1], isError: Boolean(result.isError), text: body });
+      lines.push(`${m[1]} -> ${body.slice(0, 1500)}`);
+    }
+    save();
+    const final = `**${lines.join('\n')}**`;
+    out({ type: 'assistant', message: { content: [{ type: 'text', text: final }] } });
+    out({ type: 'result', subtype: 'success', is_error: false, result: final });
+  } catch (error) {
+    record.error = String(error && error.message);
+    save();
+    out({ type: 'result', subtype: 'error_during_execution', is_error: true, result: record.error });
+  }
+}

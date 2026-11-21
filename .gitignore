@@ -1,0 +1,50 @@
+# Data and secrets that must never reach git
+crm-db-prod-*.sql*
+local/secrets.env
+backups/
+parisahon-api/.env
+parisahon-api/'
+parisahon-api/public/uploads/
+parisahon-api/logs/
+parisahon-api/docker/nginx/*.bak.*
+parisahon-telegram-service/.env
+parisahon-telegram-service/*.db
+parisahon-telegram-service/recordings/
+parisahon-telegram-service/uploads
+parisahon-telegram-service/logs/
+parisahon-telegram-service/ffmpeg-6.1-*/
+parisahon-client/pnpm-lock.yaml
+
+# Build output and dependencies
+node_modules/
+dist/
+.nuxt/
+.output/
+.pnpm-store/
+__pycache__/
+*.log
+
+# Dev copy on the server (local/dev/setup.sh writes it: trial db password, dev secrets)
+local/dev/api.env
+local/dev/tg-venv/
+local/dev/telegram.env
+local/dev/telegram_service.db
+local/dev/telegram-logs/
+local/dev/whatsapp.env
+local/dev/whatsapp-sessions/
+local/dev/ftp.env
+local/dev/ftp/
+local/dev/mail-venv/
+local/dev/mail/cert.pem
+local/dev/mail/key.pem
+local/dev/bin/
+local/dev/.last-green
+local/dev/screens/
+local/dev/tools/
+
+# local docker stack: real values stay on the machine (see local/secrets.env.example)
+local/api.env
+local/LOCAL_LOGIN.txt
+
+# the audit lists weak spots of the live system and names of clients: kept on the server, not in a public repository
+docs/AUDIT.md

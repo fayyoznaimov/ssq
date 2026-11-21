@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  crm-telegram:
+    build: .
+    container_name: crm-telegram
+    volumes:
+      - .:/app
+      - ../parisahon-api/public/uploads:/app/uploads # Modify this depending on your setup
+    networks:
+      - crm-network
+
+networks:
+  crm-network:
+    external: true

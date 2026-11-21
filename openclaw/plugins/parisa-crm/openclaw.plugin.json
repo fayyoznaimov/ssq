@@ -1,0 +1,23 @@
+{
+  "id": "parisa-crm",
+  "name": "Parisa CRM",
+  "description": "Create companies and contacts in Parisa CRM from photos of company cards and business cards.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["apiUrl", "webUrl", "email", "password"],
+    "properties": {
+      "apiUrl": { "type": "string", "description": "CRM API base URL, e.g. http://crm-app:3000/api/v1" },
+      "webUrl": { "type": "string", "description": "CRM web URL used in links, e.g. http://localhost:4100" },
+      "email": { "type": "string", "description": "Login of the CRM service account" },
+      "password": { "type": "string", "description": "Password of the CRM service account" }
+    }
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": ["crm_check_card", "crm_create_company", "crm_add_contact"]
+  }
+}

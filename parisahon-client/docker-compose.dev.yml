@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  front:
+    build:
+      context: ./app
+      target: prod
+    volumes:
+      - .:/app
+    networks:
+      - crm-network
+
+
+networks:
+    crm-network:
+        external: true

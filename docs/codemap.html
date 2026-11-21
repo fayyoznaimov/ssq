@@ -1,0 +1,398 @@
+<!doctype html><html lang=ru><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Карта кода CRM</title>
+<style>body{font-family:system-ui,sans-serif;margin:16px;background:#0f172a;color:#e2e8f0}h1,h2{font-weight:600}h2{margin-top:32px}.mermaid{background:#fff;border-radius:8px;padding:12px;overflow:auto}table{border-collapse:collapse;font-size:13px}td,th{border:1px solid #334155;padding:4px 8px;text-align:left;vertical-align:top}</style>
+<script src='https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js'></script></head><body>
+<h1>Карта кода Parisa CRM</h1><p>Сгенерировано <code>local/dev/codemap.py</code> из исходников и базы.</p>
+<h2>Обзор: фронт → блоки API → таблицы</h2><pre class=mermaid>flowchart LR
+  WEB[&quot;Фронт&lt;br/&gt;parisahon-client/app&quot;]
+  TG[&quot;Telegram-сервис&lt;br/&gt;(Python)&quot;]
+  REC[&quot;Рекордер&lt;br/&gt;звонков&quot;]
+  B_Вход_и_права[&quot;&lt;b&gt;Вход и права&lt;/b&gt;&lt;br/&gt;Auth, User, Group&quot;]
+  D_Вход_и_права[(&quot;deal, file, group, user, user_filler&quot;)]
+  B_Вход_и_права --&gt; D_Вход_и_права
+  B_Сделки[&quot;&lt;b&gt;Сделки&lt;/b&gt;&lt;br/&gt;Deal, DealStage, Events, Trigger&quot;]
+  D_Сделки[(&quot;collection, company, deal, deal_filler, deal_stage, deal_stage_record, email, event, setting, task, trigger, trigger_run, user&quot;)]
+  B_Сделки --&gt; D_Сделки
+  B_Клиенты_и_справочники[&quot;&lt;b&gt;Клиенты и справочники&lt;/b&gt;&lt;br/&gt;Company, Contact, Product, Filler, Task, TaskType, Desktop, Linkable&quot;]
+  D_Клиенты_и_справочники[(&quot;company, company_filler, deal, filler, product, product_filler, task, task_type, user, user_filler&quot;)]
+  B_Клиенты_и_справочники --&gt; D_Клиенты_и_справочники
+  B_Каналы[&quot;&lt;b&gt;Каналы&lt;/b&gt;&lt;br/&gt;Email, Telegram, Bot, Calls, Recognition&quot;]
+  D_Каналы[(&quot;bot_account, bot_link_code, bot_reminder, call_upload, company, deal, email, email_template, email_to, email_transporter, event, file, recorder_token, recording, user&quot;)]
+  B_Каналы --&gt; D_Каналы
+  B_Отчёты[&quot;&lt;b&gt;Отчёты&lt;/b&gt;&lt;br/&gt;Analytics, Objective, Tracking&quot;]
+  D_Отчёты[(&quot;company, deal, deal_stage, deal_stage_record, event, group, recording, task, user&quot;)]
+  B_Отчёты --&gt; D_Отчёты
+  B_Служебные[&quot;&lt;b&gt;Служебные&lt;/b&gt;&lt;br/&gt;File, Helper, Messenger, NotificationGateWay, Notification, Seed, Setting, WhatsApp&quot;]
+  D_Служебные[(&quot;collection, deal, deal_stage, event, file, group, notification, setting, task_type, user&quot;)]
+  B_Служебные --&gt; D_Служебные
+  WEB --&gt; B_Вход_и_права
+  WEB --&gt; B_Каналы
+  WEB --&gt; B_Клиенты_и_справочники
+  WEB --&gt; B_Отчёты
+  WEB --&gt; B_Сделки
+  WEB --&gt; B_Служебные
+  TG --&gt;|POST /telegram/incoming&lt;br/&gt;POST /calls/upload| B_Каналы
+  REC --&gt;|POST /calls/upload| B_Каналы</pre>
+<h2>Блок «Вход и права»: страницы → модули → таблицы</h2><pre class=mermaid>flowchart LR
+  AuthModule[&quot;&lt;b&gt;Auth&lt;/b&gt;&lt;br/&gt;/auth&quot;]
+  UserModule[&quot;&lt;b&gt;User&lt;/b&gt;&lt;br/&gt;/users&quot;]
+  UserModule --&gt; T_deal[(&quot;deal&quot;)]
+  UserModule --&gt; T_file[(&quot;file&quot;)]
+  UserModule --&gt; T_user[(&quot;user&quot;)]
+  UserModule --&gt; T_user_filler[(&quot;user_filler&quot;)]
+  GroupModule[&quot;&lt;b&gt;Group&lt;/b&gt;&lt;br/&gt;/groups&quot;]
+  GroupModule --&gt; T_group[(&quot;group&quot;)]
+  W_analytics([&quot;analytics&quot;]) --&gt; UserModule
+  W_components_common([&quot;components/common&quot;]) --&gt; UserModule
+  W_components_company([&quot;components/company&quot;]) --&gt; UserModule
+  W_components_deal([&quot;components/deal&quot;]) --&gt; UserModule
+  W_components_mail([&quot;components/mail&quot;]) --&gt; UserModule
+  W_components_modals([&quot;components/modals&quot;]) --&gt; UserModule
+  W_deals([&quot;deals&quot;]) --&gt; UserModule
+  W_index([&quot;index&quot;]) --&gt; UserModule
+  W_lists([&quot;lists&quot;]) --&gt; UserModule
+  W_mails([&quot;mails&quot;]) --&gt; UserModule
+  W_profile([&quot;profile&quot;]) --&gt; GroupModule
+  W_profile([&quot;profile&quot;]) --&gt; UserModule
+  W_settings([&quot;settings&quot;]) --&gt; GroupModule
+  W_settings([&quot;settings&quot;]) --&gt; UserModule
+  W_tasks([&quot;tasks&quot;]) --&gt; UserModule
+  W_whatsapp([&quot;whatsapp&quot;]) --&gt; UserModule</pre>
+<h2>Блок «Сделки»: страницы → модули → таблицы</h2><pre class=mermaid>flowchart LR
+  DealModule[&quot;&lt;b&gt;Deal&lt;/b&gt;&lt;br/&gt;/deals&quot;]
+  DealModule --&gt; T_company[(&quot;company&quot;)]
+  DealModule --&gt; T_deal[(&quot;deal&quot;)]
+  DealModule --&gt; T_deal_filler[(&quot;deal_filler&quot;)]
+  DealModule --&gt; T_deal_stage_record[(&quot;deal_stage_record&quot;)]
+  DealStageModule[&quot;&lt;b&gt;DealStage&lt;/b&gt;&lt;br/&gt;/stages&quot;]
+  DealStageModule --&gt; T_collection[(&quot;collection&quot;)]
+  DealStageModule --&gt; T_deal[(&quot;deal&quot;)]
+  DealStageModule --&gt; T_deal_stage[(&quot;deal_stage&quot;)]
+  DealStageModule --&gt; T_setting[(&quot;setting&quot;)]
+  EventsModule[&quot;&lt;b&gt;Events&lt;/b&gt;&quot;]
+  EventsModule --&gt; T_deal[(&quot;deal&quot;)]
+  EventsModule --&gt; T_email[(&quot;email&quot;)]
+  EventsModule --&gt; T_event[(&quot;event&quot;)]
+  EventsModule --&gt; T_user[(&quot;user&quot;)]
+  TriggerModule[&quot;&lt;b&gt;Trigger&lt;/b&gt;&lt;br/&gt;/stages, /triggers&quot;]
+  TriggerModule --&gt; T_deal[(&quot;deal&quot;)]
+  TriggerModule --&gt; T_task[(&quot;task&quot;)]
+  TriggerModule --&gt; T_trigger[(&quot;trigger&quot;)]
+  TriggerModule --&gt; T_trigger_run[(&quot;trigger_run&quot;)]
+  W_components_common([&quot;components/common&quot;]) --&gt; DealModule
+  W_components_deal([&quot;components/deal&quot;]) --&gt; DealModule
+  W_components_deal([&quot;components/deal&quot;]) --&gt; DealStageModule
+  W_components_mail([&quot;components/mail&quot;]) --&gt; DealModule
+  W_components_modals([&quot;components/modals&quot;]) --&gt; DealStageModule
+  W_components_trigger([&quot;components/trigger&quot;]) --&gt; DealStageModule
+  W_deals([&quot;deals&quot;]) --&gt; DealModule
+  W_deals([&quot;deals&quot;]) --&gt; DealStageModule
+  W_lists([&quot;lists&quot;]) --&gt; DealStageModule
+  W_mails([&quot;mails&quot;]) --&gt; DealModule
+  W_mails([&quot;mails&quot;]) --&gt; DealStageModule
+  W_settings([&quot;settings&quot;]) --&gt; DealStageModule
+  W_tasks([&quot;tasks&quot;]) --&gt; DealStageModule</pre>
+<h2>Блок «Клиенты и справочники»: страницы → модули → таблицы</h2><pre class=mermaid>flowchart LR
+  CompanyModule[&quot;&lt;b&gt;Company&lt;/b&gt;&lt;br/&gt;/companies&quot;]
+  CompanyModule --&gt; T_company[(&quot;company&quot;)]
+  CompanyModule --&gt; T_company_filler[(&quot;company_filler&quot;)]
+  CompanyModule --&gt; T_deal[(&quot;deal&quot;)]
+  CompanyModule --&gt; T_user[(&quot;user&quot;)]
+  ContactModule[&quot;&lt;b&gt;Contact&lt;/b&gt;&lt;br/&gt;/contacts&quot;]
+  ContactModule --&gt; T_company[(&quot;company&quot;)]
+  ContactModule --&gt; T_company_filler[(&quot;company_filler&quot;)]
+  ContactModule --&gt; T_user[(&quot;user&quot;)]
+  ContactModule --&gt; T_user_filler[(&quot;user_filler&quot;)]
+  ProductModule[&quot;&lt;b&gt;Product&lt;/b&gt;&lt;br/&gt;/products&quot;]
+  ProductModule --&gt; T_product[(&quot;product&quot;)]
+  ProductModule --&gt; T_product_filler[(&quot;product_filler&quot;)]
+  FillerModule[&quot;&lt;b&gt;Filler&lt;/b&gt;&lt;br/&gt;/fillers&quot;]
+  FillerModule --&gt; T_filler[(&quot;filler&quot;)]
+  TaskModule[&quot;&lt;b&gt;Task&lt;/b&gt;&lt;br/&gt;/tasks&quot;]
+  TaskModule --&gt; T_task[(&quot;task&quot;)]
+  TaskTypeModule[&quot;&lt;b&gt;TaskType&lt;/b&gt;&lt;br/&gt;/task-types&quot;]
+  TaskTypeModule --&gt; T_task_type[(&quot;task_type&quot;)]
+  DesktopModule[&quot;&lt;b&gt;Desktop&lt;/b&gt;&lt;br/&gt;/desktop&quot;]
+  LinkableModule[&quot;&lt;b&gt;Linkable&lt;/b&gt;&lt;br/&gt;/linkables&quot;]
+  W_analytics([&quot;analytics&quot;]) --&gt; ProductModule
+  W_components_common([&quot;components/common&quot;]) --&gt; ContactModule
+  W_components_common([&quot;components/common&quot;]) --&gt; TaskModule
+  W_components_common([&quot;components/common&quot;]) --&gt; TaskTypeModule
+  W_components_company([&quot;components/company&quot;]) --&gt; CompanyModule
+  W_components_company([&quot;components/company&quot;]) --&gt; FillerModule
+  W_components_company([&quot;components/company&quot;]) --&gt; TaskModule
+  W_components_deal([&quot;components/deal&quot;]) --&gt; CompanyModule
+  W_components_deal([&quot;components/deal&quot;]) --&gt; ContactModule
+  W_components_deal([&quot;components/deal&quot;]) --&gt; FillerModule
+  W_components_deal([&quot;components/deal&quot;]) --&gt; ProductModule
+  W_components_deal([&quot;components/deal&quot;]) --&gt; TaskModule
+  W_components_mail([&quot;components/mail&quot;]) --&gt; CompanyModule
+  W_components_mail([&quot;components/mail&quot;]) --&gt; ContactModule
+  W_components_mail([&quot;components/mail&quot;]) --&gt; FillerModule
+  W_components_task([&quot;components/task&quot;]) --&gt; LinkableModule
+  W_components_task([&quot;components/task&quot;]) --&gt; TaskModule
+  W_components_task([&quot;components/task&quot;]) --&gt; TaskTypeModule
+  W_components_trigger([&quot;components/trigger&quot;]) --&gt; TaskTypeModule
+  W_deals([&quot;deals&quot;]) --&gt; FillerModule
+  W_index([&quot;index&quot;]) --&gt; DesktopModule
+  W_lists([&quot;lists&quot;]) --&gt; CompanyModule
+  W_lists([&quot;lists&quot;]) --&gt; ContactModule
+  W_lists([&quot;lists&quot;]) --&gt; FillerModule
+  W_lists([&quot;lists&quot;]) --&gt; ProductModule
+  W_lists([&quot;lists&quot;]) --&gt; TaskModule
+  W_settings([&quot;settings&quot;]) --&gt; FillerModule
+  W_tasks([&quot;tasks&quot;]) --&gt; TaskModule
+  W_tasks([&quot;tasks&quot;]) --&gt; TaskTypeModule</pre>
+<h2>Блок «Каналы»: страницы → модули → таблицы</h2><pre class=mermaid>flowchart LR
+  EmailModule[&quot;&lt;b&gt;Email&lt;/b&gt;&lt;br/&gt;/emails&quot;]
+  EmailModule --&gt; T_deal[(&quot;deal&quot;)]
+  EmailModule --&gt; T_email[(&quot;email&quot;)]
+  EmailModule --&gt; T_email_template[(&quot;email_template&quot;)]
+  EmailModule --&gt; T_email_to[(&quot;email_to&quot;)]
+  EmailModule --&gt; T_email_transporter[(&quot;email_transporter&quot;)]
+  EmailModule --&gt; T_event[(&quot;event&quot;)]
+  EmailModule --&gt; T_user[(&quot;user&quot;)]
+  TelegramModule[&quot;&lt;b&gt;Telegram&lt;/b&gt;&lt;br/&gt;/telegram&quot;]
+  TelegramModule --&gt; T_deal[(&quot;deal&quot;)]
+  TelegramModule --&gt; T_event[(&quot;event&quot;)]
+  TelegramModule --&gt; T_file[(&quot;file&quot;)]
+  TelegramModule --&gt; T_user[(&quot;user&quot;)]
+  BotModule[&quot;&lt;b&gt;Bot&lt;/b&gt;&lt;br/&gt;/bot&quot;]
+  BotModule --&gt; T_bot_account[(&quot;bot_account&quot;)]
+  BotModule --&gt; T_bot_link_code[(&quot;bot_link_code&quot;)]
+  BotModule --&gt; T_bot_reminder[(&quot;bot_reminder&quot;)]
+  CallsModule[&quot;&lt;b&gt;Calls&lt;/b&gt;&lt;br/&gt;/calls&quot;]
+  CallsModule --&gt; T_call_upload[(&quot;call_upload&quot;)]
+  CallsModule --&gt; T_deal[(&quot;deal&quot;)]
+  CallsModule --&gt; T_recorder_token[(&quot;recorder_token&quot;)]
+  CallsModule --&gt; T_recording[(&quot;recording&quot;)]
+  CallsModule --&gt; T_user[(&quot;user&quot;)]
+  RecognitionModule[&quot;&lt;b&gt;Recognition&lt;/b&gt;&lt;br/&gt;/companies&quot;]
+  RecognitionModule --&gt; T_company[(&quot;company&quot;)]
+  RecognitionModule --&gt; T_user[(&quot;user&quot;)]
+  W_components_common([&quot;components/common&quot;]) --&gt; EmailModule
+  W_components_company([&quot;components/company&quot;]) --&gt; TelegramModule
+  W_components_deal([&quot;components/deal&quot;]) --&gt; TelegramModule
+  W_components_mail([&quot;components/mail&quot;]) --&gt; EmailModule
+  W_components_modals([&quot;components/modals&quot;]) --&gt; TelegramModule
+  W_components_trigger([&quot;components/trigger&quot;]) --&gt; EmailModule
+  W_lists([&quot;lists&quot;]) --&gt; TelegramModule
+  W_mails([&quot;mails&quot;]) --&gt; EmailModule
+  W_profile([&quot;profile&quot;]) --&gt; BotModule
+  W_settings([&quot;settings&quot;]) --&gt; CallsModule
+  W_settings([&quot;settings&quot;]) --&gt; EmailModule
+  W_telegram([&quot;telegram&quot;]) --&gt; TelegramModule</pre>
+<h2>Блок «Отчёты»: страницы → модули → таблицы</h2><pre class=mermaid>flowchart LR
+  AnalyticsModule[&quot;&lt;b&gt;Analytics&lt;/b&gt;&lt;br/&gt;/analytics&quot;]
+  AnalyticsModule --&gt; T_company[(&quot;company&quot;)]
+  AnalyticsModule --&gt; T_deal[(&quot;deal&quot;)]
+  AnalyticsModule --&gt; T_deal_stage[(&quot;deal_stage&quot;)]
+  AnalyticsModule --&gt; T_deal_stage_record[(&quot;deal_stage_record&quot;)]
+  AnalyticsModule --&gt; T_event[(&quot;event&quot;)]
+  AnalyticsModule --&gt; T_recording[(&quot;recording&quot;)]
+  AnalyticsModule --&gt; T_task[(&quot;task&quot;)]
+  AnalyticsModule --&gt; T_user[(&quot;user&quot;)]
+  ObjectiveModule[&quot;&lt;b&gt;Objective&lt;/b&gt;&lt;br/&gt;/analytics&quot;]
+  ObjectiveModule --&gt; T_deal[(&quot;deal&quot;)]
+  ObjectiveModule --&gt; T_group[(&quot;group&quot;)]
+  ObjectiveModule --&gt; T_user[(&quot;user&quot;)]
+  TrackingModule[&quot;&lt;b&gt;Tracking&lt;/b&gt;&lt;br/&gt;/logs&quot;]
+  TrackingModule --&gt; T_event[(&quot;event&quot;)]
+  W_analytics([&quot;analytics&quot;]) --&gt; AnalyticsModule
+  W_analytics([&quot;analytics&quot;]) --&gt; TrackingModule
+  W_index([&quot;index&quot;]) --&gt; AnalyticsModule</pre>
+<h2>Блок «Служебные»: страницы → модули → таблицы</h2><pre class=mermaid>flowchart LR
+  FileModule[&quot;&lt;b&gt;File&lt;/b&gt;&lt;br/&gt;/files&quot;]
+  FileModule --&gt; T_event[(&quot;event&quot;)]
+  FileModule --&gt; T_file[(&quot;file&quot;)]
+  HelperModule[&quot;&lt;b&gt;Helper&lt;/b&gt;&quot;]
+  MessengerModule[&quot;&lt;b&gt;Messenger&lt;/b&gt;&quot;]
+  MessengerModule --&gt; T_deal[(&quot;deal&quot;)]
+  MessengerModule --&gt; T_event[(&quot;event&quot;)]
+  MessengerModule --&gt; T_user[(&quot;user&quot;)]
+  NotificationGateWayModule[&quot;&lt;b&gt;NotificationGateWay&lt;/b&gt;&quot;]
+  NotificationModule[&quot;&lt;b&gt;Notification&lt;/b&gt;&quot;]
+  NotificationModule --&gt; T_notification[(&quot;notification&quot;)]
+  SeedModule[&quot;&lt;b&gt;Seed&lt;/b&gt;&quot;]
+  SeedModule --&gt; T_collection[(&quot;collection&quot;)]
+  SeedModule --&gt; T_deal_stage[(&quot;deal_stage&quot;)]
+  SeedModule --&gt; T_group[(&quot;group&quot;)]
+  SeedModule --&gt; T_setting[(&quot;setting&quot;)]
+  SeedModule --&gt; T_task_type[(&quot;task_type&quot;)]
+  SeedModule --&gt; T_user[(&quot;user&quot;)]
+  SettingModule[&quot;&lt;b&gt;Setting&lt;/b&gt;&lt;br/&gt;/settings&quot;]
+  SettingModule --&gt; T_setting[(&quot;setting&quot;)]
+  WhatsAppModule[&quot;&lt;b&gt;WhatsApp&lt;/b&gt;&lt;br/&gt;/whatsapp&quot;]
+  WhatsAppModule --&gt; T_deal[(&quot;deal&quot;)]
+  WhatsAppModule --&gt; T_event[(&quot;event&quot;)]
+  WhatsAppModule --&gt; T_file[(&quot;file&quot;)]
+  WhatsAppModule --&gt; T_user[(&quot;user&quot;)]
+  W_components_deal([&quot;components/deal&quot;]) --&gt; SettingModule
+  W_components_deal([&quot;components/deal&quot;]) --&gt; WhatsAppModule
+  W_components_mail([&quot;components/mail&quot;]) --&gt; SettingModule
+  W_components_whatsapp([&quot;components/whatsapp&quot;]) --&gt; WhatsAppModule
+  W_index([&quot;index&quot;]) --&gt; FileModule
+  W_lists([&quot;lists&quot;]) --&gt; FileModule
+  W_whatsapp([&quot;whatsapp&quot;]) --&gt; WhatsAppModule</pre>
+<h2>Зависимости модулей API</h2><pre class=mermaid>flowchart LR
+  AuthModule --&gt; UserModule
+  BotModule --&gt; CompanyModule
+  BotModule --&gt; RecognitionModule
+  BotModule --&gt; TaskModule
+  CallsModule --&gt; MessengerModule
+  CompanyModule --&gt; DealModule
+  CompanyModule --&gt; EventsModule
+  CompanyModule --&gt; FileModule
+  CompanyModule --&gt; FillerModule
+  CompanyModule --&gt; UserModule
+  DealModule --&gt; DealStageModule
+  DealModule --&gt; EventsModule
+  DealModule --&gt; FileModule
+  DealModule --&gt; FillerModule
+  DealModule --&gt; TriggerModule
+  DealModule --&gt; UserModule
+  MessengerModule --&gt; DealModule
+  ProductModule --&gt; FillerModule
+  TaskModule --&gt; EventsModule
+  TaskModule --&gt; NotificationGateWayModule
+  TelegramModule --&gt; DealModule
+  TelegramModule --&gt; FileModule
+  TelegramModule --&gt; MessengerModule
+  TelegramModule --&gt; TriggerModule
+  TriggerModule --&gt; EmailModule
+  TriggerModule --&gt; FileModule
+  TriggerModule --&gt; NotificationGateWayModule
+  UserModule --&gt; EventsModule
+  UserModule --&gt; FillerModule
+  WhatsAppModule --&gt; DealModule
+  WhatsAppModule --&gt; FileModule
+  WhatsAppModule --&gt; MessengerModule
+  %% every module also uses HelperModule (common helpers)</pre>
+<h2>События между модулями</h2><pre class=mermaid>flowchart LR
+  E_NEW_CALL_RECORDING([&quot;NEW_CALL_RECORDING&quot;])
+  CallsModule --&gt; E_NEW_CALL_RECORDING
+  E_NEW_CALL_RECORDING --&gt; EventsModule
+  E_NEW_CALL_RECORDING --&gt; TriggerModule
+  E_NEW_COMPANY([&quot;NEW_COMPANY&quot;])
+  DealModule --&gt; E_NEW_COMPANY
+  E_NEW_COMPANY --&gt; EventsModule
+  E_NEW_CTR_AGENT([&quot;NEW_CTR_AGENT&quot;])
+  DealModule --&gt; E_NEW_CTR_AGENT
+  E_NEW_CTR_AGENT --&gt; EventsModule
+  E_NEW_DEAL([&quot;NEW_DEAL&quot;])
+  DealModule --&gt; E_NEW_DEAL
+  TriggerModule --&gt; E_NEW_DEAL
+  E_NEW_DEAL --&gt; EventsModule
+  E_NEW_DEAL_STAGE([&quot;NEW_DEAL_STAGE&quot;])
+  DealModule --&gt; E_NEW_DEAL_STAGE
+  E_NEW_DEAL_STAGE --&gt; EventsModule
+  E_NEW_EMAIL([&quot;NEW_EMAIL&quot;])
+  EmailModule --&gt; E_NEW_EMAIL
+  E_NEW_EMAIL --&gt; EventsModule
+  E_NEW_EMAIL --&gt; TriggerModule
+  E_NEW_FIELD_VALUE([&quot;NEW_FIELD_VALUE&quot;])
+  CompanyModule --&gt; E_NEW_FIELD_VALUE
+  DealModule --&gt; E_NEW_FIELD_VALUE
+  ProductModule --&gt; E_NEW_FIELD_VALUE
+  TriggerModule --&gt; E_NEW_FIELD_VALUE
+  UserModule --&gt; E_NEW_FIELD_VALUE
+  E_NEW_FIELD_VALUE --&gt; EventsModule
+  E_NEW_PRODUCT([&quot;NEW_PRODUCT&quot;])
+  DealModule --&gt; E_NEW_PRODUCT
+  E_NEW_PRODUCT --&gt; EventsModule
+  E_NEW_TASK([&quot;NEW_TASK&quot;])
+  TaskModule --&gt; E_NEW_TASK
+  TriggerModule --&gt; E_NEW_TASK
+  E_NEW_TASK --&gt; EventsModule
+  E_NEW_TASK_STATUS([&quot;NEW_TASK_STATUS&quot;])
+  TaskModule --&gt; E_NEW_TASK_STATUS
+  TriggerModule --&gt; E_NEW_TASK_STATUS
+  E_NEW_TASK_STATUS --&gt; EventsModule
+  E_NEW_TELEGRAM_MESSAGE([&quot;NEW_TELEGRAM_MESSAGE&quot;])
+  E_NEW_TELEGRAM_MESSAGE --&gt; EventsModule</pre>
+<h2>Таблицы и внешние ключи</h2><pre class=mermaid>flowchart LR
+  user[user] --&gt; group[group]
+  user[user] --&gt; company[company]
+  bot_account[bot_account] --&gt; user[user]
+  bot_reminder[bot_reminder] --&gt; task[task]
+  call_upload[call_upload] --&gt; user[user]
+  call_upload[call_upload] --&gt; recording[recording]
+  company[company] --&gt; user[user]
+  company_filler[company_filler] --&gt; company[company]
+  company_filler[company_filler] --&gt; filler[filler]
+  deal[deal] --&gt; user[user]
+  deal[deal] --&gt; company[company]
+  deal[deal] --&gt; deal_stage[deal_stage]
+  deal_file[deal_file] --&gt; deal[deal]
+  deal_file[deal_file] --&gt; file[file]
+  deal_filler[deal_filler] --&gt; deal[deal]
+  deal_filler[deal_filler] --&gt; filler[filler]
+  deal_product[deal_product] --&gt; deal[deal]
+  deal_product[deal_product] --&gt; product[product]
+  deal_stage[deal_stage] --&gt; collection[collection]
+  deal_stage_record[deal_stage_record] --&gt; deal[deal]
+  deal_stage_record[deal_stage_record] --&gt; deal_stage[deal_stage]
+  deal_user[deal_user] --&gt; user[user]
+  deal_user[deal_user] --&gt; deal[deal]
+  email[email] --&gt; user[user]
+  email_cc[email_cc] --&gt; email[email]
+  email_template[email_template] --&gt; user[user]
+  email_to[email_to] --&gt; email[email]
+  email_transporter[email_transporter] --&gt; user[user]
+  event[event] --&gt; group[group]
+  event[event] --&gt; user[user]
+  event[event] --&gt; deal[deal]
+  event[event] --&gt; task[task]
+  file[file] --&gt; user[user]
+  file[file] --&gt; email[email]
+  notification[notification] --&gt; company[company]
+  product[product] --&gt; user[user]
+  product_filler[product_filler] --&gt; filler[filler]
+  product_filler[product_filler] --&gt; product[product]
+  recorder_token[recorder_token] --&gt; user[user]
+  recording[recording] --&gt; user[user]
+  setting[setting] --&gt; user[user]
+  setting[setting] --&gt; deal_stage[deal_stage]
+  task[task] --&gt; group[group]
+  task[task] --&gt; user[user]
+  task[task] --&gt; company[company]
+  task[task] --&gt; deal[deal]
+  task[task] --&gt; task_type[task_type]
+  trigger[trigger] --&gt; user[user]
+  trigger[trigger] --&gt; deal_stage[deal_stage]
+  trigger_run[trigger_run] --&gt; deal[deal]
+  trigger_run[trigger_run] --&gt; trigger[trigger]
+  user_filler[user_filler] --&gt; user[user]
+  user_filler[user_filler] --&gt; filler[filler]</pre>
+<h2>Модули и проверки</h2><table><tr><th>Модуль</th><th>Адреса API</th><th>Таблицы</th><th>Проверки</th></tr>
+<tr><td>Analytics</td><td>/analytics</td><td>company, deal, deal_stage, deal_stage_record, event, recording, task, user</td><td>analytics, auth, smoke</td></tr>
+<tr><td>Auth</td><td>/auth</td><td></td><td>auth, smoke</td></tr>
+<tr><td>Bot</td><td>/bot/link, /bot/mcp</td><td>bot_account, bot_link_code, bot_reminder</td><td>auth, bot, smoke</td></tr>
+<tr><td>Calls</td><td>/calls</td><td>call_upload, deal, recorder_token, recording, user</td><td>auth, calls, ftp, smoke</td></tr>
+<tr><td>Company</td><td>/companies</td><td>company, company_filler, deal, user</td><td>auth, modules, smoke</td></tr>
+<tr><td>Contact</td><td>/contacts</td><td>company, company_filler, user, user_filler</td><td>auth, modules, smoke</td></tr>
+<tr><td>Deal</td><td>/deals, /deals/trash</td><td>company, deal, deal_filler, deal_stage_record</td><td>auth, deals, smoke, trash</td></tr>
+<tr><td>DealStage</td><td>/stages</td><td>deal, deal_stage, collection, setting</td><td>auth, deals, smoke, trash</td></tr>
+<tr><td>Desktop</td><td>/desktop</td><td></td><td>auth, modules, smoke</td></tr>
+<tr><td>Email</td><td>/emails</td><td>deal, email, email_template, email_to, email_transporter, event, user</td><td>auth, mail, smoke</td></tr>
+<tr><td>Events</td><td></td><td>deal, email, event, user</td><td>deals, telegram, whatsapp</td></tr>
+<tr><td>File</td><td>/files</td><td>event, file</td><td>auth, files, platform, smoke</td></tr>
+<tr><td>Filler</td><td>/fillers</td><td>filler</td><td>auth, modules, smoke</td></tr>
+<tr><td>Group</td><td>/groups</td><td>group</td><td>auth, platform, smoke</td></tr>
+<tr><td>Helper</td><td></td><td></td><td>deals, trash</td></tr>
+<tr><td>Linkable</td><td>/linkables</td><td></td><td>auth, platform, smoke</td></tr>
+<tr><td>Messenger</td><td></td><td>deal, event, user</td><td>telegram, whatsapp</td></tr>
+<tr><td>NotificationGateWay</td><td></td><td></td><td>live</td></tr>
+<tr><td>Notification</td><td></td><td>notification</td><td></td></tr>
+<tr><td>Objective</td><td>/analytics/objectives</td><td>deal, group, user</td><td>analytics, auth, smoke</td></tr>
+<tr><td>Product</td><td>/products</td><td>product, product_filler</td><td>auth, modules, smoke</td></tr>
+<tr><td>Recognition</td><td>/companies</td><td>company, user</td><td>auth, bot, recognition, smoke</td></tr>
+<tr><td>Seed</td><td></td><td>deal_stage, collection, group, setting, task_type, user</td><td></td></tr>
+<tr><td>Setting</td><td>/settings</td><td>setting</td><td>auth, platform, smoke</td></tr>
+<tr><td>Task</td><td>/tasks</td><td>task</td><td>auth, modules, smoke</td></tr>
+<tr><td>TaskType</td><td>/task-types</td><td>task_type</td><td>auth, modules, platform, smoke</td></tr>
+<tr><td>Telegram</td><td>/telegram, /telegram/incoming</td><td>deal, event, file, user</td><td>auth, smoke, telegram</td></tr>
+<tr><td>Tracking</td><td>/logs</td><td>event</td><td>auth, platform, smoke</td></tr>
+<tr><td>Trigger</td><td>/stages/:id, /triggers</td><td>deal, task, trigger, trigger_run</td><td>auth, smoke, triggers</td></tr>
+<tr><td>User</td><td>/users</td><td>deal, file, user, user_filler</td><td>auth, modules, smoke</td></tr>
+<tr><td>WhatsApp</td><td>/whatsapp, /whatsapp/incoming</td><td>deal, event, file, user</td><td>auth, smoke, whatsapp</td></tr>
+</table><script>mermaid.initialize({startOnLoad:true,securityLevel:'loose',flowchart:{htmlLabels:true}})</script></body></html>

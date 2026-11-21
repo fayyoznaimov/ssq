@@ -1,0 +1,151 @@
+import { MigrationInterface, QueryRunner } from "typeorm";
+
+/**
+ * Migrations for first prod deployment: 1.0.0
+ */
+export class Migrations1710016292238 implements MigrationInterface {
+    name = 'Migrations1710016292238'
+
+    public async up(queryRunner: QueryRunner): Promise<void> {
+        await queryRunner.query(`CREATE TABLE "deal_stage" ("id" SERIAL NOT NULL, "name" character varying(255) NOT NULL, "order" smallint, "description" character varying(1000), "created_at" TIMESTAMP NOT NULL DEFAULT now(), CONSTRAINT "PK_b15c8b643984dd7f673ba7e82cd" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE TABLE "deal_filler" ("id" SERIAL NOT NULL, "value" character varying(255) NOT NULL, "created_at" TIMESTAMP NOT NULL DEFAULT now(), "deal_id" integer, "filler_id" integer, CONSTRAINT "PK_8fd5db52a5cb4e7f79bb3071c48" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE TABLE "event" ("id" SERIAL NOT NULL, "type" smallint NOT NULL, "field_of" character varying(255), "before_state" jsonb, "after_state" jsonb, "created_at" TIMESTAMP NOT NULL DEFAULT now(), "deal_id" integer, "task_id" integer, "user_id" integer, "target_user_id" integer, "target_group_id" integer, CONSTRAINT "PK_30c2f3bbaf6d34a55f8ae6e4614" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE INDEX "IDX_b8c3aeeac35ace9d387fb5e142" ON "event" ("type") `);
+        await queryRunner.query(`CREATE TABLE "group" ("id" SERIAL NOT NULL, "name" character varying(255) NOT NULL, "created_at" TIMESTAMP NOT NULL DEFAULT now(), CONSTRAINT "PK_256aa0fda9b1de1a73ee0b7106b" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE TABLE "task_type" ("id" SERIAL NOT NULL, "name" character varying(255) NOT NULL, CONSTRAINT "PK_a0669bd34078f33604ec209dab1" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE TABLE "task" ("id" SERIAL NOT NULL, "label" character varying(255) NOT NULL, "result" text, "closed_at" TIMESTAMP, "start_time" TIMESTAMP NOT NULL, "end_time" TIMESTAMP NOT NULL, "allDay" boolean NOT NULL DEFAULT false, "created_at" TIMESTAMP NOT NULL DEFAULT now(), "type_id" integer, "company_id" integer, "ctr_agent_id" integer, "agent_id" integer, "group_id" integer, "deal_id" integer, "createdById" integer, CONSTRAINT "PK_fb213f79ee45060ba925ecd576e" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE INDEX "IDX_5f9223b3ef11ef7ba25b134cea" ON "task" ("start_time") `);
+        await queryRunner.query(`CREATE INDEX "IDX_5362920f0aea39c6345ee59349" ON "task" ("end_time") `);
+        await queryRunner.query(`CREATE TABLE "email_to" ("id" SERIAL NOT NULL, "value" text NOT NULL, "email_id" integer, CONSTRAINT "PK_e7ea8af0c2c814c69333b3c771e" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE TABLE "email_cc" ("id" SERIAL NOT NULL, "value" text NOT NULL, "email_id" integer, CONSTRAINT "PK_57e934dd5ebbc76ec75450e2f06" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE TABLE "email" ("id" SERIAL NOT NULL, "email_id" bigint NOT NULL, "from" text, "subject" text, "body" text, "sent_at" TIMESTAMP NOT NULL, "read" boolean NOT NULL DEFAULT false, "user_id" integer, CONSTRAINT "PK_1e7ed8734ee054ef18002e29b1c" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE INDEX "IDX_95d8ccd44c48395ed6c4fe07c7" ON "email" ("from") `);
+        await queryRunner.query(`CREATE TABLE "file" ("id" SERIAL NOT NULL, "name" character varying(255) NOT NULL, "path" character varying(255) NOT NULL, "email_id" integer, "uploaded_by" integer, CONSTRAINT "PK_36b46d232307066b3a2c9ea3a1d" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE TABLE "deal" ("id" SERIAL NOT NULL, "label" character varying(255) NOT NULL, "display_id" integer NOT NULL, "budget" bigint NOT NULL, "created_at" TIMESTAMP NOT NULL DEFAULT now(), "stage_id" integer, "agent_id" integer, "createdById" integer, "company_id" integer, CONSTRAINT "PK_9ce1c24acace60f6d7dc7a7189e" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE TABLE "user_filler" ("id" SERIAL NOT NULL, "value" character varying(255) NOT NULL, "created_at" TIMESTAMP NOT NULL DEFAULT now(), "user_id" integer, "filler_id" integer, CONSTRAINT "PK_140c52f9a705110cff398b56fd8" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE TABLE "email_transporter" ("id" SERIAL NOT NULL, "email" character varying(255) NOT NULL, "password" character varying(255) NOT NULL, "created_at" TIMESTAMP NOT NULL DEFAULT now(), "user_id" integer, CONSTRAINT "PK_23809e7bf6876a3d416db416cfd" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE TABLE "user" ("id" SERIAL NOT NULL, "username" character varying(255) NOT NULL, "email" character varying(255) NOT NULL, "phone" character varying(255), "password" character varying(255), "role" character varying(255) NOT NULL, "permissions" jsonb, "updated_at" TIMESTAMP NOT NULL DEFAULT now(), "deleted_at" TIMESTAMP, "created_at" TIMESTAMP NOT NULL DEFAULT now(), "group_id" integer, "company_id" integer, "created_by" integer, "updated_by" integer, CONSTRAINT "PK_cace4a159ff9f2512dd42373760" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE INDEX "IDX_78a916df40e02a9deb1c4b75ed" ON "user" ("username") `);
+        await queryRunner.query(`CREATE UNIQUE INDEX "IDX_e12875dfb3b1d92d7d7c5377e2" ON "user" ("email") `);
+        await queryRunner.query(`CREATE TABLE "company" ("id" SERIAL NOT NULL, "name" character varying(255) NOT NULL, "email" character varying(255), "phone" character varying(255), "updated_at" TIMESTAMP NOT NULL DEFAULT now(), "deleted_at" TIMESTAMP, "created_at" TIMESTAMP NOT NULL DEFAULT now(), "created_by" integer, "updated_by" integer, CONSTRAINT "PK_056f7854a7afdba7cbd6d45fc20" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE UNIQUE INDEX "IDX_a76c5cd486f7779bd9c319afd2" ON "company" ("name") `);
+        await queryRunner.query(`CREATE TABLE "company_filler" ("id" SERIAL NOT NULL, "value" character varying(255) NOT NULL, "created_at" TIMESTAMP NOT NULL DEFAULT now(), "company_id" integer, "filler_id" integer, CONSTRAINT "PK_ba192aec97d664fc5485c225bc9" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE TABLE "filler" ("id" SERIAL NOT NULL, "target" character varying(255) NOT NULL, "field" character varying(255) NOT NULL, "created_at" TIMESTAMP NOT NULL DEFAULT now(), CONSTRAINT "PK_9853d92975791b2161c09774a72" PRIMARY KEY ("id"))`);
+        await queryRunner.query(`CREATE TABLE "deal_file" ("fileId" integer NOT NULL, "dealId" integer NOT NULL, CONSTRAINT "PK_61a1c253ffbae5d1b3e86e7c2c7" PRIMARY KEY ("fileId", "dealId"))`);
+        await queryRunner.query(`CREATE INDEX "IDX_8bd64028aa040211fd8ee26c96" ON "deal_file" ("fileId") `);
+        await queryRunner.query(`CREATE INDEX "IDX_51bec2fe9a42042e7ca3988b9c" ON "deal_file" ("dealId") `);
+        await queryRunner.query(`CREATE TABLE "deal_user" ("dealId" integer NOT NULL, "userId" integer NOT NULL, CONSTRAINT "PK_27fad6b09ba57ee144fef0419e5" PRIMARY KEY ("dealId", "userId"))`);
+        await queryRunner.query(`CREATE INDEX "IDX_b9ddd7d8436c5c20e48f12ca6a" ON "deal_user" ("dealId") `);
+        await queryRunner.query(`CREATE INDEX "IDX_34cf6c725f881d5788377817ec" ON "deal_user" ("userId") `);
+        await queryRunner.query(`ALTER TABLE "deal_filler" ADD CONSTRAINT "FK_f917d5a942a7f438e981248c3bd" FOREIGN KEY ("deal_id") REFERENCES "deal"("id") ON DELETE CASCADE ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "deal_filler" ADD CONSTRAINT "FK_ef7b37d9c5c61f3b3fac003b38e" FOREIGN KEY ("filler_id") REFERENCES "filler"("id") ON DELETE CASCADE ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "event" ADD CONSTRAINT "FK_9717eefd8b374e00916cdef3137" FOREIGN KEY ("deal_id") REFERENCES "deal"("id") ON DELETE NO ACTION ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "event" ADD CONSTRAINT "FK_16ca0e799433b981df31f800a2f" FOREIGN KEY ("task_id") REFERENCES "task"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "event" ADD CONSTRAINT "FK_e6358bd3df1b2874637dca92bcf" FOREIGN KEY ("user_id") REFERENCES "user"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "event" ADD CONSTRAINT "FK_ddd07fa5de88eb3a4eb359cb189" FOREIGN KEY ("target_user_id") REFERENCES "user"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "event" ADD CONSTRAINT "FK_9415505a5e4e2a9b92015f27025" FOREIGN KEY ("target_group_id") REFERENCES "group"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "task" ADD CONSTRAINT "FK_a0669bd34078f33604ec209dab1" FOREIGN KEY ("type_id") REFERENCES "task_type"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "task" ADD CONSTRAINT "FK_f4ca8c2241f11acbba5ad18f718" FOREIGN KEY ("company_id") REFERENCES "company"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "task" ADD CONSTRAINT "FK_d9d3a13592be48292618264d91f" FOREIGN KEY ("ctr_agent_id") REFERENCES "user"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "task" ADD CONSTRAINT "FK_e5ee26e7f7b7ef4e8258cdfb988" FOREIGN KEY ("agent_id") REFERENCES "user"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "task" ADD CONSTRAINT "FK_465a127df1ace09f377dd2eef6f" FOREIGN KEY ("group_id") REFERENCES "group"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "task" ADD CONSTRAINT "FK_5c28e19dbd3bd6cf7d0ac56baa1" FOREIGN KEY ("deal_id") REFERENCES "deal"("id") ON DELETE NO ACTION ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "task" ADD CONSTRAINT "FK_91d76dd2ae372b9b7dfb6bf3fd2" FOREIGN KEY ("createdById") REFERENCES "user"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "email_to" ADD CONSTRAINT "FK_fef20416e465e9c58a32f4b3ff9" FOREIGN KEY ("email_id") REFERENCES "email"("id") ON DELETE NO ACTION ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "email_cc" ADD CONSTRAINT "FK_9b1e2063d126c374b495b8fda19" FOREIGN KEY ("email_id") REFERENCES "email"("id") ON DELETE NO ACTION ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "email" ADD CONSTRAINT "FK_25f2e7a5a3fc2c9119ecfa40493" FOREIGN KEY ("user_id") REFERENCES "user"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "file" ADD CONSTRAINT "FK_f642272acba10f209a0351ff555" FOREIGN KEY ("email_id") REFERENCES "email"("id") ON DELETE CASCADE ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "file" ADD CONSTRAINT "FK_7b877394007233a988b1b845378" FOREIGN KEY ("uploaded_by") REFERENCES "user"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "deal" ADD CONSTRAINT "FK_b15c8b643984dd7f673ba7e82cd" FOREIGN KEY ("stage_id") REFERENCES "deal_stage"("id") ON DELETE NO ACTION ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "deal" ADD CONSTRAINT "FK_282a1bb7174d879b5f24a006293" FOREIGN KEY ("agent_id") REFERENCES "user"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "deal" ADD CONSTRAINT "FK_3e4a58fefdb8545f134d763ea7e" FOREIGN KEY ("createdById") REFERENCES "user"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "deal" ADD CONSTRAINT "FK_471eb3e9d4652578fd124c2cf84" FOREIGN KEY ("company_id") REFERENCES "company"("id") ON DELETE NO ACTION ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "user_filler" ADD CONSTRAINT "FK_cf9df5acd4b525080c7bf4fc5df" FOREIGN KEY ("user_id") REFERENCES "user"("id") ON DELETE CASCADE ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "user_filler" ADD CONSTRAINT "FK_16b0112adaf5d6102c860e7d00c" FOREIGN KEY ("filler_id") REFERENCES "filler"("id") ON DELETE CASCADE ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "email_transporter" ADD CONSTRAINT "FK_b5237f486aa16543612a8a61334" FOREIGN KEY ("user_id") REFERENCES "user"("id") ON DELETE CASCADE ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "user" ADD CONSTRAINT "FK_3c29fba6fe013ec8724378ce7c9" FOREIGN KEY ("group_id") REFERENCES "group"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "user" ADD CONSTRAINT "FK_9e70b5f9d7095018e86970c7874" FOREIGN KEY ("company_id") REFERENCES "company"("id") ON DELETE CASCADE ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "user" ADD CONSTRAINT "FK_d2f5e343630bd8b7e1e7534e82e" FOREIGN KEY ("created_by") REFERENCES "user"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "user" ADD CONSTRAINT "FK_6bfae5ab9f39212d5b6ad0276b1" FOREIGN KEY ("updated_by") REFERENCES "user"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "company" ADD CONSTRAINT "FK_02d6084f6eb9912c0d8a35f9d0d" FOREIGN KEY ("created_by") REFERENCES "user"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "company" ADD CONSTRAINT "FK_b8fdf420e133fe881a11a5f7068" FOREIGN KEY ("updated_by") REFERENCES "user"("id") ON DELETE SET NULL ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "company_filler" ADD CONSTRAINT "FK_ba92db4ca2a3db19fa1f2d3f55a" FOREIGN KEY ("company_id") REFERENCES "company"("id") ON DELETE CASCADE ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "company_filler" ADD CONSTRAINT "FK_d9a331ec3194f55f0574578ddbf" FOREIGN KEY ("filler_id") REFERENCES "filler"("id") ON DELETE CASCADE ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "deal_file" ADD CONSTRAINT "FK_8bd64028aa040211fd8ee26c96d" FOREIGN KEY ("fileId") REFERENCES "file"("id") ON DELETE CASCADE ON UPDATE CASCADE`);
+        await queryRunner.query(`ALTER TABLE "deal_file" ADD CONSTRAINT "FK_51bec2fe9a42042e7ca3988b9c5" FOREIGN KEY ("dealId") REFERENCES "deal"("id") ON DELETE NO ACTION ON UPDATE NO ACTION`);
+        await queryRunner.query(`ALTER TABLE "deal_user" ADD CONSTRAINT "FK_b9ddd7d8436c5c20e48f12ca6a7" FOREIGN KEY ("dealId") REFERENCES "deal"("id") ON DELETE CASCADE ON UPDATE CASCADE`);
+        await queryRunner.query(`ALTER TABLE "deal_user" ADD CONSTRAINT "FK_34cf6c725f881d5788377817ecc" FOREIGN KEY ("userId") REFERENCES "user"("id") ON DELETE NO ACTION ON UPDATE NO ACTION`);
+    }
+
+    public async down(queryRunner: QueryRunner): Promise<void> {
+        await queryRunner.query(`ALTER TABLE "deal_user" DROP CONSTRAINT "FK_34cf6c725f881d5788377817ecc"`);
+        await queryRunner.query(`ALTER TABLE "deal_user" DROP CONSTRAINT "FK_b9ddd7d8436c5c20e48f12ca6a7"`);
+        await queryRunner.query(`ALTER TABLE "deal_file" DROP CONSTRAINT "FK_51bec2fe9a42042e7ca3988b9c5"`);
+        await queryRunner.query(`ALTER TABLE "deal_file" DROP CONSTRAINT "FK_8bd64028aa040211fd8ee26c96d"`);
+        await queryRunner.query(`ALTER TABLE "company_filler" DROP CONSTRAINT "FK_d9a331ec3194f55f0574578ddbf"`);
+        await queryRunner.query(`ALTER TABLE "company_filler" DROP CONSTRAINT "FK_ba92db4ca2a3db19fa1f2d3f55a"`);
+        await queryRunner.query(`ALTER TABLE "company" DROP CONSTRAINT "FK_b8fdf420e133fe881a11a5f7068"`);
+        await queryRunner.query(`ALTER TABLE "company" DROP CONSTRAINT "FK_02d6084f6eb9912c0d8a35f9d0d"`);
+        await queryRunner.query(`ALTER TABLE "user" DROP CONSTRAINT "FK_6bfae5ab9f39212d5b6ad0276b1"`);
+        await queryRunner.query(`ALTER TABLE "user" DROP CONSTRAINT "FK_d2f5e343630bd8b7e1e7534e82e"`);
+        await queryRunner.query(`ALTER TABLE "user" DROP CONSTRAINT "FK_9e70b5f9d7095018e86970c7874"`);
+        await queryRunner.query(`ALTER TABLE "user" DROP CONSTRAINT "FK_3c29fba6fe013ec8724378ce7c9"`);
+        await queryRunner.query(`ALTER TABLE "email_transporter" DROP CONSTRAINT "FK_b5237f486aa16543612a8a61334"`);
+        await queryRunner.query(`ALTER TABLE "user_filler" DROP CONSTRAINT "FK_16b0112adaf5d6102c860e7d00c"`);
+        await queryRunner.query(`ALTER TABLE "user_filler" DROP CONSTRAINT "FK_cf9df5acd4b525080c7bf4fc5df"`);
+        await queryRunner.query(`ALTER TABLE "deal" DROP CONSTRAINT "FK_471eb3e9d4652578fd124c2cf84"`);
+        await queryRunner.query(`ALTER TABLE "deal" DROP CONSTRAINT "FK_3e4a58fefdb8545f134d763ea7e"`);
+        await queryRunner.query(`ALTER TABLE "deal" DROP CONSTRAINT "FK_282a1bb7174d879b5f24a006293"`);
+        await queryRunner.query(`ALTER TABLE "deal" DROP CONSTRAINT "FK_b15c8b643984dd7f673ba7e82cd"`);
+        await queryRunner.query(`ALTER TABLE "file" DROP CONSTRAINT "FK_7b877394007233a988b1b845378"`);
+        await queryRunner.query(`ALTER TABLE "file" DROP CONSTRAINT "FK_f642272acba10f209a0351ff555"`);
+        await queryRunner.query(`ALTER TABLE "email" DROP CONSTRAINT "FK_25f2e7a5a3fc2c9119ecfa40493"`);
+        await queryRunner.query(`ALTER TABLE "email_cc" DROP CONSTRAINT "FK_9b1e2063d126c374b495b8fda19"`);
+        await queryRunner.query(`ALTER TABLE "email_to" DROP CONSTRAINT "FK_fef20416e465e9c58a32f4b3ff9"`);
+        await queryRunner.query(`ALTER TABLE "task" DROP CONSTRAINT "FK_91d76dd2ae372b9b7dfb6bf3fd2"`);
+        await queryRunner.query(`ALTER TABLE "task" DROP CONSTRAINT "FK_5c28e19dbd3bd6cf7d0ac56baa1"`);
+        await queryRunner.query(`ALTER TABLE "task" DROP CONSTRAINT "FK_465a127df1ace09f377dd2eef6f"`);
+        await queryRunner.query(`ALTER TABLE "task" DROP CONSTRAINT "FK_e5ee26e7f7b7ef4e8258cdfb988"`);
+        await queryRunner.query(`ALTER TABLE "task" DROP CONSTRAINT "FK_d9d3a13592be48292618264d91f"`);
+        await queryRunner.query(`ALTER TABLE "task" DROP CONSTRAINT "FK_f4ca8c2241f11acbba5ad18f718"`);
+        await queryRunner.query(`ALTER TABLE "task" DROP CONSTRAINT "FK_a0669bd34078f33604ec209dab1"`);
+        await queryRunner.query(`ALTER TABLE "event" DROP CONSTRAINT "FK_9415505a5e4e2a9b92015f27025"`);
+        await queryRunner.query(`ALTER TABLE "event" DROP CONSTRAINT "FK_ddd07fa5de88eb3a4eb359cb189"`);
+        await queryRunner.query(`ALTER TABLE "event" DROP CONSTRAINT "FK_e6358bd3df1b2874637dca92bcf"`);
+        await queryRunner.query(`ALTER TABLE "event" DROP CONSTRAINT "FK_16ca0e799433b981df31f800a2f"`);
+        await queryRunner.query(`ALTER TABLE "event" DROP CONSTRAINT "FK_9717eefd8b374e00916cdef3137"`);
+        await queryRunner.query(`ALTER TABLE "deal_filler" DROP CONSTRAINT "FK_ef7b37d9c5c61f3b3fac003b38e"`);
+        await queryRunner.query(`ALTER TABLE "deal_filler" DROP CONSTRAINT "FK_f917d5a942a7f438e981248c3bd"`);
+        await queryRunner.query(`DROP INDEX "public"."IDX_34cf6c725f881d5788377817ec"`);
+        await queryRunner.query(`DROP INDEX "public"."IDX_b9ddd7d8436c5c20e48f12ca6a"`);
+        await queryRunner.query(`DROP TABLE "deal_user"`);
+        await queryRunner.query(`DROP INDEX "public"."IDX_51bec2fe9a42042e7ca3988b9c"`);
+        await queryRunner.query(`DROP INDEX "public"."IDX_8bd64028aa040211fd8ee26c96"`);
+        await queryRunner.query(`DROP TABLE "deal_file"`);
+        await queryRunner.query(`DROP TABLE "filler"`);
+        await queryRunner.query(`DROP TABLE "company_filler"`);
+        await queryRunner.query(`DROP INDEX "public"."IDX_a76c5cd486f7779bd9c319afd2"`);
+        await queryRunner.query(`DROP TABLE "company"`);
+        await queryRunner.query(`DROP INDEX "public"."IDX_e12875dfb3b1d92d7d7c5377e2"`);
+        await queryRunner.query(`DROP INDEX "public"."IDX_78a916df40e02a9deb1c4b75ed"`);
+        await queryRunner.query(`DROP TABLE "user"`);
+        await queryRunner.query(`DROP TABLE "email_transporter"`);
+        await queryRunner.query(`DROP TABLE "user_filler"`);
+        await queryRunner.query(`DROP TABLE "deal"`);
+        await queryRunner.query(`DROP TABLE "file"`);
+        await queryRunner.query(`DROP INDEX "public"."IDX_95d8ccd44c48395ed6c4fe07c7"`);
+        await queryRunner.query(`DROP TABLE "email"`);
+        await queryRunner.query(`DROP TABLE "email_cc"`);
+        await queryRunner.query(`DROP TABLE "email_to"`);
+        await queryRunner.query(`DROP INDEX "public"."IDX_5362920f0aea39c6345ee59349"`);
+        await queryRunner.query(`DROP INDEX "public"."IDX_5f9223b3ef11ef7ba25b134cea"`);
+        await queryRunner.query(`DROP TABLE "task"`);
+        await queryRunner.query(`DROP TABLE "task_type"`);
+        await queryRunner.query(`DROP TABLE "group"`);
+        await queryRunner.query(`DROP INDEX "public"."IDX_b8c3aeeac35ace9d387fb5e142"`);
+        await queryRunner.query(`DROP TABLE "event"`);
+        await queryRunner.query(`DROP TABLE "deal_filler"`);
+        await queryRunner.query(`DROP TABLE "deal_stage"`);
+    }
+
+}

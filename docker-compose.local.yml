@@ -1,0 +1,119 @@
+# Local development stack for the Parisa CRM.
+#   docker compose -f docker-compose.local.yml up
+#
+#   Frontend (Nuxt dev, hot reload):  http://localhost:4100
+#   API through nginx (like prod):    http://localhost:8080/api/v1
+#   Fake mailbox web UI:              none (GreenMail), IMAP/SMTP only inside the network
+#   Postgres:                         localhost:5434  (root / passwd, db parisahon)
+#
+# Isolation from production:
+#   - EMAIL_HOST points at a local GreenMail container, so no real mail is read or sent.
+#   - TELEGRAM_SERVICE_HOST points nowhere; the telegram service is not started.
+#   - The CRM bot talks to fake-telegram (localhost:8098 for tests), never to api.telegram.org.
+#   - The frontend talks only to localhost (NUXT_PUBLIC_* overrides).
+
+name: parisa-crm-local
+
+services:
+  crm-db:
+    image: postgres:16.3
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: passwd
+      POSTGRES_DB: parisahon
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - crm_db_data:/var/lib/postgresql/data
+      # Restored only on first start (empty volume). To reload: docker compose ... down -v
+      - ./crm-db-prod-2026-11-14.sql.gz:/docker-entrypoint-initdb.d/01-prod-dump.sql.gz:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root -d parisahon"]
+      interval: 3s
+      retries: 30
+
+  mail:
+    image: greenmail/standalone:2.1.2
+    environment:
+      GREENMAIL_OPTS: >-
+        -Dgreenmail.imaps.hostname=0.0.0.0
+        -Dgreenmail.imaps.port=993
+        -Dgreenmail.smtps.hostname=0.0.0.0
+        -Dgreenmail.smtps.port=465
+        -Dgreenmail.users=testing:local@parisahome.com
+        -Dgreenmail.users.login=email
+        -Dgreenmail.verbose
+
+  crm-app:
+    image: node:20.11-alpine3.18
+    working_dir: /app
+    command: sh -c "npm install --no-audit --no-fund && npx nest start --watch"
+    env_file:
+      - ./local/api.env
+      # Your own secrets (ANTHROPIC_API_KEY=...). Not in git; see local/secrets.env.example
+      - path: ./local/secrets.env
+        required: false
+    restart: unless-stopped
+    volumes:
+      - ./parisahon-api:/app
+      - api_node_modules:/app/node_modules
+      # Stand-in for the server's Claude CLI (card recognition), see local/fake-claude
+      - ./local/fake-claude:/opt/fake-claude:ro
+    depends_on:
+      crm-db:
+        condition: service_healthy
+      mail:
+        condition: service_started
+
+  # Stand-in for the Telegram Bot API (CRM bot), see local/fake-telegram/server.mjs
+  fake-telegram:
+    image: node:20.11-alpine3.18
+    command: node /srv/server.mjs
+    volumes:
+      - ./local/fake-telegram/server.mjs:/srv/server.mjs:ro
+    ports:
+      - "127.0.0.1:8098:8081"
+
+  # Stand-in for the Anthropic API, only for tests: docker compose ... --profile test up -d mock-claude
+  mock-claude:
+    image: python:3.12-alpine
+    profiles: ["test"]
+    command: python -u /srv/server.py
+    volumes:
+      - ./local/mock-claude/server.py:/srv/server.py:ro
+    ports:
+      - "127.0.0.1:8099:8000"
+
+  nginx:
+    image: nginx:1.27.0
+    ports:
+      - "8080:80"
+    volumes:
+      - ./local/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./parisahon-api/public/uploads:/usr/share/nginx/html/api/v1/uploads:ro
+    depends_on:
+      - crm-app
+
+  front:
+    # app/pnpm-lock.yaml is lockfileVersion 9.0, so pnpm 9 is required to install the exact
+    # locked versions (the pnpm 7 in app/Dockerfile ignores it and re-resolves everything).
+    image: node:20.11-alpine3.18
+    working_dir: /app
+    command: sh -c "npm i -g pnpm@9 && pnpm i --frozen-lockfile && pnpm exec nuxt dev --host 0.0.0.0 --port 4100"
+    environment:
+      npm_config_store_dir: /pnpm-store
+      NUXT_PUBLIC_API_URL: http://localhost:8080/api/v1
+      NUXT_PUBLIC_SOCKET_URL: ws://localhost:8080
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - "4100:4100"
+    volumes:
+      - ./parisahon-client/app:/app
+      - front_node_modules:/app/node_modules
+      - pnpm_store:/pnpm-store
+
+volumes:
+  pnpm_store:
+  crm_db_data:
+  api_node_modules:
+  front_node_modules:
