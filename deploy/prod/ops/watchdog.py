@@ -136,6 +136,8 @@ try:
     age = (datetime.now(timezone.utc) - made).total_seconds() / 3600
     why = f" ({b.get('error')})" if b.get("error") else f" (последняя {age:.0f} ч назад)"
     checks["backup"] = (bool(b.get("ok")) and age < 26, "ночная копия базы не сделана" + why)
+    # a storage that is connected but did not take last night's copy; "not connected" is not an alarm
+    checks["offsite"] = (b.get("offsite") != "failed", "копия бэкапа вне сервера не удалась (подробности в backup.log)")
 except Exception:
     checks["backup"] = (False, "ночная копия базы ещё ни разу не сделана")
 

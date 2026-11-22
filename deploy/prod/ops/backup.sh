@@ -5,7 +5,7 @@
 #   uploads/<date>/             files of the CRM; unchanged files are hard links to the previous day
 #                               (30 days + monthly for a year; integrity.py checks them every night)
 # Result: /root/crm2/ops/state/backup.json (the watchdog alerts when it is old or failed).
-# Everything stays on this server. To copy elsewhere put an executable /root/crm2/ops/offsite.sh (gets the day folder).
+# offsite.sh then copies the night's backup, encrypted, to the storage connected as the rclone remote crm-offsite.
 set -uo pipefail
 ROOT=/root/backups/auto
 STATE=/root/crm2/ops/state
@@ -64,9 +64,11 @@ for dir in "$ROOT"/uploads/*/; do
   if [[ "$name" < "$year_ago" ]] || { [[ "$name" < "$cutoff" ]] && [[ "$name" != *-01 ]]; }; then rm -rf "$dir"; fi
 done
 
+# copy outside this server (offsite.sh): 0 = copied and verified, 3 = no storage connected yet
 OFFSITE=none
 if [ -x /root/crm2/ops/offsite.sh ]; then
-  if /root/crm2/ops/offsite.sh "$D" "$ROOT/uploads/$DAY" >>"$STATE/backup.log" 2>&1; then OFFSITE=ok; else OFFSITE=failed; fi
+  /root/crm2/ops/offsite.sh "$D" "$ROOT/uploads/$DAY" >>"$STATE/backup.log" 2>&1 </dev/null
+  case $? in 0) OFFSITE=ok ;; 3) OFFSITE="not connected" ;; *) OFFSITE=failed ;; esac
 fi
 printf '{"ok":true,"at":"%s","db_bytes":%s,"restored_rows":"%s","upload_files":%s,"offsite":"%s","size":"%s"}\n' \
   "$(date -u +%FT%TZ)" "$BYTES" "$GOT" "$FILES" "$OFFSITE" "$(du -sh "$ROOT" | cut -f1)" > "$STATE/backup.json"
