@@ -31,7 +31,7 @@ export class EventListener {
         .addTargetFieldsIfGiven(data)
         .addTask(data.task)
         .linkToDeal(data.deal)
-        .addAfterState(EventWrapper.fromEntity(data.task)),
+        .addAfterState(EventListener.taskState(data.task)),
     );
   }
 
@@ -42,8 +42,15 @@ export class EventListener {
         .originatedBy(data.originated_by)
         .addTargetFieldsIfGiven(data)
         .linkToDeal(data.deal)
-        .addAfterState(EventWrapper.fromEntity(data.task)),
+        .addAfterState(EventListener.taskState(data.task)),
     );
+  }
+
+  /** The task as the history keeps it; a task without a type gets a neutral one (the web client reads type.name). */
+  static taskState(task: any): Record<string, any> {
+    const state = EventWrapper.fromEntity(task);
+    if (state?.data && !state.data.type) state.data.type = { id: null, name: 'Задача' };
+    return state;
   }
 
   @OnEvent(EventTypes.NEW_DEAL.toString())

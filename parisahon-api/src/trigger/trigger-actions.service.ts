@@ -35,6 +35,7 @@ import { DealFiller } from '../deal/deal.filler.entity';
 import { Filler } from '../filler/filler.entity';
 import { Field, FieldValueEventDto } from '../events/dto/field.value.event.dto';
 import { NotificationGateWay } from '../gateway/notification.gateway';
+import { defaultTaskType } from '../task_type/default-task-type';
 
 // a "create deal" trigger may start a chain: a copy never creates further copies
 const MAX_CREATE_DEAL_DEPTH = 1;
@@ -151,7 +152,10 @@ export class TriggerActionsService {
     if (!targetDeal) return;
 
     const responsible = await this.getTaskResponsible(targetDeal, data.responsible, originatedBy);
-    const type = data.type_id ? await this.helperService.getById(TaskType, data.type_id) : null;
+    // a task without a type breaks the task board and the deal history in the web client
+    const type = data.type_id
+      ? await this.helperService.getById(TaskType, data.type_id)
+      : await defaultTaskType(this.taskRepository.manager);
 
     const newTask = new Task();
     newTask.agent = responsible;

@@ -7,6 +7,7 @@ import { Deal } from '../deal/deal.entity';
 import { EventTypes } from '../events/event.entity';
 import { TaskEventDto } from '../events/dto/task.event.dto';
 import { NotificationGateWay } from '../gateway/notification.gateway';
+import { defaultTaskType } from '../task_type/default-task-type';
 
 /** Labels of the tasks the CRM creates by itself; the rules find their own tasks by these prefixes. */
 export const AUTO_NEXT_STEP = 'Авто: запланируйте следующий шаг по сделке';
@@ -36,6 +37,7 @@ export class AutoTaskService {
     task.deal = deal;
     task.company = deal.company ?? null;
     task.allDay = false;
+    task.type = await defaultTaskType(this.tasks.manager);
     task.start_time = new Date();
     task.end_time = dueAt;
     const saved = await this.tasks.save(task);

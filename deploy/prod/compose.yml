@@ -37,7 +37,8 @@ services:
       - /root/crm/parisahon-api/public/uploads:/app/uploads
     networks: [crm-network]
   crm2-whatsapp:
-    image: node:20-bookworm-slim
+    # node 20 + ffmpeg from Debian (voice notes -> mp3, video thumbnails)
+    image: crm2-api:ffmpeg
     container_name: crm2-whatsapp
     working_dir: /app
     command: node src/index.js
@@ -48,7 +49,6 @@ services:
       - ./parisahon-whatsapp-service:/app
       - ./wa-sessions:/data/sessions
       - /root/crm/parisahon-api/public/uploads:/app/uploads
-      - /root/crm/parisahon-telegram-service/ffmpeg-6.1-amd64-static:/opt/ffmpeg:ro
     networks: [crm-network]
   crm2-stt:
     image: python:3.11-slim
@@ -88,6 +88,9 @@ services:
       - ./parisahon-ftp:/app
       - ./ftp-venv:/venv
       - ./ftp-data:/data
+      # manager 47's phone still uploads to the old FTP (port 21, vsftpd): the same folder is his home here,
+      # so the receiver forwards those recordings too (until the phone is switched to port 2121)
+      - /root/crm/parisahon-telegram-service/recordings/47:/data/files/47
     networks: [crm-network]
 networks:
   crm-network:
