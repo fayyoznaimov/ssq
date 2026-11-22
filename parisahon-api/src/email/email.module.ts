@@ -1,3 +1,5 @@
+import { RecognitionModule } from '../recognition/recognition.module';
+import { MailAssistService } from './mail-assist.service';
 import { Module } from '@nestjs/common';
 import { EmailService } from './email.service';
 import { EmailController } from './email.controller';
@@ -31,8 +33,10 @@ import { MailSignService } from './mail-sign.service';
       EmailTo,
     ]),
     HelperModule,
+    RecognitionModule,
   ],
   providers: [
+    MailAssistService,
     EmailService,
     MailConnectionService,
     MailSyncService,

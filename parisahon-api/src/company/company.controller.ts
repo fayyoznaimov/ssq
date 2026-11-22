@@ -14,6 +14,8 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { Access, RecordAccess } from '../auth/access';
+import { SimilarService } from './similar.service';
+import { SimilarQueryDto } from './dto/similar.query.dto';
 import { CompanyService } from './company.service';
 import { CreateCompanyDto } from './dto/create.company.dto';
 import {
@@ -31,6 +33,7 @@ import { PaginationRequestDto } from 'src/helper/dto/pagination.dto';
 @Controller('companies')
 export class CompanyController {
   constructor(
+    private similarService: SimilarService,
     private companyService: CompanyService,
     private eventService: EventsService,
     private clientHistory: ClientHistoryService,
@@ -57,6 +60,12 @@ export class CompanyController {
       throw new ForbiddenException('No right to create companies');
     }
     return instanceToPlain(this.companyService.create(data, request));
+  }
+
+  /** Companies and contacts that look like the one being typed, with reasons and hints. */
+  @Get('similar')
+  async similar(@Query() query: SimilarQueryDto) {
+    return this.similarService.find(query);
   }
 
   @Get(':id')

@@ -1,4 +1,5 @@
 import {
+  HttpCode,
   Body,
   Controller,
   Delete,
@@ -31,11 +32,14 @@ import { HelperService } from '../helper/helper.service';
 import { EmailTo } from './email_to.entity';
 import { FetchEmailToDto } from './dto/fetch.email.to.dto';
 import { MailAccessGuard } from './mail-access.guard';
+import { MailAssistService } from './mail-assist.service';
+import { AssistEmailDto } from './dto/assist.email.dto';
 
 @UseGuards(AuthGuard, MailAccessGuard)
 @Controller('emails')
 export class EmailController {
   constructor(
+    private mailAssist: MailAssistService,
     private emailService: EmailService,
     private helperService: HelperService,
   ) { }
@@ -49,6 +53,13 @@ export class EmailController {
       this.emailService.syncEmailsFromAllMailBoxes(query, request),
     );
   }
+  /** Writing assistant: check spelling and meaning, rewrite, translate, draft or reply (suggestions only). */
+  @Post('assist')
+  @HttpCode(200)
+  async assist(@Body() data: AssistEmailDto, @Req() request: Request) {
+    return this.mailAssist.assist(request['user'], data.action, data);
+  }
+
 
   @Get()
   async fetchAll(

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { unlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Injectable } from '@nestjs/common';
@@ -52,8 +52,39 @@ export class ClaudeCliError extends Error {
   }
 }
 
-/** Env of the CRM that must not reach the CLI: with them it would bill an API key instead of the login. */
-const DROPPED_ENV = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'NODE_OPTIONS'];
+/**
+ * The CLI gets only what it needs from the CRM's environment: never the database password, the
+ * JWT secret or the bot / mail / messenger tokens. ANTHROPIC_* are not passed either: with them it
+ * would bill an API key instead of the login (CLAUDE_CODE_OAUTH_TOKEN).
+ */
+const PASSED_ENV = ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TMPDIR', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME'];
+function cliEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (PASSED_ENV.includes(name) || name.startsWith('CLAUDE_CODE_') || name === 'CLAUDE_CONFIG_DIR') env[name] = value;
+  }
+  return env;
+}
+
+/** At most CLAUDE_MAX_PARALLEL (2) CLI processes at a time; up to 20 more wait, the rest are refused. */
+const MAX_PARALLEL = Math.max(1, Number(process.env.CLAUDE_MAX_PARALLEL || 2));
+const MAX_QUEUE = 20;
+let running = 0;
+const queue: Array<() => void> = [];
+async function acquire(): Promise<void> {
+  if (running < MAX_PARALLEL) {
+    running++;
+    return;
+  }
+  if (queue.length >= MAX_QUEUE) throw new ClaudeCliError('Claude сейчас занят, попробуйте через минуту');
+  await new Promise<void>((resolve) => queue.push(resolve));
+  running++;
+}
+function release(): void {
+  running--;
+  const next = queue.shift();
+  if (next) next();
+}
 
 @Injectable()
 export class ClaudeCliClient {
@@ -67,9 +98,11 @@ export class ClaudeCliClient {
       mcpFile = join(tmpdir(), `crm-mcp-${randomBytes(8).toString('hex')}.json`);
       await writeFile(mcpFile, JSON.stringify({ mcpServers: options.mcpServers }), { mode: 0o600 });
     }
+    await acquire();
     try {
       return await this.runWith(options, timeoutSec, mcpFile);
     } finally {
+      release();
       if (mcpFile) await unlink(mcpFile).catch(() => undefined);
     }
   }
@@ -114,7 +147,8 @@ export class ClaudeCliClient {
 
     if (!result) {
       const detail = (stderr || stdout).trim().split('\n').slice(-3).join(' ').slice(0, 300);
-      throw new ClaudeCliError(`Claude не вернул результат (код ${code})${detail ? `: ${detail}` : ''}`, true);
+      if (detail) console.warn(`[ClaudeCliClient] no result (code ${code}): ${detail}`);
+      throw new ClaudeCliError(`Claude не вернул результат (код ${code})`, true);
     }
     if (result.is_error || result.subtype !== 'success') {
       const detail = String(result.result || result.api_error_status || result.subtype || 'неизвестная ошибка').slice(0, 300);
@@ -127,12 +161,20 @@ export class ClaudeCliClient {
     return { text, model: init?.model ?? null, tools: Array.isArray(init?.tools) ? init.tools : [] };
   }
 
-  private spawn(args: string[], input: string, timeoutSec: number) {
+  private async spawn(args: string[], input: string, timeoutSec: number) {
+    // a private empty working directory per run, removed afterwards
+    const cwd = await mkdtemp(join(tmpdir(), 'crm-claude-'));
+    try {
+      return await this.spawnIn(cwd, args, input, timeoutSec);
+    } finally {
+      await rm(cwd, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  private spawnIn(cwd: string, args: string[], input: string, timeoutSec: number) {
     return new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve, reject) => {
-      const env = { ...process.env };
-      for (const name of DROPPED_ENV) delete env[name];
       // No shell: arguments go as an array, recognized text can't become a command.
-      const child = spawn(this.bin, args, { cwd: tmpdir(), windowsHide: true, env });
+      const child = spawn(this.bin, args, { cwd, windowsHide: true, env: cliEnv() });
       let stdout = '';
       let stderr = '';
       let settled = false;

@@ -1,3 +1,4 @@
+import { SimilarService } from './similar.service';
 import { ClientHistoryService } from '../deal/client-history.service';
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
@@ -23,7 +24,7 @@ import { FileModule } from 'src/file/file.module';
     FileModule,
   ],
   // ClientHistoryService: stateless, needs only the Deal repository (DealModule imports CompanyModule)
-  providers: [CompanyService, ClientHistoryService],
+  providers: [SimilarService, CompanyService, ClientHistoryService],
   controllers: [CompanyController],
   exports: [CompanyService],
 })

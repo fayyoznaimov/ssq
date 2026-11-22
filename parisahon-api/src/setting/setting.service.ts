@@ -1,3 +1,4 @@
+import { safeHtml } from '../helper/safe-html';
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { Repository } from 'typeorm';
 import { Setting } from './setting.entity';
@@ -55,6 +56,10 @@ export class SettingService {
           `User with id: ${setting.default_agent.id} is not an agent!`,
         );
       }
+    }
+
+    if (data.mail_signature !== undefined) {
+      setting.mail_signature = data.mail_signature.trim() ? safeHtml(data.mail_signature) : null;
     }
 
     await this.settingRepository.save(setting);

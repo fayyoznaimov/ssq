@@ -1,3 +1,4 @@
+import { escapeHtml } from '../helper/safe-html';
 import {
   BadRequestException,
   ForbiddenException,
@@ -30,6 +31,9 @@ export class MailSignService {
       .getRawOne<UserWithSign>();
 
     if (!userWithSign) {
+      // no signature of their own: the company template with the manager's name, phone and e-mail
+      const company = await this.companySignature(user_id);
+      if (company) return company;
       throw new NotFoundException(
         `User ${user_id} does not have a sign set up!`,
       );
@@ -91,5 +95,22 @@ export class MailSignService {
     ) {
       throw new ForbiddenException('Можно менять только свою подпись');
     }
+  }
+
+  /** The company signature (setting.mail_signature) filled in for a staff user, or null. */
+  private async companySignature(user_id: number): Promise<UserWithSign | null> {
+    const rows = await this.userRepository.manager.query(
+      `SELECT u.id, u.username, u.phone, u.email, u.role,
+              (SELECT s.mail_signature FROM setting s ORDER BY s.id DESC LIMIT 1) AS template
+         FROM "user" u WHERE u.id = $1 AND u.deleted_at IS NULL`,
+      [user_id],
+    );
+    const row = rows[0];
+    if (!row || row.role === RoleEnum.CTR_AGENT || !row.template) return null;
+    const sign = String(row.template)
+      .replace(/\{\{\s*name\s*\}\}/g, escapeHtml(row.username ?? ''))
+      .replace(/\{\{\s*phone\s*\}\}/g, escapeHtml(row.phone ?? ''))
+      .replace(/\{\{\s*email\s*\}\}/g, escapeHtml(row.email ?? ''));
+    return { user_id: row.id, username: row.username, sign } as UserWithSign;
   }
 }

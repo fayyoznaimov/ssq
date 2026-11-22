@@ -1,4 +1,4 @@
-import { Entity, JoinColumn, ManyToOne, PrimaryGeneratedColumn } from 'typeorm';
+import { Column, Entity, JoinColumn, ManyToOne, PrimaryGeneratedColumn } from 'typeorm';
 import { DealStage } from '../deal_stage/deal_stage.entity';
 import { User } from '../user/user.entity';
 
@@ -19,4 +19,8 @@ export class Setting {
     onDelete: 'SET NULL',
   })
   default_agent: User;
+
+  // the company's e-mail signature template: HTML with {{name}}, {{phone}}, {{email}} (sanitised on save)
+  @Column({ type: 'text', nullable: true })
+  mail_signature: string | null;
 }
