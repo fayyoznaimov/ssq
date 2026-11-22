@@ -25,7 +25,8 @@ const loaded = ref(false);
 const EXAMPLE = `<table cellpadding="0" cellspacing="0" style="font-family: Arial, sans-serif; font-size: 13px; color: #334155">
   <tr>
     <td style="padding-right: 14px; vertical-align: top">
-      <img src="https://crm.parisahome.com/logo.png" alt="Parisa Home" width="64" height="64">
+      <div style="font-size: 20px; font-weight: bold; letter-spacing: 3px; color: #0d9488">PARISA</div>
+      <div style="font-size: 10px; letter-spacing: 4px; color: #64748b">HOME</div>
     </td>
     <td style="border-left: 2px solid #14b8a6; padding-left: 14px; line-height: 1.5">
       <b style="font-size: 15px; color: #0f172a">{{name}}</b><br>
@@ -88,8 +89,8 @@ async function save() {
                     <BaseButton variant="pastel" @click="template = ''">Очистить</BaseButton>
                 </div>
                 <p class="text-xs text-muted-400">
-                    Скрипты, формы и обработчики событий удаляются при сохранении. Логотип — ссылка на картинку
-                    в интернете (https).
+                    Скрипты, формы и обработчики событий удаляются при сохранении. В образце логотип текстом; чтобы
+                    поставить картинку, замените его на &lt;img src="https://…"&gt; со ссылкой на логотип в интернете.
                 </p>
             </BaseCard>
             <BaseCard class="flex flex-col gap-4 p-6">
