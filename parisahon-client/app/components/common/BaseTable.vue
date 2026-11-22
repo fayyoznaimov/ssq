@@ -146,15 +146,12 @@
                                     hyperlink
                                 />
                             </template>
-                            <span
-                                v-else
-                                v-html="getValue(item, column)"
-                            />
+                            <!-- values are text: names come from clients (Telegram, WhatsApp), never markup -->
+                            <span v-else>{{ getValue(item, column) }}</span>
                             <div
                                 v-if="column.subtitle"
                                 class="text-muted-400 dark:text-muted-600 text-sm"
-                                v-html="column.subtitle(item)"
-                            />
+                            >{{ column.subtitle(item) }}</div>
                         </slot>
                     </TairoTableCell>
                     <slot

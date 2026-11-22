@@ -91,6 +91,14 @@
                 :classes="{ wrapper: 'w-full mb-3' }"
             />
 
+            <SimilarClients
+                :name="agent.username"
+                :phone="agent.phone"
+                :email="agent.email"
+                :exclude-contact-id="agent.id && !agent.new ? agent.id : null"
+                class="mb-3"
+            />
+
             <!-- FILLERS -->
             <BaseInput
                 v-for="(filler, fillerIdx) in agent.fillers || []"
@@ -126,6 +134,7 @@
 </template>
 
 <script setup lang="ts">
+import SimilarClients from '~/components/company/SimilarClients.vue';
 const ctrAgentsStore = useCtrAgentsStore();
 
 const { addCtrAgent, removeCtrAgent } = ctrAgentsStore;

@@ -135,6 +135,15 @@ export default defineAppConfig({
                                 to: "/analytics/calls",
                                 subject: "Calls"
                             },
+                            {
+                                name: "Контроль менеджеров",
+                                icon: {
+                                    name: "ph:gauge",
+                                    class: "w-5 h-5"
+                                },
+                                to: "/analytics/control",
+                                subject: "Control"
+                            },
                         ]
                     },
                     {
@@ -238,6 +247,15 @@ export default defineAppConfig({
                                 },
                                 to: "/settings/transporters",
                                 subject: "Transporter"
+                            },
+                            {
+                                name: "Подпись в письмах",
+                                icon: {
+                                    name: "ph:signature",
+                                    class: "w-5 h-5"
+                                },
+                                to: "/settings/signature",
+                                subject: "MailSignature"
                             },
                             {
                                 name: "Запись звонков",

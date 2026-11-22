@@ -177,6 +177,7 @@
                     v-if="messageType.id === 'email'" 
                     :reply-options="replyEmails"
                     :to="toEmail"
+                    :deal-id="route.params.id ? Number(route.params.id) : undefined"
                 />
                 <BaseTextarea
                     v-else

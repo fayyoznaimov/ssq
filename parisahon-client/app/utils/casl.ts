@@ -21,6 +21,7 @@ export const ANALYTICS_SUBJECTS = [
     'Goals',
     'Consolidated',
     'Calls',
+    'Control',
 ];
 
 export function abilityFor(user: User) {

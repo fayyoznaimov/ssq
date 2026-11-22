@@ -22,10 +22,16 @@ export function useNinjaMark(
             return escapeHtml(txt);
         }
 
-        const regex = new RegExp(srch, 'gi');
-
-        return txt.replace(regex, (part) => {
-            return `<mark class="${classes.value}">${escapeHtml(part)}</mark>`;
-        });
+        // the search is text, not a pattern; everything outside the marks is escaped too
+        const regex = new RegExp(srch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+        let out = '';
+        let last = 0;
+        for (const found of txt.matchAll(regex)) {
+            const at = found.index ?? 0;
+            out += escapeHtml(txt.slice(last, at));
+            out += `<mark class="${escapeHtml(classes.value ?? '')}">${escapeHtml(found[0])}</mark>`;
+            last = at + found[0].length;
+        }
+        return out + escapeHtml(txt.slice(last));
     });
 }

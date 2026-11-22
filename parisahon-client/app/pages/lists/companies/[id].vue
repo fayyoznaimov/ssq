@@ -56,6 +56,13 @@
                             :error="errors.email || recognitionWarning('email')"
                         />
                         <p v-if="company.email_from_contact" class="-mt-2 text-xs text-muted-500">Почта основного контакта ({{ company.email_from_contact }}); сохранится как почта компании.</p>
+                        <SimilarClients
+                            :name="company.name"
+                            :phone="company.phone"
+                            :email="company.email"
+                            :inn="company.inn"
+                            :exclude-company-id="isAdd ? null : Number(route.params.id)"
+                        />
                         <ul class="flex flex-col gap-3">
                             <li
                                 v-for="(filler, idx) in company.fillers"
@@ -184,6 +191,7 @@
 </template>
 
 <script lang="ts" setup>
+import SimilarClients from '~/components/company/SimilarClients.vue';
 import { Can } from "@casl/vue";
 
 import CardRecognition, { type RecognitionResult } from "~/components/company/CardRecognition.vue";
