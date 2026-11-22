@@ -1,3 +1,5 @@
+import re
+import secrets
 import pyrogram
 from typing import List
 from .file import File
@@ -28,8 +30,20 @@ def message_has_acceptable_media_type(message: pyrogram.types.Message) -> bool:
 
 
 def generate_random_filename():
-    letters = string.ascii_lowercase
-    return ''.join(random.choice(letters) for i in range(10))
+    # uploads are served by URL: names must not be guessable (cryptographic, 128 bits)
+    return secrets.token_hex(16)
+
+
+# Extensions a browser would open as a page with scripts in the CRM origin: stored as .bin
+# (the same rule as the API, parisahon-api/src/file/file.service.ts ACTIVE_EXTENSIONS)
+ACTIVE_EXTENSIONS = {'html', 'htm', 'xhtml', 'xht', 'shtml', 'svg', 'svgz', 'xml', 'xsl', 'xslt', 'js', 'mjs'}
+
+
+def safe_extension(ext: str) -> str:
+    ext = (ext or '').lower()
+    if not re.fullmatch(r'[a-z0-9]{1,8}', ext) or ext in ACTIVE_EXTENSIONS:
+        return 'bin'
+    return ext
 
 
 def extract_file_name(url: str, without_extension: bool = False) -> str:
@@ -116,7 +130,7 @@ async def save_document(
     files = []
     try:
         # Generate a unique file name
-        file_name = f"{output_dir}/document_{generate_random_filename()}.{extract_file_extension(message.document.file_name)}"
+        file_name = f"{output_dir}/document_{generate_random_filename()}.{safe_extension(extract_file_extension(message.document.file_name))}"
 
         # Download document file
         await client.download_media(message=message, file_name=file_name, in_memory=False, block=True)

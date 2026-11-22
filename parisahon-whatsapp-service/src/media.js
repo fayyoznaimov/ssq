@@ -30,13 +30,17 @@ EXT_MIME.ogg = 'audio/ogg; codecs=opus'
 EXT_MIME.mp3 = 'audio/mpeg'
 EXT_MIME.webm = 'video/webm'
 
-const safeExt = (ext) => (ext && /^[a-z0-9]{1,8}$/.test(ext) ? ext : null)
+// Extensions a browser would open as a page with scripts in the CRM origin: stored as .bin
+// (the same rule as the API, parisahon-api/src/file/file.service.ts ACTIVE_EXTENSIONS)
+const ACTIVE_EXT = new Set(['html', 'htm', 'xhtml', 'xht', 'shtml', 'svg', 'svgz', 'xml', 'xsl', 'xslt', 'js', 'mjs'])
+const safeExt = (ext) => (ext && /^[a-z0-9]{1,8}$/.test(ext) ? (ACTIVE_EXT.has(ext) ? 'bin' : ext) : null)
 
 export function extensionFor(media) {
   const fromName = safeExt(path.extname(media.fileName || '').slice(1).toLowerCase())
   if (media.kind === 'document' && fromName) return fromName
   const mime = String(media.mimetype || '').split(';')[0].trim().toLowerCase()
-  return MIME_EXT[mime] || fromName || DEFAULT_EXT[media.kind] || 'bin'
+  const ext = MIME_EXT[mime] || fromName || DEFAULT_EXT[media.kind] || 'bin'
+  return ACTIVE_EXT.has(ext) ? 'bin' : ext
 }
 
 /** A file name safe to show: no directories, no control characters, at most 180 characters. */
