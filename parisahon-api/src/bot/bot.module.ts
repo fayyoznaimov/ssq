@@ -1,3 +1,4 @@
+import { BotWaitingService } from './bot-waiting.service';
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { CompanyModule } from '../company/company.module';
@@ -20,7 +21,7 @@ import { BotLinkController } from './bot-link.controller';
     TaskModule,
     RecognitionModule,
   ],
-  providers: [BotService, BotCrmService, BotToolsService, BotAssistantService, BotSpeechService, BotReminderService],
+  providers: [BotService, BotCrmService, BotToolsService, BotAssistantService, BotSpeechService, BotReminderService, BotWaitingService],
   controllers: [BotMcpController, BotLinkController],
 })
 export class BotModule {}
