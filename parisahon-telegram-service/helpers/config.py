@@ -30,3 +30,7 @@ SESSION_RETRY_SEC = int(env("SESSION_RETRY_SEC", "300"))
 
 # downloaded media go here (parisahon-api/public/uploads)
 UPLOADS_DIR = env("RECORDINGS_TARGET", "/app/uploads")
+
+# a file above this size is not saved in the CRM: it stays in Telegram and the CRM shows a link that
+# fetches it on demand (GET /download). 0 = save everything, as before.
+MAX_AUTO_DOWNLOAD_MB = float(env("TG_MAX_AUTO_DOWNLOAD_MB", "25"))

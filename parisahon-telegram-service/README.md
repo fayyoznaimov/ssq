@@ -18,6 +18,11 @@ Connects the managers' own Telegram accounts (Pyrogram) to the CRM.
   account through `contacts.importContacts` (the number stays in their Telegram contacts, so they can write
   to it). 400 no session / bad phone, 429 Telegram's flood limit (`retry_after`), 503 no answer in
   `RESOLVE_TIMEOUT_SEC` (20). `helpers/phone_lookup.py`.
+- A file above `TG_MAX_AUTO_DOWNLOAD_MB` (25; 0 = no limit) is not saved: the payload carries
+  `{remote: true, size, mime}` instead of a path, and the CRM shows a link. `GET /download?user_id&chat_id&message_id`
+  streams such a file from Telegram through that manager's account when somebody clicks the link; nothing
+  is kept on the server (`helpers/media_download.py`). It works while the message exists in Telegram and
+  the manager's account is connected.
 - A message sent from the CRM (`POST /new-message`) is answered only after Telegram accepted it;
   the API records it. Two-step verification is supported when connecting (`needs_password`).
 - Call recordings from the recorder's folders (`RECORDINGS_SOURCE/<CRM user id>/*.amr + .json`) are

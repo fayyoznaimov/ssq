@@ -35,7 +35,7 @@ from pyrogram.handlers import MessageHandler
 load_dotenv()  # take environment variables from .env.
 
 from helpers import config  # noqa: E402  (after load_dotenv)
-from helpers import media_type_handler, message_handler, name_lookup, phone_lookup, profile_photo, session_crypto  # noqa: E402
+from helpers import media_download, media_type_handler, message_handler, name_lookup, phone_lookup, profile_photo, session_crypto  # noqa: E402
 from helpers.api_client import CrmApi  # noqa: E402
 from helpers.chat_filter import message_payload, peer_of, reason_to_skip  # noqa: E402
 from helpers.file import File  # noqa: E402
@@ -71,6 +71,7 @@ db_sessions: Dict[int, LocalSession] = {}
 api: Optional[CrmApi] = None
 photo_cache = profile_photo.PhotoCache()         # chat id -> when the client's photo was sent / checked
 lookup_tasks: Set[asyncio.Task] = set()          # running /resolve-phone lookups
+download_tasks: Set[asyncio.Task] = set()        # running GET /download streams
 
 
 def recordings_enabled() -> bool:
@@ -116,6 +117,10 @@ def fetch_all_sessions() -> Dict[int, LocalSession]:
 # ------------------------------------------------------------------ incoming messages
 
 async def save_files(client: Client, message: pyrogram.types.Message) -> List[File]:
+    # a big file is not downloaded: the CRM gets its name and size and fetches it on demand
+    remote = media_type_handler.remote_file(message, config.MAX_AUTO_DOWNLOAD_MB)
+    if remote is not None:
+        return [remote]
     if message.voice:
         return await media_type_handler.save_audio(client, message)
     if message.document:
@@ -133,7 +138,7 @@ async def save_files(client: Client, message: pyrogram.types.Message) -> List[Fi
 
 def remove_files(files: List[File]) -> None:
     for file in files:
-        if file is None:
+        if file is None or not file.path:
             continue
         path = os.path.join(config.UPLOADS_DIR, os.path.basename(file.path))
         try:
@@ -194,6 +199,19 @@ async def send_message(message: message_handler.Message) -> Tuple[bool, str, lis
     except Exception as e:
         listener_logger.error(f"[{ctx.name}] could not send to {message.to_user}: {e}")
         return False, f"Telegram не принял сообщение: {e}", sent
+
+
+# ------------------------------------------------------------------ big files on demand (GET /download)
+
+def start_download(request: media_download.MediaDownload, send_results) -> None:
+    ctx = contexts.get(int(request.user_id))
+    if ctx is None:
+        send_results[request.request_id] = {"ok": False, "status": 400, "message": "У менеджера нет подключённого Telegram"}
+        return
+    task = asyncio.get_running_loop().create_task(
+        media_download.run_download(ctx.client, request, send_results, listener_logger.error))
+    download_tasks.add(task)
+    task.add_done_callback(download_tasks.discard)
 
 
 # ------------------------------------------------------------------ phone lookup (POST /resolve-phone)
@@ -317,6 +335,9 @@ async def main_loop(message_queue: multiprocessing.Queue, send_results) -> None:
                 message = message_queue.get_nowait()
                 if isinstance(message, (phone_lookup.PhoneLookup, name_lookup.NameLookup)):
                     start_lookup(message, send_results)
+                    continue
+                if isinstance(message, media_download.MediaDownload):
+                    start_download(message, send_results)
                     continue
                 ok, reason, sent = await send_message(message)
                 send_results[message.request_id] = {"ok": ok, "reason": reason, "sent": sent}

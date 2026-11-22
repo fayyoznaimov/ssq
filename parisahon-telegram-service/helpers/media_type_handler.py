@@ -29,6 +29,19 @@ def message_has_acceptable_media_type(message: pyrogram.types.Message) -> bool:
     ]) or message.text
 
 
+def remote_file(message: pyrogram.types.Message, max_mb: float):
+    """A File without a local copy when the media of the message is bigger than max_mb, else None."""
+    from .media_download import media_name, media_of
+    if not max_mb or max_mb <= 0:
+        return None
+    kind, media = media_of(message)
+    size = int(getattr(media, 'file_size', 0) or 0)
+    if media is None or size <= max_mb * 1024 * 1024:
+        return None
+    return File(media_name(kind, media), '', kind, message.caption,
+                remote=True, size=size, mime=getattr(media, 'mime_type', None))
+
+
 def generate_random_filename():
     # uploads are served by URL: names must not be guessable (cryptographic, 128 bits)
     return secrets.token_hex(16)

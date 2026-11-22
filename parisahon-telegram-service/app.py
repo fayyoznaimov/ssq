@@ -14,6 +14,10 @@
   POST /resolve-name   {user_id, name} -> 200 {matches: [{tg_id, phone|null, username, first_name, last_name}]}:
                        whom that manager's Telegram shows under this name (contacts, then the latest chats);
                        a call recorder knows a Telegram call by the name only. Errors as /resolve-phone.
+  GET  /download       ?user_id&chat_id&message_id -> the file of that message, streamed from Telegram
+                       through the manager's account (files above TG_MAX_AUTO_DOWNLOAD_MB are not saved
+                       in the CRM; this fetches one when somebody asks for it). Nothing is kept here.
+                       400 no session, 404 the message or file is gone, 502/504 Telegram did not answer
   GET  /health         {ok, sessions, outbox}
 
 The listener (listener_session_string.py) runs in a separate process; the two
@@ -21,13 +25,15 @@ talk through a multiprocessing queue and manager dicts.
 """
 import os
 import sqlite3
+import tempfile
 import time
 import uuid
 import multiprocessing
 from typing import List
+from urllib.parse import quote
 
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify
+from flask import Flask, Response, request, jsonify
 
 load_dotenv()  # take environment variables from .env.
 
@@ -36,7 +42,7 @@ from helpers.Logger import Logger  # noqa: E402
 from helpers.Session import LoginCode, ActivationResult  # noqa: E402
 from helpers.message_handler import Message, Location, Contact  # noqa: E402
 from helpers.file import File  # noqa: E402
-from helpers import name_lookup, phone_lookup  # noqa: E402
+from helpers import media_download, name_lookup, phone_lookup  # noqa: E402
 from scripts import authenticate_user  # noqa: E402
 
 app = Flask(__name__)
@@ -59,6 +65,7 @@ activation_result_mutex = multiprocessing.Lock()
 
 SEND_TIMEOUT_SEC = int(os.environ.get("SEND_TIMEOUT_SEC", "60"))
 RESOLVE_TIMEOUT_SEC = float(os.environ.get("RESOLVE_TIMEOUT_SEC", "20"))
+DOWNLOAD_START_TIMEOUT_SEC = float(os.environ.get("DOWNLOAD_START_TIMEOUT_SEC", "45"))
 
 
 def fetch_all_db_sessions() -> List[dict]:
@@ -258,6 +265,57 @@ def resolve_name():
         time.sleep(0.2)
     logger.warning(f"resolve name for user {lookup.user_id}: no answer in {RESOLVE_TIMEOUT_SEC:g}s")
     return jsonify({"message": "Telegram не ответил вовремя"}), 503
+
+
+@app.route("/download", methods=["GET"])
+def download():
+    """A big file straight from Telegram: found and streamed by the listener, passed on while it arrives."""
+    try:
+        user_id = int(request.args["user_id"])
+        chat_id = int(request.args["chat_id"])
+        message_id = int(request.args["message_id"])
+    except (KeyError, ValueError):
+        return jsonify({"message": "user_id, chat_id and message_id are required"}), 400
+    if not has_session(user_id):
+        return jsonify({"message": "У менеджера нет подключённого Telegram"}), 400
+    if listener_process is None or not listener_process.is_alive():
+        return jsonify({"message": "Telegram-сервис не запущен"}), 503
+
+    fd, path = tempfile.mkstemp(prefix="tgdl_")
+    os.close(fd)
+    job = media_download.MediaDownload(user_id, chat_id, message_id, path)
+    rid = job.request_id
+    new_messages.put_nowait(job)
+
+    meta = None
+    deadline = time.time() + DOWNLOAD_START_TIMEOUT_SEC
+    while time.time() < deadline:
+        meta = send_results.pop(rid, None)
+        if meta is not None:
+            break
+        time.sleep(0.2)
+    if meta is None or not meta.get("ok"):
+        media_download.remove_quietly(path)
+        if meta is None:
+            # the listener may still pick the job up: it must not start streaming into nowhere
+            send_results[rid + ":cancel"] = True
+            logger.warning(f"download of message {message_id} for user {user_id}: no answer in {DOWNLOAD_START_TIMEOUT_SEC:g}s")
+            return jsonify({"message": "Telegram не ответил вовремя"}), 504
+        return jsonify({"message": meta.get("message") or "Не удалось получить файл"}), int(meta.get("status") or 502)
+
+    def generate():
+        try:
+            yield from media_download.follow_file(path, lambda: (rid + ":done") in send_results)
+        finally:
+            # the browser went away before the end: tell the listener to stop
+            if send_results.pop(rid + ":done", None) is None:
+                send_results[rid + ":cancel"] = True
+            media_download.remove_quietly(path)
+
+    headers = {"X-File-Name": quote(str(meta.get("name") or "file"))}
+    if meta.get("size"):
+        headers["Content-Length"] = str(meta["size"])
+    return Response(generate(), mimetype=meta.get("mime") or "application/octet-stream", headers=headers)
 
 
 def start_listener() -> None:

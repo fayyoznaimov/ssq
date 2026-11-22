@@ -139,6 +139,20 @@ try:
 except Exception:
     checks["backup"] = (False, "ночная копия базы ещё ни разу не сделана")
 
+# 7b. files: the nightly integrity check (integrity.py)
+try:
+    r = json.load(open(f"{STATE_DIR}/integrity.json"))
+    made = datetime.fromisoformat(r["at"].replace("Z", "+00:00"))
+    age = (datetime.now(timezone.utc) - made).total_seconds() / 3600
+    if age >= 26:
+        checks["files"] = (False, f"проверка целостности файлов не запускалась {age:.0f} ч")
+    else:
+        text = (f"файлы CRM: потеряно {len(r.get('lost', []))}, повреждено {len(r.get('damaged', []))}, "
+                f"записей без файла {len(r.get('missing_new', []))} (подробности в integrity.log)")
+        checks["files"] = (bool(r.get("ok")), text)
+except Exception:
+    checks["files"] = (False, "проверка целостности файлов ещё не запускалась")
+
 # 8. certificate
 try:
     ctx = ssl.create_default_context()

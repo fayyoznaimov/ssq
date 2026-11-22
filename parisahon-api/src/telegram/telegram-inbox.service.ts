@@ -2,6 +2,7 @@ import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import { extname } from 'path';
+import { randomBytes } from 'crypto';
 import { RoleEnum, User } from '../user/user.entity';
 import { Deal } from '../deal/deal.entity';
 import { Event, EventTypes } from '../events/event.entity';
@@ -10,7 +11,7 @@ import { File } from '../file/file.entity';
 import { WhichFiles } from '../trigger/dto/assign.trigger.dto';
 import { TriggerService } from '../trigger/trigger.service';
 import { ApplyTriggerWhenEnum } from '../trigger/dto/assign.trigger.dto';
-import { IncomingMessageDto } from './dto/incoming.message.dto';
+import { IncomingFileDto, IncomingMessageDto } from './dto/incoming.message.dto';
 import { MessengerLookupService } from '../messenger/messenger-lookup.service';
 import { ClientDealsService } from '../messenger/client-deals.service';
 
@@ -141,14 +142,17 @@ export class TelegramInboxService {
     const fromUser = data.outgoing ? agent : contact;
     const toUser = data.outgoing ? contact : agent;
     const files = await this.saveFiles(data, fromUser, targetDeals);
+    const eventFiles = [];
+    for (const f of data.files ?? []) {
+      eventFiles.push(
+        f.remote
+          ? await this.remoteFile(data, f)
+          : { name: f.name, path: f.path, type: f.type, caption: f.caption ?? null },
+      );
+    }
     const afterState = {
       message: data.text ?? '',
-      files: (data.files ?? []).map((f) => ({
-        name: f.name,
-        path: f.path,
-        type: f.type,
-        caption: f.caption ?? null,
-      })),
+      files: eventFiles,
       from_user_id: fromUser.id,
       to_user_id: toUser.id,
       outgoing: data.outgoing,
@@ -228,9 +232,38 @@ export class TelegramInboxService {
     return this.userRepository.save(contact);
   }
 
+  /**
+   * A file the service did not download because of its size: the event gets a link instead of a
+   * path (`url`, which the feed shows under the file's name), and telegram_remote_file remembers
+   * where the file is, so GET /telegram/remote-file/:token can fetch it when somebody clicks.
+   */
+  private async remoteFile(data: IncomingMessageDto, f: IncomingFileDto) {
+    const rows = await this.eventRepository.query(
+      `INSERT INTO telegram_remote_file (token, agent_id, chat_tg_id, tg_message_id, name, kind, size, mime)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (agent_id, chat_tg_id, tg_message_id) DO UPDATE SET name = EXCLUDED.name
+       RETURNING token`,
+      [randomBytes(16).toString('hex'), data.agent_id, data.chat.tg_id, data.tg_message_id,
+        String(f.name || 'file').slice(0, 255), f.type, f.size ?? null, f.mime ?? null],
+    );
+    const base = (process.env.CRM_PUBLIC_URL || '').replace(/\/+$/, '');
+    const mb = f.size ? Math.max(1, Math.round(f.size / 1048576)) : null;
+    return {
+      name: `${f.name} — ${mb ? `${mb} МБ, ` : ''}скачать из Telegram`,
+      path: '',
+      type: 'link',
+      caption: f.caption ?? null,
+      url: `${base}/api/v1/telegram/remote-file/${rows[0].token}`,
+      remote: true,
+      size: f.size ?? null,
+      original_type: f.type,
+    };
+  }
+
   private async saveFiles(data: IncomingMessageDto, uploadedBy: User, deals: Deal[]): Promise<File[]> {
-    if (!data.files?.length) return [];
-    const files = data.files.map((f) => {
+    const local = (data.files ?? []).filter((f) => !f.remote && f.path);
+    if (!local.length) return [];
+    const files = local.map((f) => {
       const file = new File();
       file.name = f.name;
       file.path = f.path;

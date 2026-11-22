@@ -4,5 +4,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 */5 * * * * root /usr/bin/python3 /root/crm2/ops/watchdog.py >/dev/null 2>&1
 # 02:15 Tashkent: database + settings + files, with a test restore
 15 21 * * * root /root/crm2/ops/backup.sh >/dev/null 2>&1
+# 02:35 Tashkent: every uploaded file against its checksum and the database; damaged or wrongly deleted files come back from the copies
+35 21 * * * root /usr/bin/python3 /root/crm2/ops/integrity.py >/dev/null 2>&1 </dev/null
 # Sunday night: identical uploaded files become one copy, unused docker layers go, big CRM logs are cut
 45 21 * * 0 root /root/crm2/ops/weekly.sh >> /root/crm2/ops/state/maintenance.log 2>&1

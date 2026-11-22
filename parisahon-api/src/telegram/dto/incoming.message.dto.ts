@@ -5,6 +5,7 @@ import {
   IsDefined,
   IsInt,
   IsISO8601,
+  IsNumber,
   IsObject,
   IsOptional,
   IsString,
@@ -52,10 +53,24 @@ export class IncomingFileDto {
   @MaxLength(255)
   name: string;
 
-  // file name inside parisahon-api/public/uploads (the service saves it there)
+  // file name inside parisahon-api/public/uploads (the service saves it there); '' for a remote file
   @IsString()
   @MaxLength(255)
   path: string;
+
+  // true: too big to save (TG_MAX_AUTO_DOWNLOAD_MB of the service), the file stays in Telegram
+  @IsOptional()
+  @IsBoolean()
+  remote?: boolean;
+
+  @IsOptional()
+  @IsNumber()
+  size?: number | null;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  mime?: string | null;
 
   @IsString()
   @MaxLength(32)

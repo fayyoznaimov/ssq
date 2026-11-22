@@ -13,6 +13,7 @@ import { TelegramInboxService } from './telegram-inbox.service';
 import { TelegramInboxController } from './telegram-inbox.controller';
 import { FileModule } from '../file/file.module';
 import { MessengerModule } from '../messenger/messenger.module';
+import { TelegramRemoteFileController } from './telegram-remote-file.controller';
 
 @Module({
   imports: [
@@ -24,6 +25,6 @@ import { MessengerModule } from '../messenger/messenger.module';
     MessengerModule,
   ],
   providers: [TelegramService, TelegramInboxService],
-  controllers: [TelegramController, TelegramInboxController],
+  controllers: [TelegramController, TelegramInboxController, TelegramRemoteFileController],
 })
 export class TelegramModule {}

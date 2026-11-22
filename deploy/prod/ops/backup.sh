@@ -3,6 +3,7 @@
 #   daily/<date>/db.dump        the database (pg_dump custom format), restored into a scratch database as a test
 #   daily/<date>/config.tar.gz  settings, keys, WhatsApp and Telegram sessions
 #   uploads/<date>/             files of the CRM; unchanged files are hard links to the previous day
+#                               (30 days + monthly for a year; integrity.py checks them every night)
 # Result: /root/crm2/ops/state/backup.json (the watchdog alerts when it is old or failed).
 # Everything stays on this server. To copy elsewhere put an executable /root/crm2/ops/offsite.sh (gets the day folder).
 set -uo pipefail
@@ -54,7 +55,14 @@ FILES=$(find "$ROOT/uploads/$DAY" -type f | wc -l)
 # 5. retention
 find "$ROOT/daily" -mindepth 1 -maxdepth 1 -type d -mtime +14 ! -name '*-01' -exec rm -rf {} +
 find "$ROOT/daily" -mindepth 1 -maxdepth 1 -type d -mtime +185 -exec rm -rf {} +
-find "$ROOT/uploads" -mindepth 1 -maxdepth 1 -type d | sort | head -n -7 | xargs -r rm -rf
+# file snapshots cost almost nothing (hard links): 30 days, and the 1st of each month for a year.
+# By folder name: rsync gives the folders the date of the uploads folder, not of the copy.
+cutoff=$(date -d '30 days ago' +%F); year_ago=$(date -d '366 days ago' +%F)
+for dir in "$ROOT"/uploads/*/; do
+  name=$(basename "$dir")
+  [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+  if [[ "$name" < "$year_ago" ]] || { [[ "$name" < "$cutoff" ]] && [[ "$name" != *-01 ]]; }; then rm -rf "$dir"; fi
+done
 
 OFFSITE=none
 if [ -x /root/crm2/ops/offsite.sh ]; then

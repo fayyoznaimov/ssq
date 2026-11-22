@@ -29,6 +29,9 @@ class File:
             from_number: Union[str, None] = None,
             direction: Union[str, None] = None,
             agent_id: Union[int, None] = None,
+            remote: bool = False,
+            size: Union[int, None] = None,
+            mime: Union[str, None] = None,
     ):
         self.name = name
         self.path = path
@@ -39,14 +42,21 @@ class File:
         self.from_number = from_number
         self.direction = direction
         self.agent_id = agent_id
+        # remote: too big to keep in the CRM, left in Telegram (no path); the CRM shows a download link
+        self.remote = remote
+        self.size = size
+        self.mime = mime
 
     def convert_to_dict(self) -> dict:
-        return {
+        data = {
             "name": self.name,
             "path": extract_file_name(self.path),
             "type": self.media_type,
             "caption": self.caption,
         }
+        if self.remote:
+            data.update({"remote": True, "size": self.size, "mime": self.mime})
+        return data
 
     @staticmethod
     def convert_list_to_dict(files: List['File']) -> List[dict]:
