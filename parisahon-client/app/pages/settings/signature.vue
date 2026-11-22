@@ -67,7 +67,7 @@ async function save() {
             <h1 class="text-xl">Подпись в письмах</h1>
             <p class="text-sm text-muted-500 dark:text-muted-400">
                 Одна подпись для всей компании. В письмо подставятся имя, телефон и почта менеджера:
-                <code>{{ '{{name}}' }}</code>, <code>{{ '{{phone}}' }}</code>, <code>{{ '{{email}}' }}</code>.
+                <code v-pre>{{name}}</code>, <code v-pre>{{phone}}</code>, <code v-pre>{{email}}</code>.
                 У менеджера со своей подписью остаётся своя.
             </p>
         </div>
