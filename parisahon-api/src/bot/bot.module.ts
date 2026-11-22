@@ -13,6 +13,7 @@ import { BotSpeechService } from './bot-speech.service';
 import { BotReminderService } from './bot-reminder.service';
 import { BotMcpController } from './bot-mcp.controller';
 import { BotLinkController } from './bot-link.controller';
+import { AutomationModule } from '../automation/automation.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { BotLinkController } from './bot-link.controller';
     CompanyModule,
     TaskModule,
     RecognitionModule,
+    AutomationModule,
   ],
   providers: [BotService, BotCrmService, BotToolsService, BotAssistantService, BotSpeechService, BotReminderService, BotWaitingService],
   controllers: [BotMcpController, BotLinkController],

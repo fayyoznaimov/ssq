@@ -78,6 +78,8 @@ export class DesktopService {
         'succesfull_deals',
       )
       .setParameters({ from_date: query.from_date, till_date: query.till_date })
+      // the numbers are sub-selects: one row is enough, not one per task
+      .limit(1)
       .getRawOne();
 
     const managerStats = await this.dataSource

@@ -1,0 +1,8 @@
+# CRM automation on the production server (installed 2026-11-22). Times are UTC; Tashkent = UTC+5.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * root /usr/bin/python3 /root/crm2/ops/watchdog.py >/dev/null 2>&1
+# 02:15 Tashkent: database + settings + files, with a test restore
+15 21 * * * root /root/crm2/ops/backup.sh >/dev/null 2>&1
+# Sunday night: identical uploaded files become one copy, unused docker layers go, big CRM logs are cut
+45 21 * * 0 root /root/crm2/ops/weekly.sh >> /root/crm2/ops/state/maintenance.log 2>&1

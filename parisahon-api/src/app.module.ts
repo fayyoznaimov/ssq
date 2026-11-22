@@ -35,6 +35,7 @@ import { NotificationGateWayModule } from './gateway/notification.gateway.module
 import { NotificationModule } from './notification/notification.module';
 import { RecognitionModule } from './recognition/recognition.module';
 import { BotModule } from './bot/bot.module';
+import { AutomationModule } from './automation/automation.module';
 import { CallsModule } from './calls/calls.module';
 import { AuthGuard } from './auth/auth.guard';
 
@@ -71,6 +72,7 @@ import { AuthGuard } from './auth/auth.guard';
     NotificationModule,
     RecognitionModule,
     BotModule,
+    AutomationModule,
     CallsModule,
   ],
   controllers: [AppController],

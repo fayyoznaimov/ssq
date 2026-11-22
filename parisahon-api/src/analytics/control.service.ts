@@ -121,8 +121,24 @@ export class ControlService implements OnModuleInit, OnModuleDestroy {
     if (this.timer) clearInterval(this.timer);
   }
 
-  /** event.replied_at of client messages that got an answer in the same deal. */
+  private filling = false;
+
+  /**
+   * event.replied_at of client messages that got an answer in the same deal. Looks at the last 30
+   * days only (CONTROL_REPLIED_DAYS), so the periodic run stays cheap however old the database is.
+   */
   async fillRepliedAt(): Promise<number> {
+    if (this.filling) return 0;
+    this.filling = true;
+    try {
+      return await this.fillRepliedAtOnce();
+    } finally {
+      this.filling = false;
+    }
+  }
+
+  private async fillRepliedAtOnce(): Promise<number> {
+    const days = Math.max(1, Number(process.env.CONTROL_REPLIED_DAYS || 30));
     const result = await this.dataSource.query(
       `UPDATE event q SET replied_at = a.at
          FROM (
@@ -131,9 +147,10 @@ export class ControlService implements OnModuleInit, OnModuleDestroy {
                             AND (m.created_at, m.id) > (c.created_at, c.id)) AS at
              FROM event c
             WHERE c.type = ANY($1) AND NOT c.outgoing AND c.replied_at IS NULL AND c.deal_id IS NOT NULL
+              AND c.created_at > now() - make_interval(days => $2::int)
          ) a
         WHERE q.id = a.id AND a.at IS NOT NULL`,
-      [CHAT_TYPES],
+      [CHAT_TYPES, days],
     );
     return Array.isArray(result) ? Number(result[1] ?? 0) : 0;
   }
@@ -182,9 +199,8 @@ export class ControlService implements OnModuleInit, OnModuleDestroy {
     const now = new Date();
     const sla = q.slaMinutes * 60;
     const waitLimit = q.waitingHours * 3600;
-    const closedStages = [process.env.DEAL_STAGE_CLOSED, process.env.DEAL_STAGE_CLOSED_NOT_REALIZED]
-      .map((x) => Number(x))
-      .filter((x) => Number.isInteger(x));
+    // DEAL_STAGE_CLOSED* are stage names
+    const closedStages = [process.env.DEAL_STAGE_CLOSED, process.env.DEAL_STAGE_CLOSED_NOT_REALIZED].filter(Boolean);
 
     const [turns, staff, deals, calls, openDeals] = await Promise.all([
       this.turns(q),
@@ -204,7 +220,8 @@ export class ControlService implements OnModuleInit, OnModuleDestroy {
         [q.from, q.till],
       ),
       this.dataSource.query(
-        `SELECT id FROM deal WHERE deleted_at IS NULL AND NOT (stage_id = ANY($1))`,
+        `SELECT d.id FROM deal d LEFT JOIN deal_stage s ON s.id = d.stage_id
+          WHERE d.deleted_at IS NULL AND d.closed_at IS NULL AND NOT (COALESCE(s.name, '') = ANY($1))`,
         [closedStages],
       ),
     ]);
