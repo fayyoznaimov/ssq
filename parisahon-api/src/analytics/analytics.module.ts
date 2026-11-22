@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { AnalyticsService } from './analytics.service';
+import { ControlService } from './control.service';
 import { AnalyticsController } from './analytics.controller';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { Deal } from 'src/deal/deal.entity';
@@ -26,7 +27,8 @@ import { Task } from 'src/task/task.entity';
     ]),
     HelperModule,
   ],
-  providers: [AnalyticsService],
+  providers: [AnalyticsService, ControlService],
+  exports: [ControlService],
   controllers: [AnalyticsController],
 })
 export class AnalyticsModule {}
