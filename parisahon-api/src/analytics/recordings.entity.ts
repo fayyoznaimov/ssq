@@ -11,6 +11,8 @@ import {
 
 // This table is being created for statistical purposes only
 @Index('IDX_recording_user', ['user'])
+// created by migration 1795130000000-perf-indexes (partial / expression indexes): TypeORM must leave them alone
+@Index('IDX_recording_created', { synchronize: false })
 @Entity()
 export class Recording {
   @PrimaryGeneratedColumn()

@@ -60,8 +60,9 @@ TAG = 'AUDIT-auth-' + RUN
 MISSING_ID = 999999999  # substituted for :params, so that nothing real is hit
 SECRET_KEYS = ('password', 'tg_api_hash', 'tg_api_id', 'sign')
 
-# The only routes that may answer without a token.
-PUBLIC_ROUTES = {('GET', '/'), ('POST', '/auth/login')}
+# The only routes that may answer without a token. /health tells only up/down (for the server watchdog);
+# /telegram/remote-file/:token is a download link like the files in /uploads (128-bit token, attachment only).
+PUBLIC_ROUTES = {('GET', '/'), ('POST', '/auth/login'), ('GET', '/health'), ('GET', '/telegram/remote-file/:token')}
 
 # Skip the JWT guard but check access themselves: the MCP endpoint of the CRM bot
 # answers only on 127.0.0.1 with a per-run session token (src/bot/bot-mcp.controller.ts).
@@ -358,8 +359,8 @@ def main():
         protected = [r for r in routes if r not in PUBLIC_ROUTES and r not in SELF_AUTH_ROUTES]
         check('controllers parsed: %d routes found' % len(routes), len(routes) > 100,
               'only %d routes parsed from %s' % (len(routes), API_SRC))
-        check('@Public() is used exactly 6 times in the controllers (login, hello, bot MCP, telegram and whatsapp incoming, calls upload)',
-              public_marks == 6 and PUBLIC_ROUTES <= set(routes) and SELF_AUTH_ROUTES <= set(routes),
+        check('@Public() is used exactly 8 times in the controllers (login, hello, health, bot MCP, telegram and whatsapp incoming, calls upload, telegram remote file)',
+              public_marks == 8 and PUBLIC_ROUTES <= set(routes) and SELF_AUTH_ROUTES <= set(routes),
               'found %d' % public_marks)
         answers = {r: http(r[0], EXTERNAL_BASE + r[1], body={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'} if r[0] == 'POST' else None)[0]
                    for r in sorted(SELF_AUTH_ROUTES)}
@@ -491,7 +492,7 @@ def main():
         ]
         manager_only_gets = [
             '/analytics/deals', '/analytics/calls', '/analytics/users',
-            '/analytics/consolidated-report', '/analytics/objectives',
+            '/analytics/consolidated-report', '/analytics/objectives', '/analytics/control',
             '/analytics/objectives/results', '/logs', '/users/manager-statistics',
             '/desktop?from_date=2026-01-01&till_date=2026-12-31&my_stats=false',
             '/desktop?from_date=2026-01-01&till_date=2026-12-31',

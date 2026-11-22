@@ -18,6 +18,10 @@ import { File } from '../file/file.entity';
  * This is done to optimize calculating statistics and to have more control
  * over the emails.
  */
+// created by migration 1795130000000-perf-indexes (partial / expression indexes): TypeORM must leave them alone
+@Index('IDX_email_mailbox_uid', { synchronize: false })
+@Index('IDX_email_mailbox_sent', { synchronize: false })
+@Index('IDX_email_user', { synchronize: false })
 @Entity()
 export class Email {
   @PrimaryGeneratedColumn()

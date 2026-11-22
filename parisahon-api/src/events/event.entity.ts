@@ -43,6 +43,11 @@ export enum FieldsOf {
 @Index('IDX_event_user', ['originated_by'])
 @Index('IDX_event_target_user', ['target_user'])
 @Index('IDX_event_task', ['task'])
+// created by migration 1795130000000-perf-indexes (partial / expression indexes): TypeORM must leave them alone
+@Index('IDX_event_type_created', { synchronize: false })
+@Index('IDX_event_chat_deal', { synchronize: false })
+@Index('IDX_event_chat_unreplied', { synchronize: false })
+@Index('IDX_event_deal_tg_message', { synchronize: false })
 @Entity()
 export class Event {
   @PrimaryGeneratedColumn()

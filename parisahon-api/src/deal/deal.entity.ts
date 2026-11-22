@@ -25,6 +25,11 @@ import { DealStageRecord } from 'src/deal_stage/deal_stage.records.entity';
 @Index('IDX_deal_agent', ['agent'])
 @Index('IDX_deal_company', ['company'])
 @Index('IDX_deal_repeat_of', ['repeat_of'])
+// created by migration 1795130000000-perf-indexes (partial / expression indexes): TypeORM must leave them alone
+@Index('IDX_deal_created', { synchronize: false })
+@Index('IDX_deal_closed', { synchronize: false })
+@Index('IDX_deal_open_stage', { synchronize: false })
+@Index('IDX_deal_created_by', { synchronize: false })
 @Entity()
 export class Deal {
   @PrimaryGeneratedColumn()

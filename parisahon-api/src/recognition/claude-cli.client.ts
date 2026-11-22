@@ -61,7 +61,8 @@ const PASSED_ENV = ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 
 function cliEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(process.env)) {
-    if (PASSED_ENV.includes(name) || name.startsWith('CLAUDE_CODE_') || name === 'CLAUDE_CONFIG_DIR') env[name] = value;
+    // FAKE_CLAUDE_*: switches of the stand-in CLI of the tests (local/fake-claude), nothing in production
+    if (PASSED_ENV.includes(name) || name.startsWith('CLAUDE_CODE_') || name.startsWith('FAKE_CLAUDE_') || name === 'CLAUDE_CONFIG_DIR') env[name] = value;
   }
   return env;
 }

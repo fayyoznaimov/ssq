@@ -360,11 +360,9 @@ export class UserService {
     user.email = data.email;
     user.phone = data.phone;
 
-    // a new password, role or rights signs the account out everywhere (token_version, see AuthGuard)
-    const signOut =
-      !!data.password ||
-      user.role !== data.role ||
-      JSON.stringify(user.permissions ?? null) !== JSON.stringify(data.permissions ?? null);
+    // a new password signs the account out everywhere (token_version, see AuthGuard). A new role or new
+    // rights need no new login: AuthGuard reads both from the database on every request, so they apply at once.
+    const signOut = !!data.password;
 
     if (data.password) {
       user.password = await bcrypt.hash(data.password, salt);

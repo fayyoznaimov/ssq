@@ -67,6 +67,9 @@ interface Permission {
 @Index('IDX_user_wa_id', ['wa_id'])
 // digits-only phone lookup of contacts (Telegram, call recordings); created by the migration
 @Index('IDX_user_phone_digits', { synchronize: false })
+// created by migration 1795130000000-perf-indexes (partial / expression indexes): TypeORM must leave them alone
+@Index('IDX_user_email_lower', { synchronize: false })
+@Index('IDX_user_group', { synchronize: false })
 @Entity()
 export class User {
   @PrimaryGeneratedColumn()

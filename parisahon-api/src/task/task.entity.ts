@@ -28,6 +28,10 @@ export const DefaultTaskRelations = [
 @Index('IDX_task_deal', ['deal'])
 @Index('IDX_task_agent', ['agent'])
 @Index('IDX_task_company', ['company'])
+// created by migration 1795130000000-perf-indexes (partial / expression indexes): TypeORM must leave them alone
+@Index('IDX_task_open_agent', { synchronize: false })
+@Index('IDX_task_open_deal', { synchronize: false })
+@Index('IDX_task_created', { synchronize: false })
 @Entity()
 export class Task {
   @PrimaryGeneratedColumn()

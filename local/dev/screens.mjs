@@ -58,7 +58,10 @@ try {
       await page.screenshot({ path: file, fullPage: true });
       // a page wider than the screen is the usual sign of a broken layout
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
-      const finalPath = new URL(page.url()).pathname;
+      // SCREEN_BASE: the web copy is served under a prefix (the QA stand serves the /preview/ build)
+      const base = (process.env.SCREEN_BASE || '').replace(/\/+$/, '');
+      const fullPath = new URL(page.url()).pathname;
+      const finalPath = base && fullPath.startsWith(base) ? fullPath.slice(base.length) || '/' : fullPath;
       files.push(file);
       report.push({ path, size: size.name, file, url: finalPath, overflow, pageErrors: errors.splice(0), consoleErrors: consoleErrors.splice(0), api5xx: failed.splice(0) });
       if (!json) {
