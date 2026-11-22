@@ -139,7 +139,7 @@ export class UserController {
   async changeOwnPassword(
     @Body() data: ChangeOwnPasswordDto,
     @Req() request: Request,
-  ): Promise<void> {
+  ): Promise<{ access_token: string }> {
     return this.userService.changeOwnPassword(request['user'].sub, data);
   }
 

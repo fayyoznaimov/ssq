@@ -38,7 +38,7 @@ export class UpdateUserDto extends LoginUserDto {
 
   @IsOptional()
   @IsNotEmpty()
-  @Length(10, 255)
+  @Length(10, 255, { message: 'Пароль: от 10 символов' })
   password: string;
 
   @IsOptional()
@@ -88,6 +88,6 @@ export class ChangeOwnPasswordDto {
   old_password: string;
 
   @IsString()
-  @Length(10, 255)
+  @Length(10, 255, { message: 'Новый пароль: от 10 символов' })
   new_password: string;
 }

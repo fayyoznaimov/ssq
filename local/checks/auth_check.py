@@ -698,6 +698,11 @@ def main():
         check('old password stops working -> 401', status == 401, 'status %s' % status)
         status, token, _ = login(agent['email'], new_password)
         check('new password works -> 200', status == 200 and bool(token), 'status %s' % status)
+        old_token = agent['token']
+        status, _ = http('GET', '/deals?limit=1', token=old_token)
+        check('a new password signs out the tokens issued before it -> 401', status == 401, 'status %s' % status)
+        if token:
+            agent['token'] = token
         status, me = http('GET', '/users/%d' % agent['id'], token=admin_token)
         check('extra fields in that request changed nothing else (role, group)',
               me.get('role') == 'agent' and (me.get('group') or {}).get('id') == agent['group_id'],
@@ -775,6 +780,11 @@ def main():
         else:
             def forged(**claims):
                 payload = {'iat': now, 'exp': now + 600}
+                sub_id = claims.get('sub')
+                if isinstance(sub_id, int) and sub_id != MISSING_ID:
+                    out = (psql('select coalesce(token_version, 0) from "user" where id = %d' % sub_id) or '').strip()
+                    if out.isdigit():
+                        payload['tv'] = int(out)
                 payload.update(claims)
                 return sign_jwt(payload, jwt_secret)
 

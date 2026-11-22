@@ -28,6 +28,7 @@ import { Group } from '../group/group.entity';
 import { Field, FieldValueEventDto } from '../events/dto/field.value.event.dto';
 import { EventTypes, FieldsOf } from '../events/event.entity';
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import { JwtService } from '@nestjs/jwt';
 import { Request } from 'express';
 import { File } from '../file/file.entity';
 
@@ -44,6 +45,7 @@ export class UserService {
     private helperService: HelperService,
     private eventEmitter: EventEmitter2,
     private dataSource: DataSource,
+    private jwtService: JwtService,
   ) {}
 
   async findById(id: number, withRelations: boolean = false): Promise<User> {
@@ -279,7 +281,7 @@ export class UserService {
   async changeOwnPassword(
     userId: number,
     data: ChangeOwnPasswordDto,
-  ): Promise<void> {
+  ): Promise<{ access_token: string }> {
     const user = await this.userRepository
       .createQueryBuilder('t0')
       .addSelect('t0.password')
@@ -301,11 +303,14 @@ export class UserService {
       );
     }
 
-    // the new password signs out every other device (token_version, see AuthGuard)
+    // the new password signs out every other device (token_version, see AuthGuard) ...
     await this.userRepository.update(
       { id: user.id },
       { password: await bcrypt.hash(data.new_password, 10), token_version: () => 'token_version + 1' } as any,
     );
+    // ... while this one stays signed in with a fresh token (same claims as AuthService.signIn)
+    const rows = await this.dataSource.query(`SELECT token_version FROM "user" WHERE id = $1`, [user.id]);
+    return { access_token: await this.jwtService.signAsync({ sub: user.id, tv: Number(rows[0]?.token_version ?? 0) }) };
   }
 
   /**

@@ -158,13 +158,15 @@ async function changePassword() {
     password.error = '';
     password.errors = {old: '', new: '', repeat: ''};
     if (!password.old) password.errors.old = 'Введите текущий пароль';
-    if (password.new.length < 8) password.errors.new = 'Не меньше 8 символов';
+    if (password.new.length < 10) password.errors.new = 'Не меньше 10 символов';
     if (password.repeat !== password.new) password.errors.repeat = 'Пароли не совпадают';
     if (password.errors.old || password.errors.new || password.errors.repeat) return;
 
     password.busy = true;
     try {
-        await usersService.patch('me/password', {old_password: password.old, new_password: password.new}).exec();
+        const answer: any = await usersService.patch('me/password', {old_password: password.old, new_password: password.new}).exec();
+        // the new password signs out the other devices; this one goes on with the fresh token
+        if (answer?.access_token) localStorage.setItem('token', answer.access_token);
         password.old = password.new = password.repeat = '';
         password.done = true;
     } catch (e) {
