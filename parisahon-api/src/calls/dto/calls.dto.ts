@@ -67,9 +67,39 @@ export class RecordingsQueryDto {
   limit?: number;
 }
 
+/** A page of calls: the company card, a staff member's own list (GET /calls/companies/:id, /calls/staff/:id). */
+export class CallFeedQueryDto {
+  // YYYY-MM-DD, both days included
+  @IsOptional()
+  @IsString()
+  from?: string;
+
+  @IsOptional()
+  @IsString()
+  till?: string;
+
+  @IsOptional()
+  @IsString()
+  @Length(1, 64)
+  number?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  page?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit?: number;
+}
+
 export class QueueQueryDto {
   @IsOptional()
-  @IsIn(['pending', 'done', 'failed', 'discarded', 'all'])
+  @IsIn(['pending', 'done', 'failed', 'discarded', 'duplicate', 'all'])
   status?: string;
 
   @IsOptional()

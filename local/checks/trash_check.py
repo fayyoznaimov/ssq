@@ -22,7 +22,8 @@ What is checked
               a stage comes back in the default stage
   purge       admin only; removes the deal, events, tasks, stage records, products, fields, contacts,
               its own file (row and disk); a file shared with another deal (in the trash too) is kept
-  rights      agent with delete=0 / delete=1 (own) / manager with delete=2 (group) / admin
+  rights      agent with delete=0 / delete=1 (own) / delete=2 (group) / delete=3; a manager sees and restores
+              every deal whatever the matrix says (src/auth/access.ts: admin and manager — everything) / admin
 """
 import base64
 import concurrent.futures
@@ -280,7 +281,8 @@ def main():
 
     people = {}
     for key, role, group, delete in (("own", "agent", group_a, 1), ("none", "agent", group_a, 0),
-                                     ("group", "manager", group_a, 2), ("other", "agent", group_b, 3)):
+                                     ("group", "agent", group_a, 2), ("other", "agent", group_b, 3),
+                                     ("manager", "manager", group_b, 0)):
         password = "Audit-%s-%s" % (RUN, key)
         email = "audit-trash-%s-%s@example.test" % (RUN, key)
         status, body = http("POST", "/users", {"email": email, "password": password, "username": "%s-%s" % (P, key),
@@ -291,7 +293,7 @@ def main():
         if status not in (200, 201):
             raise SystemExit("cannot log in as test user %s: %s" % (key, status))
         people[key] = {"id": body["id"], "token": login["access_token"]}
-    own, none, grp, other = people["own"], people["none"], people["group"], people["other"]
+    own, none, grp, other, mgr = people["own"], people["none"], people["group"], people["other"], people["manager"]
 
     def create_deal(suffix, agent=None, token=None, **extra):
         payload = {"label": "%s-%s" % (P, suffix), "budget": 100, "agent_id": agent or admin_id,
@@ -476,19 +478,24 @@ def main():
     check("agent with delete=0: restore -> 403", http("POST", "/deals/trash/%d/restore" % mine["id"], token=none["token"])[0] == 403)
     check("agent with delete=1: restore a deal of somebody else -> 403", http("POST", "/deals/trash/%d/restore" % admins["id"], token=own["token"])[0] == 403)
     seen = trash_ids(grp["token"], "&search=" + urllib.parse.quote(P))
-    check("manager with delete=2 sees deals of the group, not of other groups", isinstance(seen, list) and mine["id"] in seen and theirs["id"] not in seen and admins["id"] not in seen, seen)
+    check("agent with delete=2 sees deals of the group, not of other groups", isinstance(seen, list) and mine["id"] in seen and theirs["id"] not in seen and admins["id"] not in seen, seen)
     seen = trash_ids(other["token"], "&search=" + urllib.parse.quote(P))
     check("agent with delete=3 sees every deal in the trash", isinstance(seen, list) and {mine["id"], theirs["id"], admins["id"]} <= set(seen), seen)
-    for who, person in (("agent delete=1", own), ("manager delete=2", grp), ("agent delete=3", other)):
+    seen = trash_ids(mgr["token"], "&search=" + urllib.parse.quote(P))
+    check("manager (delete=0 in the matrix) sees every deal in the trash: admin and manager see everything (Access)",
+          isinstance(seen, list) and {mine["id"], theirs["id"], admins["id"]} <= set(seen), seen)
+    for who, person in (("agent delete=1", own), ("agent delete=2", grp), ("agent delete=3", other), ("manager", mgr)):
         r = http("DELETE", "/deals/trash/%d" % mine["id"], token=person["token"])
         r2 = http("DELETE", "/deals/trash", token=person["token"])
         check("%s: delete for good / empty the trash -> 403" % who, r[0] == 403 and r2[0] == 403 and row(mine["id"]) is not None, (r[0], r2[0]))
     r = http("POST", "/deals/trash/%d/restore" % mine["id"], token=grp["token"])
-    check("manager with delete=2: restore a deal of the group -> 201", r[0] in (200, 201) and not row(mine["id"])["deleted"], r)
+    check("agent with delete=2: restore a deal of the group -> 201", r[0] in (200, 201) and not row(mine["id"])["deleted"], r)
     r = http("POST", "/deals/trash/%d/restore" % theirs["id"], token=grp["token"])
-    check("manager with delete=2: restore a deal of another group -> 403", r[0] == 403 and row(theirs["id"])["deleted"], r)
+    check("agent with delete=2: restore a deal of another group -> 403", r[0] == 403 and row(theirs["id"])["deleted"], r)
     r = http("POST", "/deals/trash/%d/restore" % theirs["id"], token=other["token"])
     check("agent with delete=3: restore any deal -> 201", r[0] in (200, 201) and not row(theirs["id"])["deleted"], r)
+    r = http("POST", "/deals/trash/%d/restore" % admins["id"], token=mgr["token"])
+    check("manager (delete=0 in the matrix): restore a deal of somebody else -> 201", r[0] in (200, 201) and not row(admins["id"])["deleted"], r)
     sql("UPDATE \"user\" SET permissions = NULL WHERE id = %d" % none["id"])
     seen = trash_ids(none["token"])
     check("agent without stored permissions: own deals (the bot's default) -> trash 200", isinstance(seen, list), seen)

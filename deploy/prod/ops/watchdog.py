@@ -21,6 +21,21 @@ WA_HEALTH = (
     "fetch('http://localhost:'+(process.env.PORT||3040)+'/health',{signal:AbortSignal.timeout(5000)})"
     ".then(r=>r.text()).then(t=>console.log(t)).catch(e=>{console.log('ERR '+e.message);process.exit(1)})"
 )
+# GET /health of parisahon-telegram-service inside its container (no token needed); a 503 has a JSON body too
+TG_HEALTH = (
+    "import os, urllib.request, urllib.error\n"
+    "try:\n"
+    "    print(urllib.request.urlopen('http://localhost:%s/health' % (os.environ.get('PORT') or 3030), timeout=5).read().decode())\n"
+    "except urllib.error.HTTPError as e:\n"
+    "    print(e.read().decode())\n"
+    "except Exception as e:\n"
+    "    print('ERR', e)\n"
+    "    raise SystemExit(1)\n"
+)
+# a number / account that reconnects by itself is a problem only when it lasts
+DOWN_LONG_SEC = 600
+# messages for the CRM waiting longer than this in a service's outbox: the API does not take them
+OUTBOX_OLD_SEC = 900
 CHATS_SQL = (
     'SELECT ba.chat_id FROM bot_account ba JOIN "user" u ON u.id = ba.user_id '
     "WHERE u.deleted_at IS NULL AND u.role IN ('admin', 'manager')"
@@ -54,6 +69,69 @@ def log(text):
         f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
     if os.path.getsize(LOG) > 2_000_000:
         os.replace(LOG, LOG + ".1")
+
+
+def psql(sql):
+    code, out = run(["docker", "exec", "-i", "crm-db", "sh", "-c", 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At'], stdin=sql)
+    return out if code == 0 else ""
+
+
+def staff_names(ids):
+    """user id -> name, for the messages (ids only digits: they come from the services' /health)."""
+    ids = sorted({int(i) for i in ids if str(i).isdigit()})
+    if not ids:
+        return {}
+    out = psql('SELECT id, username FROM "user" WHERE id IN (%s)' % ", ".join(str(i) for i in ids))
+    names = {}
+    for line in out.splitlines():
+        uid, _, name = line.partition("|")
+        if uid.isdigit():
+            names[int(uid)] = name.strip()
+    return names
+
+
+def since_sec(value):
+    """Seconds since `since` of a /health problem: epoch seconds (Telegram) or an ISO time (WhatsApp)."""
+    if value in (None, ""):
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            t = float(value) / (1000 if value > 1e12 else 1)
+        else:
+            t = datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        return max(0, now - t)
+    except (TypeError, ValueError):
+        return None
+
+
+def health_json(out):
+    try:
+        data = json.loads(out.strip().splitlines()[-1]) if out.strip() else None
+        return data if isinstance(data, dict) else None
+    except (ValueError, IndexError):
+        return None
+
+
+def outbox_checks(key, name, data):
+    """Messages waiting for the CRM API too long, and messages the API refused (kept aside by the service)."""
+    oldest = int(data.get("outbox_oldest_sec") or 0)
+    size = int(data.get("outbox") or 0)
+    checks[f"{key}_outbox"] = (
+        not (size and oldest >= OUTBOX_OLD_SEC),
+        f"{name}: {size} сообщ. клиентов ждут CRM уже {oldest // 60} мин — API их не принимает (токен, ошибка API)",
+    )
+    rejected = int(data.get("rejected") or 0)
+    seen = state.setdefault("rejected", {})
+    previous = seen.get(key)
+    if previous is None or rejected < previous.get("count", 0):
+        seen[key] = {"count": rejected, "grew_at": 0}
+    elif rejected > previous.get("count", 0):
+        seen[key] = {"count": rejected, "grew_at": now}
+    grew_at = seen[key].get("grew_at", 0)
+    checks[f"{key}_rejected"] = (
+        not grew_at or now - grew_at > 86400,
+        f"{name}: CRM отказалась принять сообщения клиентов (всего отложено {rejected}); они сохранены в сервисе, подробности в его журнале",
+    )
 
 
 def env(key):
@@ -101,24 +179,60 @@ if fails >= 3 and now - state.get("api_restarted", 0) > 1800:
     state["api_fails"] = 0
     repairs.append("API перезапущен после 3 неудачных проверок" if c2 == 0 else "перезапуск API не удался")
 
-# 4. WhatsApp: at least one connected number
+# 4. WhatsApp: the state of every linked number (GET /health of the service: states + problems).
+#    A number unlinked on the phone, or reconnecting for 10 minutes and more, is a problem of its own
+#    (one alarm per number); messages waiting for the CRM or refused by it are alarms too.
 code, out = run(["docker", "exec", "crm2-whatsapp", "node", "-e", WA_HEALTH])
-try:
-    sessions = int(json.loads(out).get("sessions", 0))
-except Exception:
-    sessions = -1
-checks["whatsapp"] = (
-    sessions >= 1,
-    "WhatsApp не подключён: нужно заново привязать номер (Профиль → WhatsApp)" if sessions == 0 else "служба WhatsApp не отвечает",
-)
+wa = health_json(out) if code == 0 else None
+checks["whatsapp"] = (wa is not None, "служба WhatsApp не отвечает")
+if wa is not None:
+    problems = [p for p in wa.get("problems") or [] if p.get("status") == "logged_out"
+                or (since_sec(p.get("since")) or 0) >= DOWN_LONG_SEC]
+    names = staff_names([p.get("user_id") for p in problems])
+    for p in problems:
+        uid = int(p.get("user_id") or 0)
+        who = names.get(uid) or f"№{uid}"
+        if p.get("status") == "logged_out":
+            text = f"WhatsApp сотрудника {who} отвязан на телефоне: сообщения его клиентов не приходят в CRM (подключить: CRM → WhatsApp)"
+        else:
+            text = (f"WhatsApp сотрудника {who} не на связи {int((since_sec(p.get('since')) or 0) // 60)} мин"
+                    f"{' (' + str(p.get('error')) + ')' if p.get('error') else ''}: сообщения клиентов не приходят (CRM → WhatsApp → Переподключить)")
+        checks[f"whatsapp:{uid}"] = (False, text)
+    # a number that was a problem and is fine now: its check is ok again (so the "fixed" message goes out)
+    for key in list(state.get("items", {})):
+        if key.startswith("whatsapp:") and key not in checks:
+            checks[key] = (True, "")
+    outbox_checks("whatsapp", "WhatsApp", wa)
 
-# 5. Telegram: an account whose login was revoked keeps failing until the manager signs in again
-code, out = run(["docker", "logs", "--since", "11m", "crm2-telegram"])
-dead = sorted(set(re.findall(r"\(user (\d+)\)[^\n]*AUTH_KEY_UNREGISTERED", out)), key=int)
-checks["telegram"] = (
-    not dead,
-    "Telegram отключён у пользователей CRM № " + ", ".join(dead) + ": нужно войти заново (Профиль → Telegram)",
-)
+# 5. Telegram: the state of every connected account (GET /health of the service: revoked = ended in
+#    Telegram itself, error = no connection); an older service without it: its start-failure log line
+code, out = run(["docker", "exec", "crm2-telegram", "python", "-c", TG_HEALTH])
+tg = health_json(out)
+if tg is not None and "problems" in tg:
+    checks["telegram"] = (bool(tg.get("ok")), "служба Telegram не работает: сообщения клиентов не приходят в CRM")
+    problems = [p for p in tg.get("problems") or [] if p.get("status") == "revoked"
+                or (since_sec(p.get("since")) or 0) >= DOWN_LONG_SEC]
+    names = staff_names([p.get("user_id") for p in problems])
+    for p in problems:
+        uid = int(p.get("user_id") or 0)
+        who = names.get(uid) or f"№{uid}"
+        if p.get("status") == "revoked":
+            text = f"Telegram сотрудника {who} отключён в самом Telegram (сеанс завершён): сообщения его клиентов не приходят в CRM (подключить: CRM → Телеграм → Подключить заново)"
+        else:
+            text = (f"Telegram сотрудника {who} не на связи {int((since_sec(p.get('since')) or 0) // 60)} мин"
+                    f"{' (' + str(p.get('error')) + ')' if p.get('error') else ''}: сервис пробует сам")
+        checks[f"telegram:{uid}"] = (False, text)
+    for key in list(state.get("items", {})):
+        if key.startswith("telegram:") and key not in checks:
+            checks[key] = (True, "")
+    outbox_checks("telegram", "Telegram", tg)
+else:
+    code, out = run(["docker", "logs", "--since", "11m", "crm2-telegram"])
+    dead = sorted(set(re.findall(r"\(user (\d+)\)[^\n]*AUTH_KEY_UNREGISTERED", out)), key=int)
+    checks["telegram"] = (
+        not dead,
+        "Telegram отключён у пользователей CRM № " + ", ".join(dead) + ": нужно войти заново (CRM → Телеграм → Подключить)",
+    )
 
 # 6. disk, memory
 st = os.statvfs("/")
@@ -187,6 +301,9 @@ for key, (ok, text) in checks.items():
             it["alerted"] = now
 for r in repairs:
     messages.append("🔧 " + r)
+# per-number checks (whatsapp:<id>, telegram:<id>) that are fine again are forgotten
+for key in [k for k, it in items.items() if ":" in k and k.split(":", 1)[0] in ("whatsapp", "telegram") and it.get("ok")]:
+    items.pop(key, None)
 
 bad = {k: v[1] for k, v in checks.items() if not v[0]}
 with open(STATUS, "w", encoding="utf-8") as f:
@@ -201,11 +318,7 @@ if messages:
     text = "CRM, сторож сервера:\n" + "\n".join(messages)
     log(text.replace("\n", " | "))
     token = env("CRM_BOT_TOKEN")
-    code, out = run(
-        ["docker", "exec", "-i", "crm-db", "sh", "-c", 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At'],
-        stdin=CHATS_SQL,
-    )
-    chats = [c for c in out.split() if re.fullmatch(r"-?\d+", c)] if code == 0 else []
+    chats = [c for c in psql(CHATS_SQL).split() if re.fullmatch(r"-?\d+", c)]
     if not token or not chats:
         log("nobody to tell: no admin has linked the CRM bot")
     for chat in chats:

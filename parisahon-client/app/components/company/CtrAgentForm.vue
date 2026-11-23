@@ -46,11 +46,12 @@
                         </button>
                     </template>
                 </span>
+                <!-- a saved contact is detached from the company on save (it stays in the CRM with its deals) -->
                 <BaseButton
-                    v-if="idx"
                     size="sm"
                     type="button"
-                    @click="removeCtrAgent(agent)"
+                    :title="agent.id ? 'Отвязать от компании' : 'Убрать'"
+                    @click="onRemove(agent)"
                 >
                     <Icon name="ph:trash" />
                 </BaseButton>
@@ -60,15 +61,15 @@
             <BaseInput
                 v-model="agent.username"
                 type="text"
-                label="Имя пользователя"
-                placeholder="пр.: JohnDoe"
+                label="Имя*"
+                placeholder="пр.: Андрей"
                 icon="ph:user"
                 required
                 :classes="{ wrapper: 'w-full mb-3' }"
                 name="field"
             />
 
-            <!-- EMAIL -->
+            <!-- EMAIL: a contact from Telegram or a business card often has none -->
             <BaseInput
                 v-model="agent.email"
                 type="email"
@@ -79,7 +80,7 @@
                 name="email"
             />
 
-            <!-- PHONE -->
+            <!-- PHONE: any format, stored as +998901234567 -->
             <BaseInput
                 v-model="agent.phone"
                 type="text"
@@ -87,7 +88,6 @@
                 name="phone"
                 placeholder="пр.: +998901200000"
                 icon="ph:phone"
-                required
                 :classes="{ wrapper: 'w-full mb-3' }"
             />
 
@@ -96,6 +96,7 @@
                 :phone="agent.phone"
                 :email="agent.email"
                 :exclude-contact-id="agent.id && !agent.new ? agent.id : null"
+                :exclude-company-id="companyId"
                 class="mb-3"
             />
 
@@ -117,6 +118,14 @@
         </li>
     </ul>
 
+    <p
+        v-if="removedIds.length"
+        class="mb-3 text-xs text-muted-500 dark:text-muted-400"
+    >
+        {{ removedIds.length === 1 ? 'Один контакт будет отвязан' : `Контактов будет отвязано: ${removedIds.length}` }}
+        от компании при сохранении. Они останутся в CRM вместе со сделками.
+    </p>
+
     <!-- ADD AGENT -->
     <div
         v-if="ctrAgents.length > 0"
@@ -135,10 +144,20 @@
 
 <script setup lang="ts">
 import SimilarClients from '~/components/company/SimilarClients.vue';
+import type { CtrAgent } from '~/types/ctrAgent';
 const ctrAgentsStore = useCtrAgentsStore();
 
 const { addCtrAgent, removeCtrAgent } = ctrAgentsStore;
-const { ctrAgents, primaryContactId } = storeToRefs(ctrAgentsStore);
+const { ctrAgents, primaryContactId, removedIds } = storeToRefs(ctrAgentsStore);
+
+const route = useRoute();
+// the company being edited: its own contacts and the company itself are not "similar"
+const companyId = computed(() => (route.params.id && route.params.id !== "new" ? Number(route.params.id) : null));
+
+function onRemove(agent: CtrAgent) {
+    if (agent.id && !confirm(`Отвязать контакт «${agent.username || ""}» от компании? Он останется в CRM вместе со своими сделками. Изменение сохранится кнопкой «Сохранить компанию».`)) return;
+    removeCtrAgent(agent);
+}
 
 // a single saved contact is the primary one even when nobody chose it
 function isPrimary(agent: { id?: number }) {

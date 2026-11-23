@@ -1,7 +1,8 @@
 """Settings of the FTP receiver: everything comes from the environment (README.md lists the keys)."""
+import ipaddress
 import os
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Tuple
 
 # what the CRM API accepts at POST /calls/upload; everything else stays in the folder untouched
 AUDIO_EXTENSIONS = (".amr", ".mp3", ".m4a", ".wav", ".ogg", ".aac", ".3gp")
@@ -23,6 +24,12 @@ class Config:
     masquerade_address: Optional[str] = None
     tls_cert: Optional[str] = None
     tls_key: Optional[str] = None
+    # FTP_TLS_REQUIRED: with a certificate, every login and transfer must be FTPS (no plain FTP at all)
+    tls_required: bool = False
+    # FTP_PLAIN_NETWORKS: plain (not TLS) FTP only from these networks (office, VPN); None = from anywhere
+    plain_networks: Optional[Tuple[object, ...]] = None
+    # FTP_PLAIN_DOWNLOAD: a session without TLS may download files (RETR); FTPS sessions always may
+    plain_download: bool = True
     retain_days: float = 30.0      # 0 = keep the files forever
     settle_sec: float = 5.0        # size and mtime must not change this long before a file is sent
     scan_sec: float = 10.0
@@ -45,6 +52,44 @@ def _number(env: Mapping[str, str], key: str, default: float, minimum: float = 0
     if value < minimum:
         raise ConfigError(f"{key} must be at least {minimum:g}, got {raw!r}")
     return value
+
+
+def _flag(env: Mapping[str, str], key: str, default: bool) -> bool:
+    raw = (env.get(key) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"{key} must be 1 or 0, got {raw!r}")
+
+
+def parse_networks(raw: str) -> Optional[Tuple[object, ...]]:
+    """"10.0.0.0/8, 192.168.1.0/24 203.0.113.7" -> networks; empty -> None (no limit)."""
+    parts = [part for part in (raw or "").replace(",", " ").split() if part]
+    if not parts:
+        return None
+    networks = []
+    for part in parts:
+        try:
+            networks.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            raise ConfigError(f"FTP_PLAIN_NETWORKS must be addresses or networks like 192.168.1.0/24, got {part!r}") from None
+    return tuple(networks)
+
+
+def address_in(networks: Optional[Tuple[object, ...]], address: str) -> bool:
+    """Is the client's address in one of the networks (None: no limit)? An IPv4 address seen as IPv6 (::ffff:a.b.c.d) counts as IPv4."""
+    if networks is None:
+        return True
+    try:
+        ip = ipaddress.ip_address((address or "").split("%")[0])
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return any(ip.version == network.version and ip in network for network in networks)
 
 
 def parse_passive_ports(raw: str) -> Optional[range]:
@@ -78,6 +123,9 @@ def from_env(env: Optional[Mapping[str, str]] = None) -> Config:
     for path in (cert, key):
         if path and not os.path.isfile(path):
             raise ConfigError(f"TLS file does not exist: {path}")
+    tls_required = _flag(env, "FTP_TLS_REQUIRED", False)
+    if tls_required and not cert:
+        raise ConfigError("FTP_TLS_REQUIRED needs a certificate: set FTP_TLS_CERT and FTP_TLS_KEY")
     return Config(
         root=root,
         state_dir=state_dir,
@@ -89,6 +137,9 @@ def from_env(env: Optional[Mapping[str, str]] = None) -> Config:
         masquerade_address=(env.get("FTP_MASQUERADE_ADDRESS") or "").strip() or None,
         tls_cert=cert,
         tls_key=key,
+        tls_required=tls_required,
+        plain_networks=parse_networks(env.get("FTP_PLAIN_NETWORKS", "")),
+        plain_download=_flag(env, "FTP_PLAIN_DOWNLOAD", True),
         retain_days=_number(env, "FTP_RETAIN_DAYS", 30.0),
         settle_sec=_number(env, "FTP_SETTLE_SEC", 5.0),
         scan_sec=_number(env, "FTP_SCAN_SEC", 10.0, 0.05),

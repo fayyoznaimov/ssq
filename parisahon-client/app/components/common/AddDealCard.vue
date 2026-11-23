@@ -23,8 +23,8 @@
                 v-model="deal.budget" 
                 placeholder="Бюджет" 
                 type="number" 
+                min="0"
                 :error="errors.budget" 
-                required
                 @input="(e: Event) => onChange('budget', (e.target as HTMLInputElement).value)"
                 :key="resetKey"
             />
@@ -47,7 +47,6 @@
                 <BaseInput 
                     name="email" 
                     placeholder="Контакт: Email" 
-                    required 
                     :key="resetKey"
                     class="border-t border-t-muted-200 !border-x-0 !outline-none !rounded-none"
                     :error="errors.contactEmail"
@@ -57,7 +56,6 @@
                 <BaseInput 
                     name="phone" 
                     placeholder="Контакт: Телефон"
-                    required 
                     :key="resetKey"
                     class="border-none !outline-none rounded-b-md !rounded-t-none"
                     :error="errors.contactPhone"
@@ -132,12 +130,15 @@ watchEffect(() => {
     agents.value = filteredCtrAgents(contacts.value.data);
 });
 
+// Only what the API needs: a deal may come without a contact and without a company (as from
+// Telegram). A new contact needs a company of the list (the API links every contact to one);
+// e-mail and phone are checked when given.
 const schema: Schema<string> = {
-    budget: [required('Обязательное поле'), validNumber('Неверный бюджет')],
-    company: [required('Обязательное поле')],
-    contactName: [required('Обязательное поле')],
-    contactEmail: [required('Обязательное поле'), validEmail('Неверный email')],
-    contactPhone: [required('Обязательное поле'), validPhone('Неверный номер телефона')],
+    budget: [optional((value: unknown) => /^\d+$/.test(String(value ?? '').trim()) ? { ok: true as const, value: undefined } : { ok: false as const, error: 'Бюджет — целое число' })],
+    company: [(value: unknown) => value === 'typed' ? { ok: false as const, error: 'Выберите компанию из списка' } : { ok: true as const, value: undefined }],
+    contactName: [],
+    contactEmail: [optional(validEmail('Неверный email'))],
+    contactPhone: [optional(validPhone('Неверный номер телефона'))],
 };
 
 const { validate, onChange, errors } = useValidation(schema);
@@ -157,13 +158,20 @@ const onCtrAgentInput = debounce((e: Event) => {
 }, 300);
 
 async function onCtrAgentChange(contact: UserContact) {
-    if (contact.id) {
+    if (contact?.id) {
         const user = await userService.get<User>(contact.id).exec();
         ctrAgent.value = user;
         onChange('contactName', user.username);
         onChange('contactEmail', user.email);
         onChange('contactPhone', user.phone);
-    } 
+    } else if (contact && !Array.isArray(contact) && contact.name) {
+        // a new contact by the typed name (it was never taken before, so a new contact could not be added)
+        const typed = ctrAgent.value.id ? {} : ctrAgent.value;
+        ctrAgent.value = { email: typed.email, phone: typed.phone, username: contact.name };
+        onChange('contactName', contact.name);
+    } else {
+        ctrAgent.value = {};
+    }
 }
 
 function nameFilter(query?: string, items?: any[]) {
@@ -175,23 +183,30 @@ function nameFilter(query?: string, items?: any[]) {
 }
 
 async function onSubmit() {
+    const company: any = deal.value.company;
+    const companyName = company && !Array.isArray(company) ? String(company.name ?? '').trim() : '';
+    const contactName = String(ctrAgent.value.username ?? '').trim();
     const validationResult = validate({
         budget: deal.value.budget,
-        company: deal.value.company?.id,
-        contactName: ctrAgent.value.username,
+        // a typed name is not a company yet: it has required fields this card does not have
+        company: companyName && !company.id ? 'typed' : 'ok',
+        contactName,
         contactEmail: ctrAgent.value.email,
         contactPhone: ctrAgent.value.phone,
     });
     if (!validationResult.valid) return;
+    if (contactName && !ctrAgent.value.id && !company?.id) {
+        return toast.show({message: 'Новому контакту нужна компания: выберите её из списка', timeout: 4000, type: 'error'});
+    }
 
-    if (!ctrAgent.value.id) {
+    if (contactName && !ctrAgent.value.id) {
         const user = await promiseResult(userService.create<User>({
             role: 'ctr_agent',
-            username: ctrAgent.value.username,
-            email: ctrAgent.value.email,
-            phone: ctrAgent.value.phone,
+            username: contactName,
+            email: String(ctrAgent.value.email ?? '').trim() || undefined,
+            phone: String(ctrAgent.value.phone ?? '').trim() || undefined,
             fillers_create: [],
-            company_id: deal.value.company?.id,
+            company_id: company?.id,
             fillers: [],
         }).exec());
 
@@ -200,11 +215,11 @@ async function onSubmit() {
     }
 
     const dealCreated = await promiseResult(runDealAsync(dealService.create<Deal>({
-        label: deal.value.label,
-        budget: Number(deal.value.budget),
+        label: deal.value.label ?? '',
+        budget: Number(deal.value.budget) || 0,
         agent_id: Number(deal.value.agent?.id),
-        ctr_agent_ids: [ctrAgent.value.id],
-        company_id: deal.value.company?.id,
+        ctr_agent_ids: ctrAgent.value.id ? [ctrAgent.value.id] : [],
+        company_id: company?.id || undefined,
         stage_id: props.stage.id,
         fillers: [],
         products: [],
@@ -213,6 +228,9 @@ async function onSubmit() {
     if (!dealCreated.ok) return toast.show({message: dealCreated.error.message, timeout: 3000, type: 'error'});
     resetKey.value++;
     openAddDealField.value = false;
+    // the next quick deal starts empty
+    ctrAgent.value = {};
+    deal.value = { agent: user.value, stage: props.stage, ctr_agents: [] };
     emits('deal:created', dealCreated.value);
 }
 

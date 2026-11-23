@@ -67,9 +67,13 @@ interface Permission {
 @Index('IDX_user_wa_id', ['wa_id'])
 // digits-only phone lookup of contacts (Telegram, call recordings); created by the migration
 @Index('IDX_user_phone_digits', { synchronize: false })
+// the last 9 digits of a contact's phone (helper/phone.ts phoneKeySql), migration 1795230000000-people-phones
+@Index('IDX_user_phone_key', { synchronize: false })
 // created by migration 1795130000000-perf-indexes (partial / expression indexes): TypeORM must leave them alone
 @Index('IDX_user_email_lower', { synchronize: false })
 @Index('IDX_user_group', { synchronize: false })
+// the e-mail is unique among accounts that are not deleted (partial index, migration 1795240000000-user-email-active)
+@Index('IDX_user_email_active', { synchronize: false })
 @Entity()
 export class User {
   @PrimaryGeneratedColumn()
@@ -79,7 +83,6 @@ export class User {
   @Column({ type: 'varchar', length: 255 })
   username: string;
 
-  @Index({ unique: true })
   @Column({ type: 'varchar', length: 255, nullable: true })
   email: string;
 

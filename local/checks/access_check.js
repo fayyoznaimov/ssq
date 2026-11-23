@@ -103,6 +103,14 @@ async function api(token, method, path, body) {
     await deny('A cannot update B task', 'PATCH', `/tasks/${T}`, { label: 'QA-CHECK hacked' });
     await deny('A cannot close B task', 'PATCH', `/tasks/${T}/close`, { result: 'QA-CHECK hacked' });
     await deny('A cannot delete B task', 'DELETE', `/tasks/${T}`);
+    // a task carries its deal (label, budget), company (requisites) and contact (task-access.ts)
+    await deny('A cannot read B task', 'GET', `/tasks/${T}`);
+    const tasksOfD = await api(ta, 'GET', `/tasks?deal_id=${D}&type=all&limit=1000`);
+    check('A task list hides the tasks of B deal', tasksOfD.s === 200 && !tasksOfD.b.data.some((t) => t.id === T), `status ${tasksOfD.s}`);
+    await deny('A cannot put a task on B deal (it went into its history)', 'POST', '/tasks', {
+      label: 'QA-CHECK task A on B deal', assign_to: { target: 'agent', id: A }, link_to: { target: 'deal', id: D },
+      start_time: new Date(Date.now() + 36e5).toISOString(), end_time: new Date(Date.now() + 72e5).toISOString(), allDay: false,
+    });
     await deny('A cannot read B events', 'GET', `/users/${B}/events`);
     await deny('A cannot read B recordings', 'GET', `/users/${B}/recordings`);
     await deny('A cannot read B files', 'GET', `/users/${B}/files`);

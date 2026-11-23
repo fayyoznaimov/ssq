@@ -14,10 +14,11 @@ import { FillableTablesEnum, Filler } from '../filler/filler.entity';
 import { FillerService } from '../filler/filler.service';
 import {
   ChangeOwnPasswordDto,
+  UpdateOwnProfileDto,
   UpdateUserDto,
   UpdateUserFillerDto,
 } from './dto/update.user.dto';
-import { SearchUserQueryDto } from './dto/search.user.query.dto';
+import { SearchUserQueryDto, StaffQueryDto } from './dto/search.user.query.dto';
 import { HelperService } from '../helper/helper.service';
 import {
   PaginationRequestDto,
@@ -31,6 +32,24 @@ import { EventEmitter2 } from '@nestjs/event-emitter';
 import { JwtService } from '@nestjs/jwt';
 import { Request } from 'express';
 import { File } from '../file/file.entity';
+import { SIGNED_OUT_EVENT, signOutEverywhere } from '../auth/sign-out';
+import { Access } from '../auth/access';
+import { AuthUser } from '../auth/auth.guard';
+import { normalizePhone, phoneKey, phoneKeySql } from '../helper/phone';
+
+/** Staff accounts; ctr_agent rows are customer contacts. */
+export const STAFF_ROLES = [RoleEnum.ADMIN, RoleEnum.MANAGER, RoleEnum.AGENT];
+
+/** TypeORM answers [rows, count] to UPDATE ... RETURNING on Postgres. */
+function returnedRows(result: any): any[] {
+  return Array.isArray(result?.[0]) ? result[0] : Array.isArray(result) ? result : [];
+}
+
+/** What updateCtrAgent() accepts: the contact card's PATCH, or a contact of the company card. */
+export type CtrAgentChanges = Partial<UpdateUserDto> & {
+  // a custom field by its definition (the company card shows one input per field): set or cleared
+  fillers_set?: { filler_id: number; value: string }[];
+};
 
 @Injectable()
 export class UserService {
@@ -94,27 +113,78 @@ export class UserService {
     return users;
   }
 
+  /**
+   * GET /users: staff accounts and customer contacts. `requester` limits the contacts to the
+   * user's contact view scope (Access.contactSql); staff accounts are always listed.
+   */
   async fetchAll(
     query: SearchUserQueryDto,
+    requester?: AuthUser,
   ): Promise<PaginationResponseDto<User[]>> {
     let qb = this.userRepository.createQueryBuilder('t0');
 
+    // andWhere: a second .where() replaced the first, so role=agent dropped the name filter
     if (query.username) {
-      qb = qb.where('t0.username ILIKE :name', {
+      qb = qb.andWhere('t0.username ILIKE :name', {
         name: `%${query.username}%`,
       });
     }
 
-    if (query.role === 'agent') {
-      qb = qb.where('t0.role = :role', {
+    if (query.role && (Object.values(RoleEnum) as string[]).includes(query.role)) {
+      qb = qb.andWhere('t0.role = :role', {
         role: query.role,
       });
+    }
+
+    if (query.staff === 'true') {
+      qb = qb.andWhere('t0.role IN (:...staff_roles)', { staff_roles: STAFF_ROLES });
+    }
+
+    if (requester) {
+      const scope = new Access(requester).contactSql('t0', 'view');
+      if (scope.sql !== 'TRUE') {
+        qb = qb.andWhere(`(t0.role <> :contact_role OR ${scope.sql})`, {
+          contact_role: RoleEnum.CTR_AGENT,
+          ...scope.params,
+        });
+      }
+    }
+
+    // a stable order when none is asked for: by name, as the pickers show it
+    if (!query.sort) {
+      qb = qb.orderBy('t0.username', 'ASC').addOrderBy('t0.id', 'ASC');
     }
 
     return this.helperService.withPagination(
       this.helperService.withRelations(qb, ['group', 'company']),
       query,
     );
+  }
+
+  /**
+   * GET /users/staff: the staff accounts (admin, manager, agent) for the pickers and filters of the
+   * responsible user and the assignee: by name, without a page limit. GET /users mixes them with the
+   * contacts that Telegram, WhatsApp and calls keep adding, and pages them by at most 1000 rows.
+   * with_deleted=true adds removed employees (deleted_at is set) for the filters of their old records.
+   */
+  async fetchStaff(query: StaffQueryDto): Promise<PaginationResponseDto<User[]>> {
+    const qb = this.userRepository
+      .createQueryBuilder('t0')
+      .leftJoinAndSelect('t0.group', 'group')
+      .where('t0.role IN (:...staff_roles)', { staff_roles: STAFF_ROLES })
+      .orderBy('t0.username', 'ASC')
+      .addOrderBy('t0.id', 'ASC');
+    if (query.with_deleted === 'true') qb.withDeleted();
+    if (query.username) qb.andWhere('t0.username ILIKE :name', { name: `%${query.username}%` });
+
+    const data = await qb.getMany();
+    const response = new PaginationResponseDto<User[]>();
+    response.data = data;
+    response.count = data.length;
+    response.page_size = Math.max(1, data.length);
+    response.current_page = 1;
+    response.last_page = 1;
+    return response;
   }
 
   /**
@@ -252,10 +322,19 @@ export class UserService {
     return this.userRepository.save(newUser);
   }
 
-  async checkIfUserEmailExists(email: string): Promise<User | null> {
+  /**
+   * Who of the users that are not deleted has this e-mail already (as the unique index
+   * IDX_user_email_active; case does not matter: "Ivan@Mail.ru" is "ivan@mail.ru").
+   * `exceptId`: the user being edited.
+   */
+  async checkIfUserEmailExists(email: string, exceptId?: number): Promise<User | null> {
     // findOneBy({ email: undefined }) has no condition and returns any user
-    if (!email) return null;
-    return this.userRepository.findOneBy({ email: email });
+    if (!email || !String(email).trim()) return null;
+    const qb = this.userRepository
+      .createQueryBuilder('u')
+      .where('lower(u.email) = lower(:email)', { email: String(email).trim() });
+    if (exceptId) qb.andWhere('u.id <> :exceptId', { exceptId });
+    return qb.getOne();
   }
 
   /**
@@ -303,14 +382,15 @@ export class UserService {
       );
     }
 
-    // the new password signs out every other device (token_version, see AuthGuard) ...
-    await this.userRepository.update(
-      { id: user.id },
-      { password: await bcrypt.hash(data.new_password, 10), token_version: () => 'token_version + 1' } as any,
-    );
+    // the new password signs out every other device and unlinks the CRM bot (auth/sign-out.ts) ...
+    const hash = await bcrypt.hash(data.new_password, 10);
+    const signedOut = await this.dataSource.transaction(async (manager) => {
+      await manager.update(User, { id: user.id }, { password: hash });
+      return signOutEverywhere(manager, user.id);
+    });
+    this.eventEmitter.emit(SIGNED_OUT_EVENT, signedOut);
     // ... while this one stays signed in with a fresh token (same claims as AuthService.signIn)
-    const rows = await this.dataSource.query(`SELECT token_version FROM "user" WHERE id = $1`, [user.id]);
-    return { access_token: await this.jwtService.signAsync({ sub: user.id, tv: Number(rows[0]?.token_version ?? 0) }) };
+    return { access_token: await this.jwtService.signAsync({ sub: user.id, tv: signedOut.tokenVersion }) };
   }
 
   /**
@@ -325,7 +405,7 @@ export class UserService {
     data: UpdateUserDto,
   ): Promise<void> {
     const performer = await this.helperService.extractUserFromRequest(request);
-    const user = await this.helperService.getById(User, id, ['linked_deals']);
+    const user = await this.helperService.getById(User, id, ['linked_deals', 'company']);
 
     if (
       user.role !== RoleEnum.CTR_AGENT &&
@@ -336,8 +416,9 @@ export class UserService {
 
     // If email is being changed check if it already exists
     if (
-      user.email !== data.email &&
-      (await this.checkIfUserEmailExists(data.email))
+      data.email !== undefined &&
+      (data.email ?? null) !== (user.email ?? null) &&
+      (await this.checkIfUserEmailExists(data.email, user.id))
     ) {
       throw new BadRequestException(
         `User with email ${data.email} already exists!`,
@@ -363,7 +444,8 @@ export class UserService {
 
     user.username = data.username;
     user.email = data.email;
-    user.phone = data.phone;
+    // not sent: unchanged; otherwise one format for every phone (helper/phone.ts)
+    if (data.phone !== undefined) user.phone = normalizePhone(data.phone);
 
     // a new password signs the account out everywhere (token_version, see AuthGuard). A new role or new
     // rights need no new login: AuthGuard reads both from the database on every request, so they apply at once.
@@ -380,24 +462,28 @@ export class UserService {
 
     await this.userRepository.save(user);
     if (signOut) {
-      await this.userRepository
-        .createQueryBuilder()
-        .update(User)
-        .set({ token_version: () => 'token_version + 1' } as any)
-        .where('id = :id', { id: user.id })
-        .execute();
+      // every device of the account and its CRM bot (auth/sign-out.ts)
+      this.eventEmitter.emit(SIGNED_OUT_EVENT, await signOutEverywhere(this.dataSource, user.id));
     }
     return;
   }
 
   /**
    * ctr_agent: any staff user. Staff account: admin only, and not oneself.
+   * A staff account: `successorId` (another live employee) takes over the open deals and the open
+   * tasks, so they do not stay on an account nobody can pick any more (each deal's history says so);
+   * the removed employee is signed out everywhere and the CRM bot is unlinked.
    */
-  async deleteUser(id: number, performerId: number): Promise<void> {
+  async deleteUser(
+    id: number,
+    performerId: number,
+    successorId?: number,
+  ): Promise<{ deals: number; tasks: number }> {
     const user = await this.helperService.getById(User, id);
     const performer = await this.helperService.getById(User, performerId);
+    const staff = user.role !== RoleEnum.CTR_AGENT;
 
-    if (user.role !== RoleEnum.CTR_AGENT) {
+    if (staff) {
       if (performer.role !== RoleEnum.ADMIN) {
         throw new ForbiddenException('Only admin can delete staff accounts');
       }
@@ -407,12 +493,97 @@ export class UserService {
       }
     }
 
-    user.deleted_at = new Date();
-    user.deleted_by = performer;
+    let successor: User | null = null;
+    if (staff && successorId) {
+      successor = await this.userRepository.findOne({ where: { id: successorId, role: In(STAFF_ROLES) } });
+      if (!successor || successor.id === user.id) {
+        throw new BadRequestException('Преемник — другой действующий сотрудник');
+      }
+    }
 
-    await this.userRepository.save(user);
+    const moved = await this.dataSource.transaction(async (manager) => {
+      let deals: any[] = [];
+      let tasks: any[] = [];
+      if (successor) {
+        deals = returnedRows(
+          await manager.query(
+            `UPDATE deal SET agent_id = $1 WHERE agent_id = $2 AND closed_at IS NULL AND deleted_at IS NULL RETURNING id`,
+            [successor.id, user.id],
+          ),
+        );
+        tasks = returnedRows(
+          await manager.query(`UPDATE task SET agent_id = $1 WHERE agent_id = $2 AND closed_at IS NULL RETURNING id`, [
+            successor.id,
+            user.id,
+          ]),
+        );
+      }
+      await manager.update(User, { id: user.id }, { deleted_at: new Date(), deleted_by: { id: performer.id } as User });
+      return { deals: deals.map((row) => Number(row.id)), tasks: tasks.length };
+    });
 
-    return;
+    for (const dealId of moved.deals) {
+      const eventData: FieldValueEventDto = {
+        originated_by: performer,
+        deal: { id: dealId } as any,
+        fields: [new Field('agent', successor.username, user.username)],
+        fields_of: FieldsOf.DEAL,
+      };
+      this.eventEmitter.emit(EventTypes.NEW_FIELD_VALUE.toString(), eventData);
+    }
+    if (staff) {
+      // a removed employee: no token and no bot chat keeps acting as them
+      this.eventEmitter.emit(SIGNED_OUT_EVENT, await signOutEverywhere(this.dataSource, user.id));
+    }
+
+    return { deals: moved.deals.length, tasks: moved.tasks };
+  }
+
+  /**
+   * PATCH /users/me: a staff user changes their own name and phone (the phone is needed to connect
+   * Telegram and goes into the e-mail signature); role, rights, group and e-mail stay with the admin.
+   * The change is written to the journal.
+   */
+  async updateOwnProfile(
+    userId: number,
+    data: UpdateOwnProfileDto,
+  ): Promise<{ id: number; username: string; phone: string | null }> {
+    const user = await this.userRepository.findOne({ where: { id: userId } });
+    if (!user || user.role === RoleEnum.CTR_AGENT) {
+      throw new ForbiddenException();
+    }
+
+    const fields: Field[] = [];
+    const changes: Partial<User> = {};
+    if (data.username !== undefined && data.username !== user.username) {
+      fields.push(new Field('username', data.username, user.username));
+      changes.username = data.username;
+    }
+    if (data.phone !== undefined) {
+      const phone = normalizePhone(data.phone);
+      if ((phone ?? null) !== (user.phone ?? null)) {
+        fields.push(new Field('phone', phone, user.phone));
+        changes.phone = phone;
+      }
+    }
+
+    if (fields.length) {
+      await this.userRepository.update(user.id, { ...changes, updated_by: { id: user.id } as User });
+      const eventData = {
+        originated_by: user,
+        target_user: user,
+        deal: undefined,
+        fields,
+        fields_of: FieldsOf.USER,
+      } as FieldValueEventDto;
+      this.eventEmitter.emit(EventTypes.NEW_FIELD_VALUE.toString(), eventData);
+    }
+
+    return {
+      id: user.id,
+      username: changes.username ?? user.username,
+      phone: (changes.phone !== undefined ? changes.phone : user.phone) ?? null,
+    };
   }
 
   private async assertNotLastAdmin(adminId: number): Promise<void> {
@@ -452,15 +623,18 @@ export class UserService {
     data: CreateUserDto,
     request: Request,
   ): Promise<User> {
-    const company = await this.helperService.getById(Company, data.company_id);
-    await this.assertPhoneIsFree(data.phone);
+    // a contact may have no company: it is attached later (or never)
+    const company =
+      data.company_id != null ? await this.helperService.getById(Company, data.company_id) : null;
+    const phone = normalizePhone(data.phone);
+    await this.assertPhoneIsFree(phone);
     const newCtrAgent = new User();
 
     newCtrAgent.username = data.username;
-    newCtrAgent.email = data.email;
+    newCtrAgent.email = data.email || null;
     newCtrAgent.role = RoleEnum.CTR_AGENT;
     newCtrAgent.company = company;
-    newCtrAgent.phone = data.phone;
+    newCtrAgent.phone = phone;
     newCtrAgent.created_by =
       await this.helperService.extractUserFromRequest(request);
 
@@ -468,27 +642,33 @@ export class UserService {
       newCtrAgent.tg_id = data.tg_user_id;
     }
 
+    const fillerValues = (data.fillers ?? []).filter((f) => f?.filler_id && String(f.value ?? '').trim());
     await this.fillerService.assertRequiredFilled(
       FillableTablesEnum.USER,
-      data.fillers,
+      fillerValues,
     );
-    const fillers = await this.fillerService.getFillersHashMap(data.fillers, FillableTablesEnum.USER);
-    newCtrAgent.user_fillers = this.createUserFillers(fillers, data.fillers);
+    newCtrAgent.user_fillers = fillerValues.length
+      ? this.createUserFillers(
+          await this.fillerService.getFillersHashMap(fillerValues, FillableTablesEnum.USER),
+          fillerValues,
+        )
+      : [];
 
     return this.userRepository.save(newCtrAgent);
   }
 
   /**
-   * Telegram, WhatsApp and call recordings find the client by the digits of the phone:
-   * two contacts with one number make them pick the wrong one.
+   * Telegram, WhatsApp and call recordings find the client by the phone: two contacts with one number
+   * make them pick the wrong one. Compared as everywhere (helper/phone.ts): the last 9 digits, so
+   * "90 123 45 67" and "+998 90 123-45-67" are the same number.
    */
   async assertPhoneIsFree(phone: string | null | undefined, exceptId?: number): Promise<void> {
-    const digits = String(phone ?? '').replace(/[^0-9]/g, '');
-    if (digits.length < 7) return;
+    const key = phoneKey(phone);
+    if (!key) return;
     const qb = this.userRepository
       .createQueryBuilder('u')
       .where('u.role = :role', { role: RoleEnum.CTR_AGENT })
-      .andWhere("regexp_replace(COALESCE(u.phone, ''), '[^0-9]', '', 'g') = :digits", { digits });
+      .andWhere(`${phoneKeySql('u.phone')} = :key`, { key });
     if (exceptId) qb.andWhere('u.id <> :exceptId', { exceptId });
     const same = await qb.getOne();
     if (same) {
@@ -496,78 +676,162 @@ export class UserService {
     }
   }
 
+  /**
+   * A contact's card (PATCH /users/:id) and a contact of the company card (PATCH /companies/:id).
+   * Only what is sent changes:
+   * - `email` / `phone` not sent stay; "" or null clears them; the phone is stored normalized;
+   * - `company_id` not sent keeps the company, null detaches the contact, a number moves it: the move is
+   *   in the history, the old company drops it as its primary contact, and the contact's deals without
+   *   a company get the new one (they belong to the client's company now);
+   * - custom fields: `fillers` change values OF THIS CONTACT by their id ("" removes a value that is not
+   *   required; an id of another contact's value is refused), `fillers_create` adds values,
+   *   `fillers_set` sets a field by its definition (the company card has one input per field).
+   * The change goes to the history of every deal of the contact; a contact without deals keeps it in
+   * its own history (the event points at the contact).
+   */
   async updateCtrAgent(
     ctrAgent: User,
     request: Request,
-    data: UpdateUserDto,
+    data: CtrAgentChanges,
   ): Promise<void> {
-    const company = await this.helperService.getById(Company, data.company_id);
-    if (data.phone !== ctrAgent.phone) await this.assertPhoneIsFree(data.phone, ctrAgent.id);
-
     /**
      * This is later used to add events that the fields were updated in deal history
      */
     const updatedFields: Field[] = [];
+    // the columns that change: written with update() — save() of a loaded contact also wrote back its
+    // loaded relations (custom field values: cascade), which could restore values changed below
+    const columns: Partial<User> = {};
 
-    updatedFields.push(new Field('username', data.username, ctrAgent.username));
-    ctrAgent.username = data.username;
+    if (data.username !== undefined && data.username !== ctrAgent.username) {
+      updatedFields.push(new Field('username', data.username, ctrAgent.username));
+      ctrAgent.username = data.username;
+      columns.username = data.username;
+    }
 
-    updatedFields.push(new Field('email', data.email, ctrAgent.email));
-    ctrAgent.email = data.email;
-    updatedFields.push(new Field('phone', data.phone, ctrAgent.phone));
-    ctrAgent.phone = data.phone;
-    ctrAgent.company = company;
+    if (data.email !== undefined) {
+      const email = data.email ? String(data.email).trim() : null;
+      if (email !== (ctrAgent.email ?? null)) {
+        if (email && (await this.checkIfUserEmailExists(email, ctrAgent.id))) {
+          throw new BadRequestException(`User with email ${email} already exists!`);
+        }
+        updatedFields.push(new Field('email', email, ctrAgent.email));
+        ctrAgent.email = email;
+        columns.email = email;
+      }
+    }
+
+    if (data.phone !== undefined) {
+      const phone = normalizePhone(data.phone);
+      if (phone !== (ctrAgent.phone ?? null)) {
+        if (phoneKey(phone) !== phoneKey(ctrAgent.phone)) await this.assertPhoneIsFree(phone, ctrAgent.id);
+        updatedFields.push(new Field('phone', phone, ctrAgent.phone));
+        ctrAgent.phone = phone;
+        columns.phone = phone;
+      }
+    }
 
     if (data.tg_user_id) {
       updatedFields.push(
         new Field('tg_user_id', `${data.tg_user_id}`, `${ctrAgent.tg_id}`),
       );
       ctrAgent.tg_id = data.tg_user_id;
+      columns.tg_id = data.tg_user_id;
     }
 
-    const userFillerIds = data.fillers.map(
-      (userFiller) => userFiller.user_filler_id,
-    );
-
-    const userFillers = await this.getUserFillersByIds(userFillerIds);
-    const requestedUserFillers = this.getUserFillerHashMap(data.fillers);
-
-    // Update necessary user fillers
-    userFillers.forEach((userFiller) => {
-      const newFillerValue = requestedUserFillers.get(userFiller.id);
-
-      if (newFillerValue !== userFiller.value) {
-        this.fillerService.assertNotBlank(userFiller.filler, newFillerValue);
-        updatedFields.push(
-          new Field(userFiller.filler.field, newFillerValue, userFiller.value),
-        );
-        userFiller.value = newFillerValue;
+    // the company: a move is a change of the client's company, so it is logged
+    let movedFrom: Company | null = null;
+    let movedTo: Company | null | undefined; // undefined: the company did not change
+    if (data.company_id !== undefined) {
+      const current = ctrAgent.company ?? null;
+      const next =
+        data.company_id === null ? null : await this.helperService.getById(Company, data.company_id);
+      if ((next?.id ?? null) !== (current?.id ?? null)) {
+        updatedFields.push(new Field('company', next?.name ?? null, current?.name ?? null));
+        ctrAgent.company = next;
+        columns.company = next ? ({ id: next.id } as Company) : null;
+        movedFrom = current;
+        movedTo = next;
       }
-    });
+    }
 
-    if ((data.fillers_create ?? []).length !== 0) {
+    // custom fields
+    const toSave: UserFiller[] = [];
+    const toRemove: UserFiller[] = [];
+    const change = (row: UserFiller, raw: unknown) => {
+      const value = String(raw ?? '').trim();
+      if (value === row.value) return;
+      this.fillerService.assertNotBlank(row.filler, value);
+      updatedFields.push(new Field(row.filler.field, value || null, row.value));
+      if (value) {
+        row.value = value;
+        toSave.push(row);
+      } else {
+        toRemove.push(row);
+      }
+    };
+
+    const byId = data.fillers ?? [];
+    const rows = await this.getUserFillersByIds(
+      byId.map((userFiller) => userFiller.user_filler_id),
+      ctrAgent.id,
+    );
+    const requestedUserFillers = this.getUserFillerHashMap(byId);
+    rows.forEach((row) => change(row, requestedUserFillers.get(row.id)));
+
+    const toSet = (data.fillers_set ?? []).filter((f) => f?.filler_id);
+    if (toSet.length) {
+      const definitions = await this.fillerService.getFillersHashMap(toSet, FillableTablesEnum.USER);
+      const existing = await this.userFillerRepository.find({
+        where: { user: { id: ctrAgent.id } },
+        relations: { filler: true },
+        order: { id: 'ASC' },
+      });
+      for (const item of toSet) {
+        const row = existing.find((e) => e.filler?.id === item.filler_id);
+        if (row) {
+          change(row, item.value);
+          continue;
+        }
+        const value = String(item.value ?? '').trim();
+        if (!value) continue;
+        const created = new UserFiller();
+        created.filler = definitions.get(item.filler_id);
+        created.value = value;
+        created.user = { id: ctrAgent.id } as User;
+        toSave.push(created);
+        updatedFields.push(new Field(created.filler.field, value));
+      }
+    }
+
+    const toCreate = (data.fillers_create ?? []).filter(
+      (f) => f?.filler_id && String(f.value ?? '').trim(),
+    );
+    if (toCreate.length !== 0) {
       // Create necessary user fillers
       const fillers = await this.fillerService.getFillersHashMap(
-        data.fillers_create,
+        toCreate,
         FillableTablesEnum.USER,
       );
-      data.fillers_create.forEach((filler) => {
+      toCreate.forEach((filler) => {
         const newUserFiller = new UserFiller();
         newUserFiller.filler = fillers.get(filler.filler_id);
-        newUserFiller.value = filler.value;
-        newUserFiller.user = ctrAgent;
-        userFillers.push(newUserFiller);
+        newUserFiller.value = String(filler.value).trim();
+        newUserFiller.user = { id: ctrAgent.id } as User;
+        toSave.push(newUserFiller);
 
         updatedFields.push(
-          new Field(fillers.get(filler.filler_id).field, filler.value),
+          new Field(fillers.get(filler.filler_id).field, newUserFiller.value),
         );
       });
     }
 
     // Was saved only together with new fields: a changed value of an existing
     // field ("Должность") was lost when no field was added at the same time.
-    if (userFillers.length) {
-      await this.userFillerRepository.save(userFillers);
+    if (toRemove.length) {
+      await this.userFillerRepository.remove(toRemove);
+    }
+    if (toSave.length) {
+      await this.userFillerRepository.save(toSave);
     }
 
     const originated_by =
@@ -575,9 +839,33 @@ export class UserService {
 
     ctrAgent.updated_by = originated_by;
 
-    await this.userRepository.save(ctrAgent);
+    await this.userRepository.update(ctrAgent.id, {
+      ...columns,
+      updated_by: { id: originated_by.id } as User,
+    });
 
-    ctrAgent.linked_deals.forEach((deal) => {
+    if (movedTo !== undefined) {
+      // the old company does not keep as its primary contact a person who is not its contact any more
+      if (movedFrom) {
+        await this.dataSource.query(
+          `UPDATE company SET primary_contact_id = NULL WHERE id = $1 AND primary_contact_id = $2`,
+          [movedFrom.id, ctrAgent.id],
+        );
+      }
+      // the contact's deals without a company (Telegram, WhatsApp, calls) are the new company's now
+      if (movedTo) {
+        await this.dataSource.query(
+          `UPDATE deal SET company_id = $1
+            WHERE company_id IS NULL AND deleted_at IS NULL
+              AND id IN (SELECT "dealId" FROM deal_user WHERE "userId" = $2)`,
+          [movedTo.id, ctrAgent.id],
+        );
+      }
+    }
+
+    if (!updatedFields.length) return;
+    const deals = ctrAgent.linked_deals ?? [];
+    deals.forEach((deal) => {
       const eventData: FieldValueEventDto = {
         originated_by: originated_by,
         deal: deal,
@@ -586,6 +874,16 @@ export class UserService {
       };
       this.eventEmitter.emit(EventTypes.NEW_FIELD_VALUE.toString(), eventData);
     });
+    if (deals.length === 0) {
+      const eventData: FieldValueEventDto = {
+        originated_by: originated_by,
+        target_user: { id: ctrAgent.id } as User,
+        deal: undefined,
+        fields: updatedFields,
+        fields_of: FieldsOf.USER,
+      };
+      this.eventEmitter.emit(EventTypes.NEW_FIELD_VALUE.toString(), eventData);
+    }
 
     return;
   }
@@ -613,14 +911,23 @@ export class UserService {
     return recordings;
   }
 
-  private async getUserFillersByIds(ids: number[]): Promise<UserFiller[]> {
+  /**
+   * Values of custom fields by their ids, and only of this contact: the ids come from the request, and
+   * an id of another contact's value used to change that contact's field without a trace.
+   */
+  private async getUserFillersByIds(ids: number[], userId: number): Promise<UserFiller[]> {
+    const wanted = [...new Set(ids.filter((id) => id != null))];
+    if (wanted.length === 0) return [];
     const userFillers = await this.userFillerRepository.find({
-      where: { id: In(ids) },
+      where: { id: In(wanted), user: { id: userId } },
       relations: ['filler'],
     });
 
-    if (userFillers.length !== ids.length) {
-      this.fillerService.throwExceptionWithNonExistingFillers(ids, userFillers);
+    if (userFillers.length !== wanted.length) {
+      const found = new Set(userFillers.map((row) => row.id));
+      throw new BadRequestException(
+        `Значения доп. полей ${wanted.filter((id) => !found.has(id)).join(', ')} не относятся к этому контакту`,
+      );
     }
 
     return userFillers;

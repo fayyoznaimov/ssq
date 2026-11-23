@@ -1,5 +1,5 @@
 import type { Result } from './result';
-import {parsePhoneNumber} from 'libphonenumber-js';
+import {parsePhoneNumberFromString} from 'libphonenumber-js';
 
 type ValidationResult = Result<undefined, string>;
 type ValidationFn = (...args: any[]) => ValidationResult;
@@ -27,10 +27,32 @@ export function validNumber(message: string) {
 
 export function validPhone(message: string): (value: string | undefined) => ValidationResult {
     return (value: string | undefined) => {
-        const parsed = parsePhoneNumber(value || '');
-        if (!parsed.isValid()) return {ok: false, error: message}
+        // An empty or unreadable number is an error of the field, not an exception;
+        // digits without "+" (998901200000) are read as an international number too
+        let valid = false;
+        try {
+            const text = String(value ?? '').trim();
+            valid = !!parsePhoneNumberFromString(text)?.isValid()
+                || (/^\d[\d\s()-]{6,}$/.test(text) && !!parsePhoneNumberFromString('+' + text)?.isValid());
+        } catch {
+            valid = false;
+        }
+        if (!valid) return {ok: false, error: message}
         return {ok: true, value: undefined}
     }
+}
+
+/** The rule checks only a filled value: an empty field passes */
+export function optional(fn: ValidationFn) {
+    return (value: unknown): ValidationResult => {
+        if (value == null || String(value).trim() === '') return {ok: true, value: undefined};
+        return fn(value);
+    };
+}
+
+/** The rule checks the value only while the condition holds */
+export function when(condition: () => boolean, fn: ValidationFn) {
+    return (value: unknown): ValidationResult => (condition() ? fn(value) : {ok: true, value: undefined});
 }
 
 export function validEmail(message: string): (value: string | undefined) => ValidationResult {

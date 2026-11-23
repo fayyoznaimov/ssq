@@ -1,4 +1,4 @@
-"""The outbox: a message the API cannot take now is delivered later, in order; a refused one is dropped."""
+"""The outbox: a message the API cannot take now is delivered later, in order; a refused one is kept aside."""
 import json
 import os
 import tempfile
@@ -75,10 +75,49 @@ class OutboxTest(unittest.TestCase):
         self.assertIsNone(api.deliver({"tg_message_id": 5}))
         self.assertEqual(api.outbox_size(), 1)
 
-    def test_refused_message_is_dropped_not_retried(self):
+    def test_refused_message_is_kept_aside_not_retried(self):
         FakeApi.status = 400
         self.assertIsNone(self.api.deliver({"tg_message_id": 9}))
         self.assertEqual(self.api.outbox_size(), 0)
+        rows = self.api.db.execute("SELECT payload, status FROM rejected").fetchall()
+        self.assertEqual([(json.loads(p)["tg_message_id"], s) for p, s in rows], [(9, 400)])
+        self.assertEqual(self.api.stats()["rejected"], 1)
+
+    def test_a_wrong_token_keeps_the_messages(self):
+        # 401: the service and the API disagree about the token (a deploy mistake): nothing may be lost
+        FakeApi.status = 401
+        self.assertIsNone(self.api.deliver({"tg_message_id": 11}))
+        self.assertEqual(self.api.outbox_size(), 1)
+        self.assertEqual(self.api.stats()["rejected"], 0)
+        FakeApi.status = 200
+        self.assertEqual(self.api.flush(), 1)
+        self.assertEqual(self.api.outbox_size(), 0)
+
+    def test_a_message_that_fails_with_500_does_not_block_the_others(self):
+        FakeApi.status = lambda body: 500 if body["tg_message_id"] == 1 else 200
+        self.assertIsNone(self.api.deliver({"tg_message_id": 1}))
+        self.assertEqual(self.api.outbox_size(), 1)
+        # the next message goes through the queue, past the one waiting for its retry
+        self.assertIsNone(self.api.deliver({"tg_message_id": 2}))
+        self.assertIn(2, [b["tg_message_id"] for b in FakeApi.received])
+        self.assertEqual(self.api.outbox_size(), 1)
+
+    def test_a_message_failing_with_500_again_and_again_is_kept_aside(self):
+        from helpers import api_client
+        FakeApi.status = 500
+        self.api.deliver({"tg_message_id": 3})
+        for _ in range(api_client.MAX_FAILED_ATTEMPTS + 1):
+            self.api.db.execute("UPDATE outbox SET next_at = 0")
+            self.api.flush()
+        self.assertEqual(self.api.outbox_size(), 0)
+        self.assertEqual(self.api.stats()["rejected"], 1)
+
+    def test_stats_tell_how_long_messages_wait(self):
+        FakeApi.status = 503
+        self.api.deliver({"tg_message_id": 4})
+        stats = self.api.stats()
+        self.assertEqual(stats["outbox"], 1)
+        self.assertGreaterEqual(stats["outbox_oldest_sec"], 0)
 
     def test_flush_stops_at_the_first_failure(self):
         FakeApi.status = 503

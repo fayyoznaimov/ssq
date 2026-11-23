@@ -232,6 +232,7 @@ def leftovers():
 
 ANALYTICS_ENDPOINTS = [
     "/analytics/users?" + PERIOD,
+    "/analytics/managers?" + PERIOD,
     "/analytics/deals",
     "/analytics/deals?is_active=true",
     "/analytics/calls",
@@ -282,10 +283,11 @@ def main():
         "file": True,
     }
 
-    def staff(role):
-        user = {"email": "auditan-%s-%s@example.test" % (role, RUN), "password": secrets.token_urlsafe(12)}
+    def staff(role, name=None):
+        name = name or role
+        user = {"email": "auditan-%s-%s@example.test" % (name, RUN), "password": secrets.token_urlsafe(12)}
         status, body = http("POST", "/users", {
-            "email": user["email"], "password": user["password"], "username": "%s-%s" % (P, role),
+            "email": user["email"], "password": user["password"], "username": "%s-%s" % (P, name),
             "role": role, "group_id": group_id, "permissions": permissions,
         })
         if status != 201 or not isinstance(body, dict):
@@ -482,8 +484,76 @@ def main():
     check("the unit is stated: duration_unit = 'minutes'", me and me.get("duration_unit") == "minutes", me)
     check("the key the page reads is 'avg_duration' (the API used to answer 'avg_duration_in_minutes')", me and "avg_duration" in me and "avg_duration_in_minutes" not in me)
 
+    # ================================================================= one definition of the numbers (CALL-13)
+    section("Звонки за период, «По менеджерам» (GET /analytics/calls?period, /analytics/managers)")
+    sql("INSERT INTO recording (duration, outgoing, user_id, created_at) VALUES "
+        "(300000, true, %d, '2031-03-15 10:00'), (60000, false, %d, '2031-03-16 11:00'), (60000, true, %d, '2031-04-01 09:00')"
+        % (agent["id"], agent["id"], agent["id"]))
+    status, body = http("GET", "/analytics/calls?" + PERIOD)
+    me = row_of(body if status == 200 and isinstance(body, list) else [], "user_id", agent["id"])
+    check("calls of March 2031 only: 2 calls, 6.0 min (the calls of other days are not counted)",
+          me and num(me.get("call_count")) == 2 and num(me.get("total_call_duration")) == 6.0, me)
+    status, body = http("GET", "/analytics/calls?from_date=2031-03-01")
+    me = row_of(body if status == 200 and isinstance(body, list) else [], "user_id", agent["id"])
+    check("one end of the period only: all time (the page's field cleared)", status == 200 and me and num(me.get("call_count")) == 5, (status, me))
+
+    status, body = http("GET", "/analytics/managers?" + PERIOD)
+    rows = (body or {}).get("data", []) if status == 200 and isinstance(body, dict) else []
+    me = row_of(rows, "id", agent["id"])
+    check("«По менеджерам»: the agent (a salesperson) is listed — was role 'manager' only", me is not None and me.get("role") == "agent", [r.get("role") for r in rows][:10])
+    check("... new deals %d / %d: responsible = the agent, created in the period, deleted out" % (EXPECTED_NEW, EXPECTED_NEW_BUDGET),
+          me and me.get("deal_count") == EXPECTED_NEW and me.get("deal_budget") == EXPECTED_NEW_BUDGET, me)
+    check("... won %d / %d: closed in the period in '%s', as the consolidated report and the goals" % (EXPECTED_WON, EXPECTED_WON_BUDGET, won_name),
+          me and me.get("won_count") == EXPECTED_WON and me.get("won_budget") == EXPECTED_WON_BUDGET, me)
+    check("... calls of the period from the recordings: 2 (1 out, 1 in), 6.0 minutes — was raw milliseconds",
+          me and me.get("call_count") == 2 and me.get("outgoing_call_count") == 1 and me.get("call_minutes") == 6.0, me)
+    check("... the answer times come from «Контроль» (working hours): the keys are there",
+          me and all(k in me for k in ("first_response_median_sec", "response_median_sec", "in_sla_share")), me)
+    boss = row_of(rows, "id", manager["id"])
+    check("... a staff member without numbers is listed with zeros", boss is not None and boss.get("deal_count") == 0 and boss.get("call_count") == 0, boss)
+    check("... no client's contacts", row_of(rows, "id", contact_id) is None)
+    status, body = http("GET", "/analytics/managers?from_date=2031-04-01&till_date=2031-04-30")
+    me = row_of((body or {}).get("data", []) if status == 200 else [], "id", agent["id"])
+    check("April 2031: won 1 / 700 (closed on 2 April), 1 call", me and me.get("won_count") == 1 and me.get("won_budget") == 700 and me.get("call_count") == 1, me)
+    status, body = http("GET", "/analytics/managers")
+    check("no period: the current month (200, the period in the answer)", status == 200 and (body or {}).get("period", {}).get("from"), (status, body and list(body)))
+    status, body = http("GET", "/analytics/managers?" + PERIOD, token=agent["token"])
+    check("agent GET /analytics/managers -> 403", status == 403, status)
+
+    # ================================================================= goals of a departed / groupless employee (CALL-14)
+    section("Цели: an employee who left and one without a group still count")
+    leaver = staff("agent", "leaver")
+    loner = staff("agent", "loner")
+    for who, budget in ((leaver, 50), (loner, 30)):
+        scalar("INSERT INTO deal (label, display_id, budget, stage_id, agent_id, created_by, company_id, created_at, closed_at) "
+               "VALUES ('%s-won-%d', %d, %d, %d, %d, %d, %d, '2031-03-11 10:00', '2031-03-21 10:00') RETURNING id"
+               % (P, who["id"], 900000000 + secrets.randbelow(90000000), budget, won_stage, who["id"], admin_id, company_id))
+    sql("UPDATE \"user\" SET deleted_at = now() WHERE id = %d" % leaver["id"])
+    sql("UPDATE \"user\" SET group_id = NULL WHERE id = %d" % loner["id"])
+    status, body = http("GET", "/analytics/objectives/results?" + PERIOD)
+    groups = (body or {}).get("groups", []) if status == 200 else []
+    group = row_of(groups, "id", group_id) or {}
+    gone = row_of(group.get("users", []), "id", leaver["id"])
+    check("a deleted employee with sales in the period stays in the group (marked deleted)",
+          gone is not None and gone.get("deleted") is True and num(gone.get("total_budget")) == 50, gone)
+    check("... and the group's fact keeps them: %d" % (EXPECTED_WON_BUDGET + 50), num(group.get("total_budget")) == EXPECTED_WON_BUDGET + 50, group.get("total_budget"))
+    outside = row_of(groups, "id", None)
+    check("sales of staff in no group: the group «Вне групп» without a plan",
+          outside is not None and outside.get("name") == "Вне групп" and outside.get("objectives") is None
+          and row_of(outside.get("users", []), "id", loner["id"]) and num(outside.get("total_budget")) >= 30, outside)
+    status, body = http("GET", "/analytics/objectives/results?from_date=2031-05-01&till_date=2031-05-31")
+    group = row_of((body or {}).get("groups", []), "id", group_id) or {}
+    check("a deleted employee without sales in the period is not listed", row_of(group.get("users", []), "id", leaver["id"]) is None, group.get("users"))
+    goals_vue = client_file(os.path.join("pages", "analytics", "goals", "index.vue"))
+    check("goals page: the fact is counted for the month / quarter / year of the plan (was 2020-2100 against the monthly plan)",
+          "set('year', 2100)" not in goals_vue and "startOf(unit)" in goals_vue and "endOf(unit)" in goals_vue, "")
+
     # ================================================================= sales
     section("Продажи (GET /analytics/deals)")
+    status, body = http("GET", "/analytics/deals?" + PERIOD)
+    # the five of the agent and the two of the goals section above
+    check("with a period: 200, the deals created in it", status == 200 and isinstance((body or {}).get("stages"), list)
+          and num((body or {}).get("total_deal_count")) == EXPECTED_NEW + 2, (status, body and body.get("total_deal_count")))
     status, body = http("GET", "/analytics/deals")
     check("200 with the stages of the active pipeline", status == 200 and isinstance((body or {}).get("stages"), list) and body["stages"], "%s %s" % (status, message_of((status, body))))
     status, body = http("GET", "/analytics/deals?is_active=maybe")

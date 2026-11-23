@@ -3,7 +3,7 @@ import { useValidation } from '~/composables/useValidation';
 import type { Deal } from '~/types/deal';
 import type { Filler } from '~/types/filler';
 import { type Company, type CompanyContact,type Contact, type User, type UserContact, UserRole } from '~/types/user';
-import { required, validEmail, validPhone } from '~/utils/validation';
+import { optional, required, validEmail, validPhone } from '~/utils/validation';
 import { uploadUrl } from '~/utils/files';
 
 import CompanyAutocomplete from './company-autocomplete.vue';
@@ -26,10 +26,12 @@ const openContact = ref();
 const selectedContact = ref<Partial<UserContact>>({ name: '' });
 const resetKey = ref(1);
 
+// The API needs the name and the company of a contact; e-mail and phone only when they are given
+// (a client from a messenger often has no e-mail). The company of the deal is offered first.
 const schema: Schema<string> = {
-    email: [required('Обязательное поле'), validEmail('Неверный формат почты')],
-    phone: [required('Обязательное поле'), validPhone('Неверный номер телефона')],
-    company: [required('Обязательное поле')],
+    email: [optional(validEmail('Неверный формат почты'))],
+    phone: [optional(validPhone('Неверный номер телефона'))],
+    company: [required('Укажите компанию контакта')],
     contact: [required('Обязательное поле')],
 };
 
@@ -100,9 +102,10 @@ async function onCtrAgentCreate(e: Event) {
 
     if (!validationResult.valid) return;
     if (!companyId) {
-        const newCompany = await promiseResult(companyService.create<Company>({name: companyName, is_old: false, fillers: []}).exec());
+        // a name that is not in the list: a company without its required fields is refused by the API
+        const newCompany = await promiseResult(companyService.create<Company>({name: String(companyName).trim(), is_old: false, fillers: []}).exec());
         if (!newCompany.ok) {
-            return toast.show({message: newCompany.error.message, timeout: 3000, type: 'error'});
+            return toast.show({message: `Компания «${companyName}» не создана: ${newCompany.error.message}. Выберите компанию из списка.`, timeout: 6000, type: 'error'});
         }
         companyId = newCompany.value.id;
     }
@@ -112,8 +115,8 @@ async function onCtrAgentCreate(e: Event) {
         username: name,
         company_id: companyId,
         fillers,
-        phone,
-        email,
+        phone: String(phone ?? '').trim() || undefined,
+        email: String(email ?? '').trim() || undefined,
         fillers_create: [],
     };
 
@@ -130,6 +133,20 @@ async function onCtrAgentCreate(e: Event) {
 watchEffect(() => {
     agents.value = filteredCtrAgents(props.contacts);
 });
+
+// a new contact belongs to the company of the deal unless another one is chosen
+// (picking a typed name replaces selectedContact, so it is offered again then)
+function offerDealCompany() {
+    const company: any = deal.value.company;
+    const current: any = selectedContact.value;
+    if (!current || current.id || current.company || !company?.id) return;
+    selectedContact.value = { ...current, company: { id: company.id, name: company.name } };
+}
+
+watch(openContact, (value) => {
+    if (value === 'new') offerDealCompany();
+});
+watch(selectedContact, offerDealCompany);
 
 watchEffect(() => {
     for (const filler of props.fillers) {
@@ -251,7 +268,6 @@ watchEffect(() => {
                     <BaseInput 
                         name="email" 
                         label="Электронная почта" 
-                        required 
                         :error="errors.email"
                         @input="(e: Event) => onChange('email', (e.target as HTMLFormElement).value)"
                         :key="resetKey"
@@ -259,7 +275,6 @@ watchEffect(() => {
                     <BaseInput 
                         name="phone" 
                         label="Номер телефона" 
-                        required 
                         :error="errors.phone"
                         @input="(e: Event) => onChange('phone', (e.target as HTMLFormElement).value)"
                         :key="resetKey"

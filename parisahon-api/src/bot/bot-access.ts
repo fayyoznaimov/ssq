@@ -1,21 +1,23 @@
 import { DataSource } from 'typeorm';
 import { AuthUser, AuthGuard } from '../auth/auth.guard';
-import { RoleEnum, UserPermissions } from '../user/user.entity';
+import { Access, Scope } from '../auth/access';
+import { RoleEnum } from '../user/user.entity';
 
 /**
- * What a CRM user may see and do through the bot. The web CRM stores these
- * rights in the user card (user.permissions: 0 banned, 1 if responsible,
- * 2 for the group, 3 everything); the bot enforces them on the server.
- *
- * Without stored permissions: admin and manager see everything, an agent sees
- * all companies and contacts, but only the deals where they are responsible.
+ * What a CRM user may see and do through the bot: the API's own rules (src/auth/access.ts), so the
+ * bot, the web CRM and the API never disagree. The user card stores the levels (user.permissions:
+ * 0 banned, 1 if responsible, 2 for the group, 3 everything). Admin and manager: everything.
+ * Without stored permissions: an agent sees all companies and contacts, but only the deals where
+ * they are responsible. This class only turns the scopes into SQL for the bot's raw queries.
  */
-export type Scope = 'none' | 'own' | 'group' | 'all';
-
-const LEVEL_TO_SCOPE: Record<number, Scope> = { 0: 'none', 1: 'own', 2: 'group', 3: 'all' };
+export type { Scope } from '../auth/access';
 
 export class BotAccess {
-  constructor(readonly user: AuthUser) {}
+  private readonly access: Access;
+
+  constructor(readonly user: AuthUser) {
+    this.access = new Access(user);
+  }
 
   get id() {
     return this.user.sub;
@@ -25,37 +27,22 @@ export class BotAccess {
     return this.user.role === RoleEnum.ADMIN;
   }
 
-  private level(entity: keyof UserPermissions, action: string): number | undefined {
-    const value = (this.user.permissions as any)?.[entity]?.[action];
-    return typeof value === 'number' ? value : undefined;
+  viewScope(entity: 'deal' | 'company' | 'contact'): Scope {
+    return this.access.scope(entity, 'view');
   }
 
-  viewScope(entity: 'deal' | 'company' | 'contact'): Scope {
-    if (this.isAdmin) return 'all';
-    const level = this.level(entity, 'view');
-    if (level === undefined) {
-      if (this.user.role === RoleEnum.MANAGER) return 'all';
-      return entity === 'deal' ? 'own' : 'all';
-    }
-    return LEVEL_TO_SCOPE[level] ?? 'none';
+  /** E-mail texts in a client's history: the "mail" switch of the user card, as on the web (Access.canReadMail). */
+  get canReadMail(): boolean {
+    return this.access.canReadMail;
   }
 
   canCreateCompany(): boolean {
-    if (this.isAdmin) return true;
-    const level = this.level('company', 'create');
-    return level === undefined || level > 0;
+    return this.access.can('company', 'create');
   }
 
-  /** May this user close a task assigned to `agentId` / group `groupId`? */
-  canUpdateTask(agentId: number | null, groupId: number | null): boolean {
-    if (this.isAdmin) return true;
-    const level = this.level('task', 'update') ?? 3;
-    const mine = agentId === this.id;
-    const ourGroup = groupId !== null && groupId === this.user.group_id;
-    if (level >= 3) return true;
-    if (level >= 2) return mine || ourGroup;
-    if (level >= 1) return mine;
-    return false;
+  /** May this user close a task assigned to `agentId` / group `groupId` (created by `creatorId`)? */
+  canUpdateTask(agentId: number | null, groupId: number | null, creatorId: number | null = null): boolean {
+    return this.access.allowsTask('update', agentId, groupId, creatorId);
   }
 
   /**

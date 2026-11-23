@@ -14,7 +14,7 @@ import {
 import { RecordAccess } from '../auth/access';
 import { TaskService } from './task.service';
 import { AuthGuard } from '../auth/auth.guard';
-import { CreateTaskDto } from './dto/create.task.dto';
+import { CreateTaskDto, UpdateTaskDto } from './dto/create.task.dto';
 import { Request } from 'express';
 import { instanceToPlain } from 'class-transformer';
 import { CloseTaskDto } from './dto/close.task.dto';
@@ -29,16 +29,21 @@ export class TaskController {
     private eventService: EventsService,
   ) { }
 
+  // tasks carry their deal, company and contact: only the tasks of records the user may see (task-access.ts)
   @Get()
-  async fetchAll(@Query() query: SearchTaskDto): Promise<Record<string, any>> {
-    return instanceToPlain(this.taskService.fetchAll(query));
+  async fetchAll(
+    @Query() query: SearchTaskDto,
+    @Req() request: Request,
+  ): Promise<Record<string, any>> {
+    return instanceToPlain(await this.taskService.fetchAll(query, request['user']));
   }
 
   @Get(':id')
   async fetchById(
     @Param('id', ParseIntPipe) id: number,
+    @Req() request: Request,
   ): Promise<Record<string, any>> {
-    return instanceToPlain(await this.taskService.getById(id));
+    return instanceToPlain(await this.taskService.getVisibleById(id, request['user']));
   }
 
   @Post()
@@ -47,19 +52,22 @@ export class TaskController {
     @Req() request: Request,
   ): Promise<Record<string, any>> {
     return instanceToPlain(
-      await this.taskService.create(request['user']?.sub, data),
+      await this.taskService.create(request['user']?.sub, data, request['user']),
     );
   }
 
+  // only what is sent changes (a drag in the calendar sends the times only)
   @Patch(':id')
   @RecordAccess('task', 'update')
   async update(
-    @Body() data: CreateTaskDto,
+    @Body() data: UpdateTaskDto,
     @Param('id', ParseIntPipe) id: number,
+    @Req() request: Request,
   ): Promise<void> {
-    const savedTask = await this.taskService.update(id, data);
+    const savedTask = await this.taskService.update(id, data, request['user']);
 
-    return this.eventService.updateTaskEvent(savedTask);
+    // the change is a new history entry with its author (the creation entry stays as it was)
+    return this.eventService.updateTaskEvent(savedTask, request['user']?.sub);
   }
 
   @Patch(':id/close')

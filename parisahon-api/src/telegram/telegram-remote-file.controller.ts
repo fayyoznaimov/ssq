@@ -4,6 +4,7 @@ import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { DataSource } from 'typeorm';
 import { Public } from '../auth/decorator/public.decorator';
+import { telegramServiceHeaders, telegramServiceUrl } from '../messenger/messenger-services';
 
 /** Types a browser may be told about; everything else is sent as a plain download. */
 const KNOWN_MIME = /^(video|audio|image)\/[a-z0-9.+-]+$|^application\/(pdf|zip)$/i;
@@ -25,9 +26,7 @@ export class TelegramRemoteFileController {
   constructor(private dataSource: DataSource) {}
 
   private serviceUrl(): string {
-    const host = (process.env.TELEGRAM_SERVICE_HOST || '').replace(/\/+$/, '');
-    const port = process.env.TELEGRAM_SERVICE_PORT;
-    return port && port !== '80' && !/:\d+$/.test(host) ? `${host}:${port}` : host;
+    return telegramServiceUrl();
   }
 
   private fail(res: Response, status: number, message: string): void {
@@ -60,7 +59,8 @@ export class TelegramRemoteFileController {
         chat_id: String(file.chat_tg_id),
         message_id: String(file.tg_message_id),
       });
-      const upstream = await fetch(`${base}/download?${query}`, { signal: abort.signal });
+      // the service's HTTP API wants the shared token too (TG-15)
+      const upstream = await fetch(`${base}/download?${query}`, { signal: abort.signal, headers: telegramServiceHeaders() });
       if (!upstream.ok || !upstream.body) {
         const answer: any = await upstream.json().catch(() => null);
         const reason = answer?.message ? `: ${answer.message}` : '';

@@ -3,13 +3,19 @@ import { DataSource } from 'typeorm';
 import { ClaudeCliClient, ClaudeCliError, matchBrace } from '../recognition/claude-cli.client';
 import { Access } from '../auth/access';
 import { AuthUser } from '../auth/auth.guard';
+import { HelperService } from '../helper/helper.service';
+import { User } from '../user/user.entity';
+import { MailboxService } from './mailbox.service';
+import { htmlToText, splitQuote } from './mail-text';
 
 /**
  * The writing assistant of the mail form (POST /emails/assist), Claude with no tools:
  *  - check:   spelling, meaning (against the deal: prices, quantities, terms, unanswered client questions), tone;
  *  - polite / shorter / english / russian / uzbek: rewrites the text;
  *  - draft:   a letter from the manager's notes;
- *  - reply:   an answer to the client's last message in the deal.
+ *  - reply:   an answer to the client's last message in the deal, or to the letter answered (reply_to_email_id).
+ * The history of the deal has the e-mails too (subject and the text without the quoted earlier
+ * letters, the direction of the letter itself), not only Telegram and WhatsApp messages.
  * It only suggests: nothing is sent. The letter, the deal and the client's messages are given to the
  * model as data inside fenced blocks, never as instructions.
  */
@@ -48,6 +54,8 @@ export class MailAssistService {
   constructor(
     private claude: ClaudeCliClient,
     private dataSource: DataSource,
+    private mailbox: MailboxService,
+    private helperService: HelperService,
   ) {}
 
   /** At most MAIL_ASSIST_PER_HOUR (60) requests per user per hour. */
@@ -76,8 +84,13 @@ export class MailAssistService {
       [dealId],
     );
     const history = await this.dataSource.query(
-      `SELECT e.created_at, e.outgoing, e.type,
-              LEFT(COALESCE(e.after_state->>'message', e.after_state->>'text', e.after_state->'email'->>'subject', ''), 600) AS text
+      // e-mails keep the letter under after_state.data (its own direction too); messages are flat
+      `SELECT e.created_at, e.type,
+              CASE WHEN e.type = 9 THEN COALESCE(e.after_state->'data'->>'outgoing', e.outgoing::text) ELSE e.outgoing::text END AS outgoing,
+              e.after_state->'data'->>'subject' AS subject,
+              LEFT(CASE WHEN e.type = 9 THEN COALESCE(e.after_state->'data'->>'body', '')
+                        ELSE COALESCE(e.after_state->>'message', e.after_state->>'text',
+                                      e.after_state->'data'->>'message', e.after_state->'data'->>'text', '') END, 8000) AS text
          FROM event e WHERE e.deal_id = $1 AND e.type IN (9, 11, 12, 16)
         ORDER BY e.created_at DESC, e.id DESC LIMIT 12`,
       [dealId],
@@ -92,19 +105,30 @@ export class MailAssistService {
     ].filter(Boolean).join('\n');
     const lines = history
       .reverse()
+      .map((h: any) => ({ ...h, text: h.type === 9 ? letterText(h.subject, h.text) : String(h.text ?? '').slice(0, 600) }))
       .filter((h: any) => h.text)
-      .map((h: any) => `${new Date(h.created_at).toISOString().slice(0, 16)} ${h.outgoing ? 'Менеджер' : 'Клиент'}: ${h.text}`);
+      .map((h: any) => `${new Date(h.created_at).toISOString().slice(0, 16)} ${h.outgoing === 'true' ? 'Менеджер' : 'Клиент'}: ${h.text}`);
     return { deal, history: lines.join('\n') };
   }
 
-  async assist(user: AuthUser, action: AssistAction, input: { subject?: string; body?: string; deal_id?: number }) {
+  /** The letter being answered, as a line of the history (only a letter the user may read). */
+  private async answeredLetter(user: AuthUser, emailId: number): Promise<string> {
+    const me = await this.helperService.getById(User, user.sub);
+    const email = await this.mailbox.accessibleLetter(emailId, me);
+    const body = email.html ? htmlToText(email.html) : email.body;
+    const when = email.sent_at ? new Date(email.sent_at).toISOString().slice(0, 16) : '';
+    return `${when} ${email.outgoing ? 'Менеджер' : 'Клиент'} (письмо, на которое отвечаем): ${letterText(email.subject, body, 2000)}`;
+  }
+
+  async assist(user: AuthUser, action: AssistAction, input: { subject?: string; body?: string; deal_id?: number; reply_to_email_id?: number }) {
     const body = String(input.body ?? '').trim();
     if (action !== 'reply' && body.length < 2) throw new BadRequestException('Пустой текст письма');
     if (body.length > 20000) throw new BadRequestException('Слишком длинное письмо для помощника');
     this.limit(user.sub);
 
     const ctx = input.deal_id ? await this.dealContext(user, input.deal_id) : null;
-    if (action === 'reply' && !ctx) throw new BadRequestException('Для ответа нужна сделка');
+    const answered = input.reply_to_email_id ? await this.answeredLetter(user, input.reply_to_email_id) : '';
+    if (action === 'reply' && !ctx && !answered) throw new BadRequestException('Для ответа нужна сделка или письмо, на которое вы отвечаете');
 
     const parts: string[] = [];
     if (action === 'check') {
@@ -119,7 +143,8 @@ export class MailAssistService {
     }
     if (input.subject) parts.push(fence('subject', input.subject));
     if (body) parts.push(fence(action === 'draft' ? 'notes' : 'letter', body));
-    if (ctx) parts.push(fence('deal', ctx.deal), fence('history', ctx.history || 'переписки нет'));
+    if (ctx) parts.push(fence('deal', ctx.deal));
+    if (ctx || answered) parts.push(fence('history', [ctx?.history, answered].filter(Boolean).join('\n') || 'переписки нет'));
 
     let text: string;
     try {
@@ -163,4 +188,13 @@ export class MailAssistService {
       text: String(parsed.text ?? '').slice(0, 20000),
     };
   }
+}
+
+/** A letter of the history for the model: «subject» and its own text (no quoted earlier letters, no markup). */
+function letterText(subject: string | null, body: string | null, max = 600): string {
+  const raw = String(body ?? '');
+  const plain = /<[a-z][\s\S]*>/i.test(raw) ? htmlToText(raw) : raw;
+  const { main } = splitQuote(plain);
+  const text = main.replace(/\s+/g, ' ').trim();
+  return [subject ? `Письмо «${subject}»` : 'Письмо', text].filter(Boolean).join(': ').slice(0, max);
 }

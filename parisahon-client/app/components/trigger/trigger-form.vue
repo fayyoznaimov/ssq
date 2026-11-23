@@ -49,17 +49,54 @@ const months = ['Январь', 'Февраль', 'Март', 'Апрель', '�
 const saved = (props.trigger.apply_when ?? { when: 'right_away', after_minutes: 0 }) as any;
 const pad = (n: number) => String(n).padStart(2, '0');
 const today = new Date();
+const INTERVALS = ['every_day', 'every_week', 'every_month', 'every_year'];
+// what the client or the manager does in the deal
+const EVENT_KINDS = ['tg_message_received', 'wa_message_received', 'email_received', 'call_recorded'];
+// (a «when» this form does not know, made by hand or by a newer version, is kept as it is: buildApplyWhen)
+const isEvent = (kind: string) => EVENT_KINDS.includes(kind);
+
+// How often the trigger may act for one deal; not saved yet = what the API does by default:
+// "create deal" once (a deal that comes back gets no second copy), "send email" once a day.
+function defaultRepeat(): string {
+    if (props.trigger.type === TriggerType.CreateDeal) return 'once';
+    if (props.trigger.type === TriggerType.SendEmail) return '1440';
+    return 'every';
+}
+function savedRepeat(): string {
+    if (saved.once_per_deal === true) return 'once';
+    if (saved.once_per_deal === false || (saved.cooldown_minutes !== undefined && saved.cooldown_minutes !== null)) {
+        const minutes = Number(saved.cooldown_minutes ?? 0);
+        return minutes > 0 ? String(minutes) : 'every';
+    }
+    return defaultRepeat();
+}
+
 const when = reactive({
-    kind: ['every_day', 'every_week', 'every_month', 'every_year'].includes(saved.when) ? 'interval' : saved.when as string,
+    kind: INTERVALS.includes(saved.when) ? 'interval' : saved.when as string,
     afterMinutes: Number(saved.after_minutes ?? 0),
     date: saved.date ? String(saved.date).slice(0, 10) : `${today.getFullYear()}-${pad(today.getMonth() + 1)}-${pad(today.getDate())}`,
     time: saved.time || '10:00',
-    interval: ['every_day', 'every_week', 'every_month', 'every_year'].includes(saved.when) ? saved.when as string : 'every_day',
+    interval: INTERVALS.includes(saved.when) ? saved.when as string : 'every_day',
     weekDay: Number(saved.week_day ?? 1),
     day: Number(saved.day ?? 1),
     month: Number(saved.month ?? 1),
-    direction: saved.outgoing === true ? 'outgoing' : saved.outgoing === false ? 'incoming' : 'any',
+    // a saved event trigger keeps its direction; a new one waits for the client (incoming): with
+    // «любом» a trigger also fires on the manager's own messages and letters
+    direction: saved.outgoing === true ? 'outgoing' : saved.outgoing === false ? 'incoming' : isEvent(saved.when) ? 'any' : 'incoming',
+    // the employee of the event: 0 = any
+    staffId: Number(saved.from_user_id ?? 0),
+    repeat: savedRepeat(),
 });
+
+// repeats are about events and entering the stage; a schedule repeats by itself, an exact time is once
+const repeatApplies = computed(() => when.kind === 'right_away' || isEvent(when.kind));
+
+function withRepeat(value: any): ApplyWhen {
+    if (!repeatApplies.value) return value as ApplyWhen;
+    value.once_per_deal = when.repeat === 'once';
+    value.cooldown_minutes = when.repeat === 'once' || when.repeat === 'every' ? 0 : Number(when.repeat) || 0;
+    return value as ApplyWhen;
+}
 
 function buildApplyWhen(): ApplyWhen {
     switch (when.kind) {
@@ -71,13 +108,19 @@ function buildApplyWhen(): ApplyWhen {
             if (when.interval === 'every_year') return { when: 'every_year', time: when.time, day: when.day, month: when.month };
             return { when: 'every_day', time: when.time };
         case 'tg_message_received':
-        case 'email_received': {
-            const value: ApplyWhen = { when: when.kind } as ApplyWhen;
-            if (when.direction !== 'any') (value as any).outgoing = when.direction === 'outgoing';
-            return value;
+        case 'wa_message_received':
+        case 'email_received':
+        case 'call_recorded': {
+            const value: any = { when: when.kind };
+            if (when.direction !== 'any') value.outgoing = when.direction === 'outgoing';
+            if (when.staffId) value.from_user_id = when.staffId;
+            return withRepeat(value);
         }
+        case 'right_away':
+            return withRepeat({ when: 'right_away', after_minutes: Number(when.afterMinutes) });
         default:
-            return { when: 'right_away', after_minutes: Number(when.afterMinutes) };
+            // unknown here: saved as it came
+            return { ...saved } as ApplyWhen;
     }
 }
 
@@ -85,8 +128,13 @@ watch(when, () => {
     props.trigger.apply_when = buildApplyWhen();
 }, { deep: true, immediate: true });
 
+const directionWord = (incoming: string, outgoing: string, any: string) =>
+    when.direction === 'incoming' ? incoming : when.direction === 'outgoing' ? outgoing : any;
+
 const whenSummary = computed(() => {
     const d = (s: string) => s.split('-').reverse().join('.');
+    const staff = when.staffId ? employees.value.find((e) => e.id === when.staffId)?.username : '';
+    const by = staff ? ` (сотрудник ${staff})` : '';
     switch (when.kind) {
         case 'at_exact_time': return `${d(when.date)} в ${when.time}`;
         case 'interval':
@@ -95,13 +143,26 @@ const whenSummary = computed(() => {
             if (when.interval === 'every_year') return `Каждый год, ${when.day} ${months[when.month - 1]?.toLowerCase()} в ${when.time}`;
             return `Ежедневно в ${when.time}`;
         case 'tg_message_received':
-            return when.direction === 'incoming' ? 'При входящем сообщении Telegram'
-                : when.direction === 'outgoing' ? 'При исходящем сообщении Telegram' : 'При сообщении в Telegram';
+            return directionWord('При входящем сообщении Telegram', 'При исходящем сообщении Telegram', 'При сообщении в Telegram') + by;
+        case 'wa_message_received':
+            return directionWord('При входящем сообщении WhatsApp', 'При исходящем сообщении WhatsApp', 'При сообщении в WhatsApp') + by;
         case 'email_received':
-            return when.direction === 'incoming' ? 'При входящем письме' : when.direction === 'outgoing' ? 'При исходящем письме' : 'При письме';
-        default:
+            return directionWord('При входящем письме', 'При исходящем письме', 'При письме') + by;
+        case 'call_recorded':
+            return directionWord('При записи входящего звонка', 'При записи исходящего звонка', 'При записи звонка') + by;
+        case 'right_away':
             return when.afterMinutes ? `${afterMinuteMap[when.afterMinutes] ?? `Через ${when.afterMinutes} мин`} после создания или перехода в этап` : 'Сразу после создания или перехода в этап';
+        default:
+            return `Условие «${when.kind}» (настроено вне этой формы)`;
     }
+});
+
+const repeatOptions = computed(() => {
+    const list: [string, string][] = isEvent(when.kind)
+        ? [['every', 'каждый раз'], ['60', 'не чаще раза в час'], ['180', 'не чаще раза в 3 часа'], ['1440', 'не чаще раза в сутки'], ['once', 'только один раз для сделки']]
+        : [['every', 'при каждом входе в этап'], ['1440', 'не чаще раза в сутки'], ['once', 'только один раз для сделки']];
+    if (!list.some(([value]) => value === when.repeat)) list.push([when.repeat, `не чаще раза в ${when.repeat} мин`]);
+    return list;
 });
 
 const employees = computed(() => props.users.filter((u) => u.role !== UserRole.CtrAgent));
@@ -112,13 +173,15 @@ const conditions = computed(() => {
         {label: 'Бюджет', field: 'budget', is_filler: false, value: ''}
     ];
     for (const filler of props.fillers) {
-        data.push({ label: filler.field, field: filler.field, is_filler: true, value: '' });
+        data.push({ label: filler.field, field: filler.field, is_filler: true, value: '', filler_id: filler.id });
     }
     return data;
 });
 
 function filterLabel(filter: DealFilter) {
-    return filter.label || conditions.value.find((c) => c.field === filter.field && !!c.is_filler === !!filter.is_filler)?.label || filter.field;
+    // a custom field by its id first: its name may have changed since the trigger was saved
+    const byId = filter.is_filler && filter.filler_id ? conditions.value.find((c) => c.filler_id === filter.filler_id) : undefined;
+    return byId?.label || filter.label || conditions.value.find((c) => c.field === filter.field && !!c.is_filler === !!filter.is_filler)?.label || filter.field;
 }
 
 function onFilterRemove(idx: number) {
@@ -148,8 +211,11 @@ async function onTriggerSave() {
     const values = toStageTrigger(props.trigger);
     const existing = props.stage.triggers.find((t) => t.id === props.trigger.id);
     if (existing) {
-        // a saved trigger (PATCH on save) or a new one opened again: replace, never duplicate
-        props.stage.triggers = props.stage.triggers.map((t) => t.id === props.trigger.id ? ({...t, ...values}) : t);
+        // a saved trigger or a new one opened again: replace, never duplicate. «Сохранить» of the
+        // funnel sends only the changed ones (a PATCH used to void the planned runs of every trigger)
+        props.stage.triggers = props.stage.triggers.map((t) => t.id === props.trigger.id
+            ? ({...t, ...values, status: t.status === 'new' ? 'new' : 'changed'})
+            : t);
     } else {
         props.stage.triggers.push(Object.assign(values, {id: props.trigger.id, status: 'new'}));
     }
@@ -162,7 +228,8 @@ watch(dealFilter, () => {
         is_filler: !!dealFilter.value.is_filler,
         field: dealFilter.value.field || '',
         value: '',
-        label: dealFilter.value.label || ''
+        label: dealFilter.value.label || '',
+        ...(dealFilter.value.filler_id ? { filler_id: dealFilter.value.filler_id } : {}),
     });
 });
 </script>
@@ -259,6 +326,16 @@ watch(dealFilter, () => {
                             <span>сообщении в Telegram</span>
                         </label>
                         <label class="flex items-center gap-2 p-2 cursor-pointer hover:bg-muted-100 dark:hover:bg-muted-700 flex-wrap">
+                            <input type="radio" value="wa_message_received" v-model="when.kind" class="accent-primary-600" />
+                            <span>При</span>
+                            <select v-model="when.direction" class="bg-transparent text-primary-600 underline underline-offset-2 outline-none dark:text-primary-200" @click="when.kind = 'wa_message_received'">
+                                <option value="incoming">входящем</option>
+                                <option value="outgoing">исходящем</option>
+                                <option value="any">любом</option>
+                            </select>
+                            <span>сообщении в WhatsApp</span>
+                        </label>
+                        <label class="flex items-center gap-2 p-2 cursor-pointer hover:bg-muted-100 dark:hover:bg-muted-700 flex-wrap">
                             <input type="radio" value="email_received" v-model="when.kind" class="accent-primary-600" />
                             <span>При</span>
                             <select v-model="when.direction" class="bg-transparent text-primary-600 underline underline-offset-2 outline-none dark:text-primary-200" @click="when.kind = 'email_received'">
@@ -268,11 +345,35 @@ watch(dealFilter, () => {
                             </select>
                             <span>письме</span>
                         </label>
+                        <label class="flex items-center gap-2 p-2 cursor-pointer hover:bg-muted-100 dark:hover:bg-muted-700 flex-wrap">
+                            <input type="radio" value="call_recorded" v-model="when.kind" class="accent-primary-600" />
+                            <span>При записи</span>
+                            <select v-model="when.direction" class="bg-transparent text-primary-600 underline underline-offset-2 outline-none dark:text-primary-200" @click="when.kind = 'call_recorded'">
+                                <option value="incoming">входящего</option>
+                                <option value="outgoing">исходящего</option>
+                                <option value="any">любого</option>
+                            </select>
+                            <span>звонка</span>
+                        </label>
+                        <label v-if="isEvent(when.kind)" class="flex items-center gap-2 p-2 ps-8 flex-wrap text-muted-600 dark:text-muted-300">
+                            <span>Сотрудник:</span>
+                            <select v-model.number="when.staffId" class="bg-transparent text-primary-600 underline underline-offset-2 outline-none dark:text-primary-200 max-w-[14rem]">
+                                <option :value="0">любой</option>
+                                <option v-for="employee in employees" :key="employee.id" :value="employee.id">{{ employee.username }}</option>
+                            </select>
+                            <span class="text-xs text-muted-400 basis-full ps-[4.75rem]">чей чат, звонок или письмо; у входящих сообщений и писем — ответственный за сделку</span>
+                        </label>
                         <div class="p-2 flex justify-end">
                             <BaseButton size="sm" type="button" @click="closeWhenPicker">Готово</BaseButton>
                         </div>
                     </div>
                 </details>
+                <label v-if="repeatApplies" class="flex flex-wrap items-center gap-2 px-3 pb-3 -mt-1 text-sm text-muted-700 dark:text-muted-200">
+                    <span>Повторять для сделки:</span>
+                    <select v-model="when.repeat" class="bg-transparent text-primary-600 underline underline-offset-2 outline-none dark:text-primary-200">
+                        <option v-for="[value, label] in repeatOptions" :key="value" :value="value">{{ label }}</option>
+                    </select>
+                </label>
             </section>
             <TaskTrigger v-if="trigger.type === TriggerType.CreateTask" :employees="employees" :trigger="trigger" />
             <EmailTrigger v-else-if="trigger.type === TriggerType.SendEmail" :trigger="trigger" :employees="employees" />

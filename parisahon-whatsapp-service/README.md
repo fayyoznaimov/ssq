@@ -15,9 +15,18 @@ service as a "linked device" by scanning a QR code, like WhatsApp Web.
 - Every message of a one-to-one chat — from the client, or written by the manager on the phone — is
   posted to the CRM API `POST ${CRM_API_URL}/whatsapp/incoming`; the API finds the contact and the deal
   and writes the history. Nothing is written to Postgres here.
-- If the API is unreachable (5xx, network) the message waits in the outbox (`SESSIONS_DIR/outbox.json`,
-  sealed like the sessions) and is resent in order every `POLL_SEC`, with a pause doubling up to
-  `MAX_BACKOFF_SEC`; it survives restarts. A 4xx answer is logged and dropped.
+- If the API is unreachable (network, 502/503/504) or refuses the service itself (401/403 after a token
+  change, 408, 429) the message waits in the outbox (`SESSIONS_DIR/outbox.json`, sealed like the sessions)
+  and is resent in order every `POLL_SEC`, with a pause doubling up to `MAX_BACKOFF_SEC`; it survives
+  restarts. A message the API fails on (500) is retried with its own pause without holding up the others,
+  and after 8 tries is set aside; one the API refuses (400, 404, 410 for a manager who is no longer staff,
+  413 ...) is set aside at once (`rejected` in the outbox file, the last 500) — never silently dropped.
+- A message WhatsApp handed over is written to `SESSIONS_DIR/inbox.json` before it is handled and removed
+  once it reached the API or the outbox: a restart or a crash in between does not lose it (WhatsApp does not
+  deliver it again). On SIGTERM the queues get `DRAIN_SEC` to finish.
+- A number unlinked on the phone stays `logged_out` after a restart (`SESSIONS_DIR/states.json`) until it is
+  linked again or disconnected in the CRM. Messages sent through `POST /send` are kept 7 days
+  (`SESSIONS_DIR/sent.json`) for Baileys' `getMessage` (a client's phone that could not decrypt one asks again).
 - The CRM sends through `POST /send`; those messages are not posted back to the CRM.
 - Logs never contain message texts, keys or full phone numbers (runs of 7+ digits are masked).
 
@@ -34,7 +43,7 @@ constant time), otherwise `401`. Errors are `{error: '<short english code>', mes
 | `GET /sessions` | `[{user_id, status, phone}]` |
 | `POST /send` | `{user_id, to_phone?, to_wa_id?, text, files:[{path, name, type}]}` — `path` is a file name in `UPLOADS_DIR`. `to_phone` is checked with WhatsApp (`onWhatsApp`); without it `to_wa_id` (the stored `chat.wa_id`, `…@lid` or `…@s.whatsapp.net`) is used as is. Files first (image / video / audio / voice / sticker by `type` or extension, anything else as a document with its name), then the text. `200 {message_ids:[…]}`; `400` `not connected` / `not on whatsapp` / `no recipient` / `bad phone` / `bad wa_id` / `bad file` / `file not found` / `nothing to send`; `502` `send failed` (with `message_ids` of what was sent before the failure) or `whatsapp error`. |
 | `POST /resolve` | `{user_id, phone:'+998…'}` → `200 {wa_id:'998…@s.whatsapp.net' \| null, photo:'<32 hex>.jpg' \| null}`: does this number have WhatsApp (asked with `onWhatsApp` through that manager's session) and its profile picture (as `chat.photo`). `400 not connected` without a connected session, `400 bad phone`, `400 bad user_id`, `502 whatsapp error`. |
-| `GET /health` | `{ok:true, sessions:n, outbox:n}`, no token |
+| `GET /health` | `{ok:true, sessions, connected, states:{user_id: status}, problems:[{user_id, status: logged_out\|reconnecting, since, reconnects, error}], inbox, outbox, outbox_oldest_sec, rejected}`, no token (the server watchdog reads it) |
 
 The QR string is the raw content of the code; the client renders it (any QR library).
 

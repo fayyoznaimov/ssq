@@ -55,6 +55,7 @@ import { Collection } from '@ckeditor/ckeditor5-utils';
 
 import type { Signature, Template } from '~/types/mail';
 import type { User } from '~/types/user';
+import { MAX_ATTACHMENTS_MB, megabytes } from '~/utils/mailView';
 
 const fileInputRef = ref();
 const model = defineModel();
@@ -69,26 +70,52 @@ const props = withDefaults(
 const signatureService = useService('emails/signs', {auth: true});
 const templateService = useService('emails/templates', {auth: true});
 
+const toast = useToast('GlobalToast');
+/** The mail server takes 10 files per letter (the API's limit) and about 20 MB of them together. */
+const MAX_FILES = 10;
+
+/** The file input holds what the list shows (a new choice replaces the input's files, so they are put back). */
+function syncInput() {
+    if (!fileInputRef.value) return;
+    const dt = new DataTransfer();
+    for (const file of uploadedFiles.value) dt.items.add(file);
+    fileInputRef.value.files = dt.files;
+}
+
 function onFileSelect(e: Event) {
     const target = e.target as HTMLInputElement;
-    const files = target.files;
-    if (!files?.length) return;
-    uploadedFiles.value.push(...files);
+    const added = [...(target.files ?? [])];
+    if (!added.length) return;
+    const next = [...uploadedFiles.value, ...added];
+    const total = next.reduce((sum, file) => sum + file.size, 0);
+    if (next.length > MAX_FILES) {
+        toast.show({ message: `К письму можно приложить не больше ${MAX_FILES} файлов`, type: 'error', timeout: 5000 });
+        return syncInput();
+    }
+    if (total > MAX_ATTACHMENTS_MB * 1024 * 1024) {
+        toast.show({
+            message: `Вложения вместе ${megabytes(total)} МБ, почтовый сервер примет не больше ${MAX_ATTACHMENTS_MB} МБ: уменьшите или уберите файлы`,
+            type: 'error',
+            timeout: 6000,
+        });
+        return syncInput();
+    }
+    uploadedFiles.value = next;
+    syncInput();
 }
 
 function onFileDelete(idx: number) {
-    const dt = new DataTransfer();
-    
-    const { files = [] } = fileInputRef.value;
-    for (let i = 0, len = files.length; i < len; i++) {
-        const file = files[i];
-        if (i !== idx) dt.items.add(file);
-    }
-
     uploadedFiles.value.splice(idx, 1);
-
-    fileInputRef.value.files = dt.files;
+    syncInput();
 }
+
+// the form was sent and reset: its files are gone from the input, so from the list too
+function onFormReset() {
+    uploadedFiles.value = [];
+}
+
+onMounted(() => fileInputRef.value?.form?.addEventListener('reset', onFormReset));
+onBeforeUnmount(() => fileInputRef.value?.form?.removeEventListener('reset', onFormReset));
 
 function FileInputPlugin(editor: ClassicEditor) {
     editor.ui.componentFactory.add('file-input', (locale) => {

@@ -1,20 +1,18 @@
 import { AuthUser } from '../auth/auth.guard';
+import { Access } from '../auth/access';
 import { RoleEnum } from '../user/user.entity';
 
 /**
  * Which deals a user may delete (move to the trash), see in the trash and restore from it.
- * One rule for the three, enforced by the API (the client mirrors it in utils/casl.ts):
- * the "Удаление" column of the deal permissions in the user card,
- * user.permissions.deal.delete — 0 nothing, 1 deals where the user is responsible,
- * 2 deals of the user's group, 3 every deal.
- * Admin: every deal. An account without stored permissions (created before they existed):
- * manager every deal, agent their own deals — the defaults of the CRM bot (src/bot/bot-access.ts).
+ * One rule for the three: the "delete" scope of deals in the API's Access (src/auth/access.ts),
+ * which the client gets from GET /auth/access — the "Удаление" column of the deal permissions in
+ * the user card, user.permissions.deal.delete: 0 nothing, 1 deals where the user is responsible,
+ * 2 deals of the user's group, 3 every deal. Admin and manager: every deal. An account without
+ * stored permissions (created before they existed): the agent's own deals.
  *
  * Permanent deletion from the trash is for the admin only (@Roles on the trash controller).
  */
 export type DealScope = 'none' | 'own' | 'group' | 'all';
-
-const LEVEL_TO_SCOPE: Record<number, DealScope> = { 0: 'none', 1: 'own', 2: 'group', 3: 'all' };
 
 export class DealAccess {
   constructor(private readonly user: AuthUser) {}
@@ -28,17 +26,7 @@ export class DealAccess {
   }
 
   deleteScope(): DealScope {
-    if (this.isAdmin) {
-      return 'all';
-    }
-
-    const level = (this.user.permissions as any)?.deal?.delete;
-
-    if (typeof level !== 'number') {
-      return this.user.role === RoleEnum.MANAGER ? 'all' : 'own';
-    }
-
-    return LEVEL_TO_SCOPE[level] ?? 'none';
+    return new Access(this.user).scope('deal', 'delete');
   }
 
   /**

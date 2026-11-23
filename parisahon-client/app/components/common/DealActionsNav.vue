@@ -123,7 +123,7 @@ async function changeAgent(agent: User) {
 async function createTasks(task: Task) {
     let promises = props.selected?.map((deal) => taskService.create({
         label: task.label,
-        type_id: task.type.id,
+        type_id: task.type?.id,
         link_to: {
             target: 'deal',
             id: deal.id,

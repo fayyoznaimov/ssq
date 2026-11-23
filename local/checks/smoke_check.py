@@ -39,6 +39,7 @@ IDS = {
     ("/emails/signs/:user_id", "user_id"): "select id from \"user\" where email = 'admin@gmail.com' limit 1",
     ("/emails/templates/:id", "id"): "select id from email_template order by id limit 1",
     ("/emails/transporters/:id", "id"): "select id from email_transporter order by id limit 1",
+    ("/groups/:id", "id"): "select id from \"group\" order by id limit 1",
     ("/products/:id", "id"): "select id from product where deleted_at is null order by id desc limit 1",
     ("/stages/collections/:id", "id"): "select id from collection order by id limit 1",
     ("/stages/:id", "id"): "select coalesce((select deal_stage_id from trigger order by id limit 1), (select id from deal_stage order by id limit 1))",
@@ -46,6 +47,12 @@ IDS = {
     ("/task-types/:id", "id"): "select id from task_type order by id limit 1",
     ("/tasks/:id", "id"): "select id from task order by id desc limit 1",
     ("/users/:id", "id"): "select id from \"user\" where role = 'ctr_agent' and deleted_at is null order by id desc limit 1",
+    # the calls of a company (its card) and of a staff member (/lists/calls/:id): the busiest ones, for the time limit
+    ("/calls/companies/:id", "id"): "select coalesce((select u.company_id from recording r join \"user\" u on u.role = 'ctr_agent' and u.company_id is not null "
+                                    "and right(regexp_replace(coalesce(u.phone, ''), '[^0-9]', '', 'g'), 9) = right(regexp_replace(coalesce(r.from_number, ''), '[^0-9]', '', 'g'), 9) "
+                                    "join company c on c.id = u.company_id and c.deleted_at is null "
+                                    "group by u.company_id order by count(*) desc limit 1), (select id from company where deleted_at is null order by id desc limit 1))",
+    ("/calls/staff/:id", "id"): "select user_id from recording group by user_id order by count(*) desc limit 1",
 }
 # talk to external services or change state although they are GET
 SKIP = {"/emails/sync"}

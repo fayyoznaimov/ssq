@@ -67,7 +67,18 @@ class SizeCheck(unittest.TestCase):
         )
 
     def test_a_file_without_a_name_gets_a_readable_one(self):
-        self.assertEqual(media_type_handler.remote_file(message_with("video_note", 30 * MB), 25).name, "Видеосообщение")
+        # with an extension: the browser's download needs it
+        self.assertEqual(media_type_handler.remote_file(message_with("video_note", 30 * MB), 25).name, "Видеосообщение.mp4")
+        self.assertEqual(media_type_handler.remote_file(message_with("video", 30 * MB), 25).name, "Видео.mp4")
+        self.assertEqual(media_type_handler.remote_file(message_with("document", 30 * MB), 25).name, "Файл")
+
+    def test_audio_and_gif_are_media_too(self):
+        audio = message_with()
+        audio.audio = SimpleNamespace(file_size=40 * MB, file_name=None, mime_type="audio/mpeg")
+        self.assertEqual(media_type_handler.remote_file(audio, 25).convert_to_dict()["type"], "audio")
+        gif = message_with()
+        gif.animation = SimpleNamespace(file_size=30 * MB, file_name=None, mime_type="video/mp4")
+        self.assertEqual(media_type_handler.remote_file(gif, 25).name, "GIF.mp4")
 
     def test_zero_turns_the_limit_off(self):
         self.assertIsNone(media_type_handler.remote_file(message_with("document", 900 * MB, "a.zip"), 0))
@@ -173,6 +184,9 @@ class Route(unittest.TestCase):
         service.has_session = lambda user_id: int(user_id) == 5
         service.listener_process = SimpleNamespace(is_alive=lambda: True)
         cls.http = service.app.test_client()
+        # the CRM API sends the shared token on every request (TG-15)
+        service.config.HTTP_API_TOKEN = "test-service-token"
+        cls.http.environ_base["HTTP_X_TELEGRAM_SERVICE_TOKEN"] = "test-service-token"
 
     @classmethod
     def tearDownClass(cls):

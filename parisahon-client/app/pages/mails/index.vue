@@ -75,6 +75,28 @@
                         Спам
                     </label>
                 </div>
+                <div>
+                    <input
+                        id="filter-deleted"
+                        v-model="filters.direction"
+                        type="radio"
+                        name="direction"
+                        value="deleted"
+                        class="peer apperance-none opacity-0 h-0 -z-10 absolute"
+                    >
+                    <label
+                        for="filter-deleted"
+                        class="nui-button nui-button-medium nui-button-rounded nui-button-pastel
+                        dark:text-primary-200 hover:bg-primary-600/10 dark:hover:bg-primary-600/40 hover:text-primary-600
+                        dark:peer-checked:bg-primary-600/40 dark:peer-checked:text-primary-200 peer-checked:bg-primary-600/10 peer-checked:text-primary-600"
+                    >
+                        <Icon
+                            name="ph:trash"
+                            class="size-5 mr-1"
+                        />
+                        Удалённые
+                    </label>
+                </div>
                 <div v-if="false">
                     <input
                         id="filter-unread"
@@ -306,6 +328,7 @@
             </form>
             <div class="ms-auto flex flex-wrap gap-2">
                 <BaseAutocomplete
+                    v-if="seesAllMail"
                     class="w-full sm:w-56"
                     v-model="filters.email_to"
                     :items="agentEmails.data"
@@ -349,6 +372,19 @@
                 </NuxtLink>
             </div>
         </BaseCard>
+        <!-- how the copying of the mailboxes goes: a letter that cannot be loaded no longer stops the mail silently -->
+        <div
+            v-if="syncStatus && (!syncStatus.ok || syncStatus.last_success_at)"
+            class="-mt-6 flex flex-wrap items-center gap-2 text-xs"
+            :class="syncStatus.ok ? 'text-muted-500 dark:text-muted-400' : 'text-amber-600 dark:text-amber-400'"
+        >
+            <Icon :name="syncStatus.ok ? 'ph:check-circle' : 'ph:warning'" class="size-4" />
+            <span v-if="syncStatus.last_success_at">Почта загружена: {{ formatter.format(new Date(syncStatus.last_success_at)) }}.</span>
+            <span v-else>Почта ещё не загружалась без ошибок.</span>
+            <span v-for="error of syncStatus.errors" :key="error.mailbox">Папка {{ error.mailbox }}: {{ error.message }}.</span>
+            <span v-if="syncStatus.failing.length">Не загружаются писем: {{ syncStatus.failing.length }} (попробуем ещё раз).</span>
+            <span v-if="syncStatus.skipped.length">Писем загружено без содержимого: {{ syncStatus.skipped.length }} — их можно прочитать в почтовой программе.</span>
+        </div>
         <main>
             <div class="text-sm border border-muted-200 dark:border-muted-700 overflow-x-auto rounded-md relative">
                 <ul class="text-xs bg-muted-50 dark:bg-muted-800 px-4 py-3 text-muted-700 dark:text-muted-400 items-center cols w-fit min-w-full">
@@ -385,6 +421,7 @@
                                 доб.сделку
                             </button>
                             <button
+                                v-if="filters.direction !== 'deleted'"
                                 :disabled="isLoadingMap.deleteall"
                                 @click="() => deleteConfirmation.open({description: `Вы действительно хотите удалить выбранные письма?`})"
                             >
@@ -399,6 +436,28 @@
                                     class="size-4 text-rose-600 dark:text-rose-400"
                                 />
                                 удалить
+                            </button>
+                            <button
+                                v-if="filters.direction === 'deleted'"
+                                :disabled="isLoadingMap.restoreall"
+                                @click="() => restore()"
+                            >
+                                <Icon
+                                    name="ph:arrow-counter-clockwise"
+                                    class="size-4 text-primary-600 dark:text-primary-200"
+                                />
+                                восстановить
+                            </button>
+                            <button
+                                v-if="filters.direction === 'spam'"
+                                :disabled="isLoadingMap.notspamall"
+                                @click="() => markAsNotSpam()"
+                            >
+                                <Icon
+                                    name="ph:tray"
+                                    class="size-4 text-primary-600 dark:text-primary-200"
+                                />
+                                не спам
                             </button>
                             <button
                                 v-if="unreadCount > 0"
@@ -418,6 +477,7 @@
                                 Отметить как прочитанное
                             </button>
                             <button
+                                v-if="filters.direction === 'incoming' || filters.direction === 'outgoing'"
                                 :disabled="isLoadingMap.spamall"
                                 @click="() => markAsSpam()"
                             >
@@ -502,6 +562,7 @@
                                         доб.контакты
                                     </button>
                                     <button
+                                        v-if="filters.direction !== 'deleted'"
                                         :disabled="isLoadingMap['delete' + email.id]"
                                         @click="() => deleteConfirmation.open({description: `Вы действительно хотите удалить '${email.subject}'?`})"
                                     >
@@ -518,6 +579,29 @@
                                         удалить
                                     </button>
                                     <button
+                                        v-if="filters.direction === 'deleted'"
+                                        :disabled="isLoadingMap['restore' + email.id]"
+                                        @click="() => restore(email.id)"
+                                    >
+                                        <Icon
+                                            name="ph:arrow-counter-clockwise"
+                                            class="size-4 text-primary-600 dark:text-primary-200"
+                                        />
+                                        восстановить
+                                    </button>
+                                    <button
+                                        v-if="filters.direction === 'spam'"
+                                        :disabled="isLoadingMap['notspam' + email.id]"
+                                        @click="() => markAsNotSpam(email.id)"
+                                    >
+                                        <Icon
+                                            name="ph:tray"
+                                            class="size-4 text-primary-600 dark:text-primary-200"
+                                        />
+                                        не спам
+                                    </button>
+                                    <button
+                                        v-if="filters.direction === 'incoming' || filters.direction === 'outgoing'"
                                         :disabled="isLoadingMap['spam' + email.id]"
                                         @click="() => markAsSpam(email.id)"
                                     >
@@ -534,7 +618,17 @@
                                         Спам
                                     </button>
                                 </div>
-                                <span class="ml-2">{{ email.from }}</span>
+                                <div class="ml-2 flex min-w-0 flex-col">
+                                    <span class="truncate">{{ email.outgoing ? (email.to ?? []).map((r) => r.value).join(', ') : (email.from_name || email.from) }}</span>
+                                    <!-- the client of the letter: the contact and the company -->
+                                    <span
+                                        v-if="email.client?.contact || email.client?.company"
+                                        class="truncate text-xs text-muted-500 dark:text-muted-400"
+                                    >
+                                        {{ [email.client?.contact?.username, email.client?.company?.name].filter(Boolean).join(' · ') }}
+                                    </span>
+                                    <span v-else-if="!email.outgoing && email.from_name" class="truncate text-xs text-muted-400">{{ email.from }}</span>
+                                </div>
                             </div>
                             <span
                                 v-if="!email.read"
@@ -547,6 +641,12 @@
                             :class="!email.read ? 'font-medium' : ''"
                             @click="() => onEmailToggle(email)"
                         >
+                            <span
+                                v-for="deal of email.deals ?? []"
+                                :key="deal.id"
+                                class="me-2 shrink-0 whitespace-nowrap rounded-md bg-muted-100 px-1.5 text-xs leading-5 text-muted-700 dark:bg-muted-700 dark:text-muted-200"
+                                :title="deal.stage ?? ''"
+                            >№{{ deal.display_id }} {{ deal.label }}</span>
                             <span class="text-muted-900 dark:text-white whitespace-nowrap">{{ email.subject }}</span>&nbsp;&minus;&nbsp;
                             <p class="text-muted-600 dark:text-muted-400 max-w-2xl truncate">
                                 {{ cleanup(email).snippet }}
@@ -577,17 +677,19 @@
                     v-click-outside="() => onEmailToggle(undefined)"
                     class="bg-white h-full w-full max-w-[85vw] md:max-w-[80vw] inner ml-auto"
                 >
-                    <Single :email="currentEmail" />
+                    <Single :email="currentEmail" @changed="onLetterChanged" />
                 </div>
             </div>
         </Transition>
         <AddContactModal
             id="AddContactModal"
             :emails="selectedEmails"
+            @saved="() => fetchEmails()"
         />
         <AddDealModal
             id="AddDealModal"
             :emails="selectedEmails"
+            @saved="onDealsCreated"
         />
         <Confirmation 
             id="DeleteConfirmation" 
@@ -600,7 +702,6 @@
 
 <script lang="ts" setup>
 import DatePicker from "@vuepic/vue-datepicker";
-import DOMPurify from "dompurify";
 import moment from "moment";
 
 import Confirmation from "~/components/common/Confirmation.vue";
@@ -608,8 +709,10 @@ import AddContactModal from "~/components/mail/AddContactModal.vue";
 import AddDealModal from "~/components/mail/AddDealModal.vue";
 import TairoPopover from "~/components/tairo/TairoPopover.vue";
 import { useAsync } from "~/composables/useAsync";
-import type { Email } from "~/types/mail";
+import type { Email, MailSyncStatus } from "~/types/mail";
+import { type User, UserRole } from "~/types/user";
 import type { Stage } from "~/types/stage";
+import { sanitizeEmail } from "~/utils/sanitize";
 
 import Single from "./index/[id].vue";
 
@@ -642,7 +745,7 @@ type Filters = {
     withAttachments: "" | "yes" | "no";
     read: "" | "yes" | "no";
     dates: string[];
-    direction: "incoming" | "outgoing" | "spam";
+    direction: "incoming" | "outgoing" | "spam" | "deleted";
     sort: {
         [key in keyof Email]?: number
     },
@@ -666,7 +769,6 @@ const initialFilters: Filters = {
 };
 
 const toast = useToast("GlobalToast");
-const sanitize = DOMPurify.sanitize;
 const route = useRoute();
 const app = useAppConfig();
 const stagesService = useService("stages", {auth: true});
@@ -690,8 +792,11 @@ const selectedEmails = ref<Email[]>([]);
 const { data: emails, isLoading: emailsLoading, run: runEmails } = useAsync<{data: Email[], count: number, page_size: number, current_page: number, last_page: number}>({data: [], count: 0, page_size: 0, current_page: 0, last_page: 0});
 const { run: runStages, data: stages } = useAsync<Stage[]>([]);
 const { runWithId, isLoadingMap } = useAsync();
-
-const sanitizedMap: Record<number, {body: string, snippet: string}> = {};
+const currentUser = useState<User>("user");
+// the filter «Почты агентов» works for admin and manager (they see every letter)
+const seesAllMail = computed(() => currentUser.value?.role === UserRole.Admin || currentUser.value?.role === UserRole.Manager);
+const syncStatus = ref<MailSyncStatus | null>(null);
+const syncStatusService = useService("emails/sync-status", {auth: true});
 
 const unreadCount = computed(() => {
     let count = 0;
@@ -704,12 +809,62 @@ const unreadCount = computed(() => {
 async function onEmailToggle(email?: Email) {
     if (email) {
         document.documentElement.style.overflow = "hidden";
+        // the drawer loads the whole letter, which marks it read
         emails.value.data = emails.value.data.map((e) => e.id === email.id ? ({...e, read: true}) : e);
-        mailsService.get(email.id).exec().catch(() => {
-            emails.value.data = emails.value.data.map((e) => e.id === email.id ? ({...e, read: false}) : e);
-        });
-    } else document.documentElement.style.overflow = "auto";
+    } else {
+        document.documentElement.style.overflow = "auto";
+        // a letter opened by its address (/mails/:id, the links of the journal): back to the list
+        if (route.params.id) navigateTo("/mails");
+    }
     currentEmail.value = email;
+}
+
+/** The letter in the drawer moved (spam, not spam, restored): it leaves this folder. */
+function onLetterChanged(id: number) {
+    emails.value.data = emails.value.data.filter((email) => email.id !== id);
+}
+
+/** Deals made from the chosen letters: the list shows them at the letters. */
+function onDealsCreated() {
+    selectedEmails.value = [];
+    fetchEmails();
+}
+
+/** /mails/:id opens the letter over the list (pages/mails/index.vue has no <NuxtPage>). */
+async function openFromRoute() {
+    const id = Number(route.params.id);
+    if (!id || currentEmail.value?.id === id) return;
+    const result = await promiseResult(mailsService.get(id).exec());
+    if (!result.ok) return toast.show({message: result.error.message, type: "error", timeout: 4000});
+    onEmailToggle(result.value as Email);
+}
+
+async function restore(emailId?: number) {
+    const ids = emailId ? [emailId] : selectedEmails.value.map((email) => email.id);
+    const results = await promiseResult(runWithId(Promise.all(ids.map((id) => mailsService.patch(`${id}/restore`, {}).exec())) as any, emailId ? "restore" + emailId : "restoreall"));
+    if (!results.ok) return toast.show({message: results.error.message, type: "error", timeout: 4000});
+    emails.value.data = emails.value.data.filter((email) => !ids.includes(email.id));
+    selectedEmails.value = selectedEmails.value.filter((email) => !ids.includes(email.id));
+    toast.show({message: ids.length === 1 ? "Письмо восстановлено" : `Восстановлено писем: ${ids.length}`, type: "success", timeout: 3000});
+}
+
+async function markAsNotSpam(emailId?: number) {
+    const ids = emailId ? [emailId] : selectedEmails.value.map((email) => email.id);
+    const results = await promiseResult(runWithId(Promise.all(ids.map((id) => mailsService.patch(`${id}/not-spam`, {}).exec())) as any, emailId ? "notspam" + emailId : "notspamall"));
+    if (!results.ok) return toast.show({message: results.error.message, type: "error", timeout: 4000});
+    emails.value.data = emails.value.data.filter((email) => !ids.includes(email.id));
+    selectedEmails.value = selectedEmails.value.filter((email) => !ids.includes(email.id));
+}
+
+function showSyncProblems(status?: MailSyncStatus | null) {
+    if (!status) return;
+    syncStatus.value = status;
+    if (status.ok) return;
+    const problems = [
+        ...status.errors.map((error) => `${error.mailbox}: ${error.message}`),
+        status.failing.length ? `не загружаются писем: ${status.failing.length}` : "",
+    ].filter(Boolean);
+    toast.show({message: `Почта загружена не полностью — ${problems.join("; ")}`, type: "error", timeout: 7000});
 }
 
 const formatter = new Intl.DateTimeFormat("ru", {
@@ -728,13 +883,9 @@ const presetDates = ref([
     { label: "За этот месяц", value: [moment().startOf("month"), moment().endOf("month")] },
 ]);
 
+// a letter of the list: its body cleaned for v-html and the first line as text
 function cleanup(email: Email) {
-    const body = sanitize(email.body);
-    const doc = new DOMParser().parseFromString(body, "text/html");
-    const values = {body, snippet: doc.body.textContent?.slice(0, 200) || ""};
-    sanitizedMap[email.id] = values;
-    email.sanitized = values;
-    return values;
+    return sanitizeEmail(email);
 }
 
 function onSelectAll(e: Event) {
@@ -774,8 +925,11 @@ function onPresetSelect(close: Function, e: Event) {
 
 async function onDelete() {
     const promises = selectedEmails.value.map((email) => runWithId(mailsService.remove(email.id).exec(), "delete" + email.id));
-    await Promise.all(promises);
-    emails.value.data = emails.value.data.filter((email) => !selectedEmails.value.some((se) => se.id === email.id));
+    const result = await promiseResult(Promise.all(promises));
+    if (!result.ok) toast.show({message: result.error.message, type: "error", timeout: 4000});
+    // deleted letters go to the Trash mailbox of the server: «Удалённые» shows them and brings them back
+    else toast.show({message: "Письма перенесены в «Удалённые»", type: "success", timeout: 3000});
+    fetchEmails();
     selectedEmails.value = [];
 }
 
@@ -808,12 +962,14 @@ function fetchEmails(sync?: boolean) {
     const outgoing = filters.direction === "outgoing";
     const isSpam = filters.direction === "spam";
     const query: Record<string, any> = {
-        outgoing, 
         sort: { sent_at: -1 },
         skip: (currentPage.value - 1) * perPage.value,
         limit: perPage.value,
         is_spam: isSpam,
     };
+    // «Удалённые»: every direction; the other folders by direction
+    if (filters.direction === "deleted") query.deleted = true;
+    else query.outgoing = outgoing;
 
     if (filters.stages.length) {
         query.stages = filters.stages.map((s) => s.id);
@@ -849,7 +1005,10 @@ function fetchEmails(sync?: boolean) {
     // The sync endpoint answers with the refreshed list. If the mail server
     // cannot be reached, say so and still show what is stored locally.
     runEmails(
-        mailsService.get("sync", query).exec().catch((e: any) => {
+        mailsService.get("sync", query).exec().then((page: any) => {
+            showSyncProblems(page?.sync);
+            return page;
+        }).catch((e: any) => {
             toast.show({
                 message: `Не удалось получить новую почту: ${e?.message ?? "ошибка сервера"}`,
                 type: "error",
@@ -907,10 +1066,14 @@ const onEmailChange = (value: AgentEmail) => {
     fetchEmails();
 };
 
+watch(() => route.params.id, () => openFromRoute());
+
 onMounted(() => {
     runStages(stagesService.find().exec());
     fetchEmails();
-    fetchAgentEmails();
+    if (seesAllMail.value) fetchAgentEmails();
+    openFromRoute();
+    syncStatusService.find().exec().then((status: any) => { syncStatus.value = status; }).catch(() => undefined);
     if (fromRefHeader.value) resizeObserver.observe(fromRefHeader.value);
     if (subjectRefHeader.value) resizeObserver.observe(subjectRefHeader.value);
 });

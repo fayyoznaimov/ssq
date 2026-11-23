@@ -56,7 +56,10 @@ export class BotLinkCode {
   expires_at: Date;
 }
 
-/** A task the bot already reminded about. */
+/**
+ * A task the bot already reminded about (its assignee or its group). TaskService.update removes
+ * the row when the task is moved to another time or handed over, so the new time is reminded again.
+ */
 @Entity('bot_reminder')
 export class BotReminder {
   @PrimaryColumn({ name: 'task_id' })

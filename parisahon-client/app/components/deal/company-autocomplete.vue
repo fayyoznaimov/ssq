@@ -8,10 +8,8 @@ const props = defineProps<{
 }>();
 
 const model = defineModel<Contact | Company | null>();
-const toast = useToast('GlobalToast');
 const { run: runCompanies, data: companies } = useAsync<{data: Contact[], count: number}>({ data: [], count: 0 });
 const contactService  = useService('contacts', { auth: true });
-const companyService  = useService('companies', { auth: true });
 
 function filteredCompanies(contacts: Contact[]): {data: Contact[], count: number} {
     const result = contacts.filter((c) => c.type === 'company');
@@ -38,18 +36,12 @@ const onCompanyInput = debounce((e: Event) => {
     );
 }, 500);
 
-async function onChange(contact?: CompanyContact) {
+// A typed name that is not in the list comes as { name } without an id: the form that owns
+// the field creates the company on save, together with its required fields. It used to be
+// created right here with no fields at all: the API refuses that while the company has
+// required fields («Страна», «Код Клиента»), and an abandoned form left an empty company.
+function onChange(contact?: CompanyContact) {
     if (!contact) return;
-    if (!contact.id && contact.name?.length > 3) {
-        const company = await promiseResult(companyService.create<Company>({
-            name: contact.name,
-            fillers: [],
-            is_old: false,
-        }).exec());
-        if (!company.ok) return toast.show({message: company.error.message, timeout: 3000, type: 'error'});
-        if (model.value) model.value.id = company.value.id;
-        return emits('changed', contact);
-    }
     emits('changed', contact);
 }
 

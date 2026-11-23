@@ -248,9 +248,17 @@ def main():
               ev == f"f|{contact}|{A['id']}|61825|{path1}", ev)
         n = psql(f"select count(*) from event where deal_id = {deal} and type = 10")
         check("both recordings of the number are in the deal history", n == "2", n)
+        # the outgoing call is from the manager to the client, and every call is dated by the call, not by its processing
+        ev2 = psql(f"select e.outgoing, e.user_id, e.target_user_id from event e join recording r on e.after_state->>'path' = r.path "
+                   f"join call_upload u on u.recording_id = r.id where e.deal_id = {deal} and e.type = 10 and u.id = {up2}")
+        check("the outgoing call in the history: from A to the contact", ev2 == f"t|{A['id']}|{contact}", ev2)
+        n = psql(f"select count(*) from event e join recording r on e.after_state->>'path' = r.path "
+                 f"where e.deal_id = {deal} and e.type = 10 and abs(extract(epoch from e.created_at - r.created_at)) < 1")
+        check("the calls in the history are dated by the time of the call (recording.created_at)", n == "2", n)
         if stage_id:
-            tasks = psql(f"select count(*) from task where deal_id = {deal} and label = '{TAG} перезвонить'")
-            check("the trigger 'записан звонок' fired: a task per recording", tasks == "2", tasks)
+            # TRG-11: «Создать задачу» does not add the same task while the earlier one is open
+            tasks = psql(f"select count(*) || '|' || count(*) filter (where closed_at is null) from task where deal_id = {deal} and label = '{TAG} перезвонить'")
+            check("the trigger 'записан звонок' fired: one open task for the two recordings, no copy while it is open", tasks == "1|1", tasks)
         r = http("GET", f"/calls/recordings?user_id={A['id']}&number={digits[-7:]}", token=admin)
         item = next((x for x in r[1]["data"] if x["path"] == path1), None) if r[0] == 200 else None
         check("GET /calls/recordings with filters: the recording with its deal link", r[0] == 200 and r[1]["count"] == 2 and item and item["deal"] and item["deal"]["id"] == deal, (r[0], item))
@@ -367,6 +375,160 @@ def main():
         check("a messenger call (a name, no number): the client is created by the name, the deal is named after them",
               r[0] == 201 and r[1].get("created_contact") is True and row == f"{TAG} незнакомец|{TAG} незнакомец|no phone", (r, row))
 
+        print("== one deal per call, the client's card, the office line (CALL-2, CALL-9)")
+        tasks_in = lambda d: psql(f"select count(*) from task where deal_id = {d} and label = '{TAG} перезвонить'")
+        events_of = lambda upload_id: psql(
+            f"select coalesce(string_agg(coalesce(e.deal_id::text, 'card:' || e.user_id::text), ',' order by e.id), '') "
+            f"from event e join recording r on e.after_state->>'path' = r.path join call_upload u on u.recording_id = r.id "
+            f"where e.type = 10 and u.id = {upload_id}")
+
+        def process(upload_ids, expected="done"):
+            http("POST", "/calls/process", {}, token=admin)
+            ids_sql = ",".join(str(u) for u in upload_ids)
+            want = ",".join([expected] * len(upload_ids))
+            return wait_for(lambda: psql(f"select string_agg(status, ',' order by id) from call_upload where id in ({ids_sql})"), want, timeout=60)
+
+        status, d = http("POST", "/deals", {"label": f"{TAG} сделка Б", "budget": 1, "agent_id": B["id"], "ctr_agent_ids": [contact], "fillers": [], "products": []}, admin)
+        deal_b = d["id"] if status == 201 else 0
+        deal_ids.append(deal_b)
+        if stage_id:
+            http("PATCH", f"/deals/{deal_b}/stage", {"stage_id": stage_id}, admin)
+        close_tasks = lambda d: psql(f"update task set closed_at = now() where deal_id = {d} and label = '{TAG} перезвонить' and closed_at is null")
+        r = upload({}, [("file", f"2026-11-21 09-00-00 (phone) {TAG} клиент ({pretty}) ↙.wav", wav_bytes(1.05), "audio/wav")], {"X-Recorder-Token": token_a})
+        up_a = r[1].get("id", 0) if r[0] == 201 else 0
+        tasks_b = tasks_in(deal_b)
+        process([up_a])
+        check("a client with deals of two managers: A's call goes into A's deal only", events_of(up_a) == str(deal), events_of(up_a))
+        if stage_id:
+            check("... so the «записан звонок» trigger of B's deal does not fire for A's call", tasks_in(deal_b) == tasks_b, (tasks_b, tasks_in(deal_b)))
+        token_b = http("POST", "/calls/tokens", {"user_id": B["id"]}, token=admin)[1].get("token", "")
+        r = upload({}, [("file", f"2026-11-21 09-05-00 (phone) {TAG} клиент ({pretty}) ↙.wav", wav_bytes(1.06), "audio/wav")], {"X-Recorder-Token": token_b})
+        up_b = r[1].get("id", 0) if r[0] == 201 else 0
+        process([up_b])
+        check("... B's call into B's deal only (no more one event per open deal of every manager)", events_of(up_b) == str(deal_b), events_of(up_b))
+
+        # a regular client whose deals are closed; a call from the company's office phone; both of one company
+        closed_digits = f"99893{random.randint(1000000, 9999999)}"
+        office_digits = f"99871{random.randint(1000000, 9999999)}"
+        company = int(psql(f"insert into company (name, phone, is_old) values ('{TAG} Текстиль', '+{office_digits}', false) returning id").split("\n")[0])
+        closed_client = int(psql(f"insert into \"user\" (username, role, phone, company_id) values ('{TAG} постоянный', 'ctr_agent', '+{closed_digits}', {company}) returning id"))
+        office_contact = int(psql(f"insert into \"user\" (username, role, phone, company_id) values ('{TAG} бухгалтер', 'ctr_agent', '+99890{random.randint(1000000, 9999999)}', {company}) returning id"))
+        psql(f"update company set primary_contact_id = {office_contact} where id = {company}")
+        status, d = http("POST", "/deals", {"label": f"{TAG} закрытая", "budget": 1, "agent_id": A["id"], "ctr_agent_ids": [closed_client], "fillers": [], "products": []}, admin)
+        closed_deal = d["id"] if status == 201 else 0
+        deal_ids.append(closed_deal)
+        psql(f"update deal set closed_at = now() where id = {closed_deal}")
+        status, d = http("POST", "/deals", {"label": f"{TAG} офис", "budget": 1, "agent_id": A["id"], "ctr_agent_ids": [office_contact], "company_id": company, "fillers": [], "products": []}, admin)
+        office_deal = d["id"] if status == 201 else 0
+        deal_ids.append(office_deal)
+        psql(f"update deal set company_id = {company} where id = {office_deal}")
+        r = upload({}, [("file", f"phone_20261121-093000__{closed_digits}.wav", wav_bytes(1.07), "audio/wav")], {"X-Recorder-Token": token_a})
+        up_closed = r[1].get("id", 0) if r[0] == 201 else 0
+        r = upload({}, [("file", f"phone_20261121-094000__{office_digits}.wav", wav_bytes(1.08), "audio/wav")], {"X-Recorder-Token": token_a})
+        up_office = r[1].get("id", 0) if r[0] == 201 else 0
+        process([up_closed, up_office])
+        row = psql(f"select e.deal_id is null, e.user_id, e.target_user_id from event e join recording r on e.after_state->>'path' = r.path "
+                   f"join call_upload u on u.recording_id = r.id where e.type = 10 and u.id = {up_closed}")
+        # incoming: from the client to A; outgoing: from A to the client (the name gives no direction)
+        check("a known client with only closed deals: the call is on the client's card (an event without a deal), not lost",
+              row in (f"t|{closed_client}|{A['id']}", f"t|{A['id']}|{closed_client}"), row)
+        check("... and not in the closed deal", psql(f"select count(*) from event where deal_id = {closed_deal} and type = 10") == "0")
+        check("a call from the company's own phone (no contact has it): into the company's deal", events_of(up_office) == str(office_deal), events_of(up_office))
+
+        print("== the calls of a company, the calls of a staff member (CALL-3, CALL-2)")
+        person = {"email": f"audit-call-{RUN}-c@example.test", "password": secrets.token_urlsafe(12), "username": f"{TAG}-c",
+                  "role": "agent", "group_id": groups[0], "permissions": dict(perms, deal=dict(perms["deal"], view=1, update=1))}
+        status, created = http("POST", "/users", person, admin)
+        if status == 201:
+            person["id"] = created["id"]
+            person["token"] = http("POST", "/auth/login", {"email": person["email"], "password": person["password"]})[1]["access_token"]
+            users["c"] = person
+        C = users.get("c")
+        path_of = lambda upload_id: psql(f"select r.path from recording r join call_upload u on u.recording_id = r.id where u.id = {upload_id}")
+        r = http("GET", f"/calls/companies/{company}", token=admin)
+        paths = {x["path"]: x for x in r[1]["data"]} if r[0] == 200 else {}
+        office_row = paths.get(path_of(up_office)) or {}
+        check("GET /calls/companies/:id: the office-line call and the call on a contact's card, newest first",
+              r[0] == 200 and r[1]["count"] == 2 and [x["path"] for x in r[1]["data"]] == [path_of(up_office), path_of(up_closed)], r)
+        check("... each with the manager, the direction, the duration, the contact and the deal",
+              office_row.get("user", {}).get("id") == A["id"] and office_row.get("outgoing") in (True, False) and office_row.get("duration", 0) > 0
+              and (office_row.get("deal") or {}).get("id") == office_deal and (office_row.get("contact") or {}).get("id") == office_contact, office_row)
+        if C:
+            r = http("GET", f"/calls/companies/{company}", token=C["token"])
+            seen = [x["path"] for x in r[1]["data"]] if r[0] == 200 else None
+            check("an agent with 'own deals': the calls of another manager's deal stay out, the card's call stays",
+                  r[0] == 200 and seen == [path_of(up_closed)], (r[0], seen))
+        r = http("GET", "/calls/companies/999999999", token=admin)
+        check("an unknown company -> 404", r[0] == 404, r)
+        r = http("GET", f"/calls/staff/{A['id']}?limit=200", token=A["token"])
+        mine = {x["path"]: x for x in r[1]["data"]} if r[0] == 200 else {}
+        row_a = mine.get(path_of(up_a)) or {}
+        check("GET /calls/staff/:id: an agent's own recordings with the client and the deal",
+              r[0] == 200 and (row_a.get("contact") or {}).get("id") == contact and (row_a.get("deal") or {}).get("id") == deal and r[1]["limit"] == 200, (r[0], row_a))
+        n_a = psql(f"select count(*) from recording where user_id = {A['id']}")
+        check("... all of them, paged (count of every recording of A)", r[0] == 200 and str(r[1]["count"]) == n_a, (r[1].get("count") if r[0] == 200 else r, n_a))
+        r = http("GET", f"/calls/staff/{A['id']}", token=B["token"])
+        check("another agent's recordings -> 403", r[0] == 403, r)
+        r = http("GET", f"/calls/staff/{A['id']}", token=admin)
+        check("admin sees anyone's -> 200", r[0] == 200 and str(r[1]["count"]) == n_a, r[0])
+        rec_b = psql(f"select recording_id from call_upload where id = {up_b}")
+        r = http("POST", f"/calls/staff/{A['id']}/recordings/{rec_b}/deal", {}, token=A["token"])
+        check("«Создать сделку» on a recording that is not one's own -> 404", r[0] == 404, r)
+
+        print("== a call sent twice: cut off, then whole (CALL-9); a .json that is not JSON (CALL-11)")
+        # an open task of the trigger stops it from adding the same task: closed after each copy, so every firing shows
+        close_tasks(deal)
+        before_tasks = tasks_in(deal)
+        name_at = lambda t: f"2026-11-21 10-00-0{t} (phone) {TAG} клиент ({pretty}) ↗.wav"
+        # every file of a manager has its own bytes: the same bytes are the same upload (file_hash), not a copy of the call
+        r = upload({}, [("file", name_at(0), wav_bytes(1.01), "audio/wav")], {"X-Recorder-Token": token_a})
+        cut = r[1].get("id", 0) if r[0] == 201 else 0
+        process([cut])
+        close_tasks(deal)
+        cut_path = path_of(cut)
+        r = upload({}, [("file", name_at(3), wav_bytes(3.0), "audio/wav")], {"X-Recorder-Token": token_a})
+        whole = r[1].get("id", 0) if r[0] == 201 else 0
+        http("POST", "/calls/process", {}, token=admin)
+        wait_for(lambda: psql(f"select status from call_upload where id = {whole}"), "done", timeout=60)
+        close_tasks(deal)
+        rows = psql(f"select string_agg(status || ':' || coalesce(recording_id::text, '-'), ',' order by id) from call_upload where id in ({cut}, {whole})")
+        rec_whole = psql(f"select recording_id from call_upload where id = {whole}")
+        check("the whole copy is kept; the cut-off one is marked duplicate and points to it", rows == f"duplicate:{rec_whole},done:{rec_whole}", rows)
+        n = psql(f"select count(*) from event where type = 10 and after_state->>'path' = '{cut_path}'")
+        check("... the history plays the whole file: the cut-off file is in no event, its recording is gone",
+              n == "0" and psql(f"select count(*) from recording where path = '{cut_path}'") == "0" and events_of(whole) == str(deal), (n, events_of(whole)))
+        r = upload({}, [("file", name_at(1), wav_bytes(0.5), "audio/wav")], {"X-Recorder-Token": token_a})
+        short = r[1].get("id", 0) if r[0] == 201 else 0
+        http("POST", "/calls/process", {}, token=admin)
+        status_short = wait_for(lambda: psql(f"select status || ':' || coalesce(recording_id::text, '-') from call_upload where id = {short}"), f"duplicate:{rec_whole}", timeout=60)
+        check("a shorter copy after the whole one -> duplicate of it, no second history entry",
+              status_short == f"duplicate:{rec_whole}" and events_of(whole) == str(deal), (status_short, events_of(whole)))
+        n = psql(f"select count(*) from recording r join call_upload u on u.recording_id = r.id where u.id in ({cut}, {whole}, {short})")
+        check("... one recording for the three copies (the statistics count the call once)", psql(f"select count(distinct recording_id) from call_upload where id in ({cut}, {whole}, {short})") == "1", n)
+        if stage_id:
+            check("... and the «записан звонок» trigger fired once for the call", int(tasks_in(deal)) - int(before_tasks) == 1, (before_tasks, tasks_in(deal)))
+        r = http("GET", "/calls/queue?status=duplicate", token=admin)
+        check("GET /calls/queue?status=duplicate lists the copies with the reason",
+              r[0] == 200 and {cut, short} <= {u["id"] for u in r[1]} and all(u["error"] for u in r[1] if u["id"] in (cut, short)), r[0])
+
+        stranger2 = f"99878{random.randint(1000000, 9999999)}"
+        r = upload({}, [("file", f"phone_20261121-120000__{stranger2}.wav", wav_bytes(1.11), "audio/wav"),
+                        ("meta", f"phone_20261121-120000__{stranger2}.json", b"{not json", "application/json")], {"X-Recorder-Token": token_a})
+        check("a .json that is not JSON: the recording is still accepted (it used to be refused and lost) -> 201",
+              r[0] == 201 and r[1].get("status") == "pending", r)
+        bad_meta = r[1].get("id", 0) if r[0] == 201 else 0
+        row = psql(f"select from_number, to_char(recorded_at, 'YYYY-MM-DD HH24:MI:SS') from call_upload where id = {bad_meta}")
+        check("... the number and the time come from the name of the file", row == f"{stranger2}|2026-11-21 12:00:00", row)
+        process([bad_meta])
+        rec_bad = psql(f"select recording_id from call_upload where id = {bad_meta}")
+        r = http("POST", f"/calls/staff/{A['id']}/recordings/{rec_bad}/deal", {}, token=A["token"])
+        check("«Создать сделку» by the agent on their own recording (from /lists/calls/:id) -> 201, a new client and deal",
+              r[0] == 201 and r[1].get("created_contact") is True and r[1].get("created_deal") is True, r)
+        if r[0] == 201:
+            deal_ids.append(r[1]["deal"]["id"])
+            extra_contacts.append(r[1].get("contact_id", 0))
+            check("... the deal is the agent's", psql(f"select agent_id from deal where id = {r[1]['deal']['id']}") == str(A["id"]))
+
         print("== retry, discard, revoke")
         r = http("POST", f"/calls/queue/{up3}/retry", {}, token=admin)
         check("retry -> pending again", r[0] == 201 and r[1].get("status") == "pending", r)
@@ -423,10 +585,13 @@ def main():
             f"delete from deal_user where \"dealId\" in ({deals})",
             f"delete from deal where id in ({deals})",
             f"delete from deal_stage where id = {stage_id or 0}",
+            f"update company set primary_contact_id = null where name like '{TAG}%'",
             f"delete from \"user\" where username like '{TAG}%' or id in ({','.join(str(c) for c in extra_contacts if c) or '0'})",
+            f"delete from company where name like '{TAG}%'",
             "commit",
         ]))
-        left = psql(f"select (select count(*) from \"user\" where username like '{TAG}%') + (select count(*) from deal where id in ({deals})) + (select count(*) from recording where user_id in ({ids}))")
+        left = psql(f"select (select count(*) from \"user\" where username like '{TAG}%') + (select count(*) from deal where id in ({deals})) + (select count(*) from recording where user_id in ({ids}))"
+                    f" + (select count(*) from company where name like '{TAG}%')")
         check("test rows removed", left == "0", left)
 
     print(f"\nRESULT: {results['PASS']} passed, {results['FAIL']} failed")

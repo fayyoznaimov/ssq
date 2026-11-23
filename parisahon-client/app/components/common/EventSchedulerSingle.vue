@@ -13,7 +13,8 @@
         </DatePicker>
         <input type="hidden" name="start" v-model="internalEvent.startStr">
         <input type="hidden" name="end" v-model="internalEvent.endStr">
-        <input v-if="internalEvent.allDay" type="hidden" name="all_day" value="all">
+        <!-- the forms read "allDay" (TaskModal, the deal, company and contact pages); "all_day" was never saved -->
+        <input v-if="internalEvent.allDay" type="hidden" name="allDay" value="true">
         <BaseAutocomplete
             name="assignee"
             :size="size"
@@ -56,7 +57,8 @@ import type { BaseAutocomplete } from '#build/components';
 import { useAsync } from '~/composables/useAsync';
 import { useService } from '~/composables/useService';
 import type { Task, TaskType } from '~/types/deal';
-import type { Group, User } from '~/types/user';
+import type { PaginatedResponse } from '~/types/generics';
+import { type Group, type User, UserRole } from '~/types/user';
 
 enum Target {
     Agent = 'agent',
@@ -80,16 +82,35 @@ const props = withDefaults(defineProps<{
 
 const isDarkMode = useDarkMode();
 const task = defineModel<Partial<Task>>({ default: {} });
-const internalEvent = ref<Partial<EventApi>>({
-    start: new Date(task.value.start_time! || task.value.start!),
-    end: new Date(task.value.end_time! || task.value.end!),
-    endStr: task.value.end_time || task.value.end,
-    startStr: task.value.start_time || task.value.start,
-    title: task.value.type?.name || ''
-});
+
+/**
+ * The task as the event of the small calendar. A day without a time ("2026-11-23", a click on a day
+ * in the calendar) or an all-day task is an all-day event: as a timed one it became 05:00 (a date is
+ * read as UTC midnight). The calendar ends an all-day event on the next day; the API keeps it until
+ * 23:59 of its last day.
+ */
+function initialEvent(): Partial<EventApi> {
+    const start = task.value.start_time || task.value.start || new Date().toISOString();
+    const end = task.value.end_time || task.value.end || start;
+    const title = task.value.type?.name || '';
+    const plainDate = /^\d{4}-\d{2}-\d{2}$/.test(String(start));
+    if (!task.value.allDay && !plainDate) {
+        return { start: new Date(start), end: new Date(end), startStr: start, endStr: end, allDay: false, title };
+    }
+    const first = moment(start).startOf('day');
+    const endAt = moment(end);
+    const midnight = endAt.hours() === 0 && endAt.minutes() === 0 && endAt.seconds() === 0;
+    const last = midnight && endAt.isAfter(first) ? endAt.clone().subtract(1, 'ms') : endAt;
+    const startStr = first.format('YYYY-MM-DD');
+    const endStr = moment.max(last, first).clone().add(1, 'day').format('YYYY-MM-DD');
+    return { start: startStr as any, end: endStr as any, startStr, endStr, allDay: true, title };
+}
+
+const internalEvent = ref<Partial<EventApi>>(initialEvent());
 
 const taskTypeService = useService('task-types', {auth: true});
 const userService = useService('users', {auth: true});
+const staffService = useService('users/staff', {auth: true});
 
 const { run: runUsers, data: users } = useAsync<{data: User[], count: number}>({ data: [], count: 0 });
 const { isLoading: typesLoading, run: runTaskTypes, data: taskTypes } = useAsync<TaskType[]>([]);
@@ -175,18 +196,22 @@ const calendarOpts = ref({
     eventTextColor: 'white'
 });
 
+// each group, then its people (by name); staff without a group at the end
 const groupedUsers = computed(() => {
-    const grouped: UserGroup[] = [];
-    const groupIndex: Record<number, number> = {};
+    const groups = new Map<number, UserGroup[]>();
+    const loose: UserGroup[] = [];
     for (const user of users.value.data) {
-        if (!user.group) continue;
-        let index = groupIndex[user.group.id];
-        if (index == null) index = groupIndex[user.group.id] = grouped.length;
-        if (!grouped[index]) grouped[index] = {...user.group, tempId: `group-${user.group.id}`, target: Target.Group};
-        grouped.splice(index + 1, 0, {...user, tempId: `agent-${user.id}`, target: Target.Agent});
+        if (user.role === UserRole.CtrAgent) continue;
+        const person: UserGroup = {...user, tempId: `agent-${user.id}`, target: Target.Agent};
+        if (!user.group) {
+            loose.push(person);
+            continue;
+        }
+        if (!groups.has(user.group.id)) groups.set(user.group.id, [{...user.group, tempId: `group-${user.group.id}`, target: Target.Group}]);
+        groups.get(user.group.id)!.push(person);
     }
 
-    return grouped;
+    return [...[...groups.values()].flat(), ...loose];
 });
 
 watch(() => [task.value.type], async () => {
@@ -226,15 +251,26 @@ function displayUserGroup(u: UserGroup) {
     if (u.target === 'agent') return u.username;
 }
 watch(taskTypes, () => {
-    if (!task.value.type) {
+    if (!task.value.type && taskTypes.value.length) {
         task.value.type = taskTypes.value[0];
-        internalEvent.value.setProp?.('title', task.value.type.name);
+        internalEvent.value.setProp?.('title', task.value.type?.name ?? '');
     }
 });
 
+/** The staff accounts for the assignee (GET /users/staff); an API without it: all users minus the contacts. */
+async function staffUsers(): Promise<{data: User[], count: number}> {
+    try {
+        return await staffService.find<PaginatedResponse<User>>().exec();
+    } catch (e) {
+        const all = await userService.find<PaginatedResponse<User>>({limit: 1000}).exec();
+        const data = (all.data ?? []).filter((u) => u.role !== UserRole.CtrAgent);
+        return {data, count: data.length};
+    }
+}
+
 onMounted(() => {
     runTaskTypes(taskTypeService.find().exec());
-    runUsers(userService.find({limit: 1000}).exec());
+    runUsers(staffUsers());
 });
 
 </script>

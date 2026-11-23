@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { GoneException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import { extname } from 'path';
@@ -14,9 +14,11 @@ import { ApplyTriggerWhenEnum } from '../trigger/dto/assign.trigger.dto';
 import { IncomingFileDto, IncomingMessageDto } from './dto/incoming.message.dto';
 import { MessengerLookupService } from '../messenger/messenger-lookup.service';
 import { ClientDealsService } from '../messenger/client-deals.service';
+import { MessengerFilterService, PHONE_KEY_SQL, keyOf } from '../messenger/messenger-filter.service';
+import { normalizePhone } from '../helper/phone';
 
 export interface InboxResult {
-  status: 'saved' | 'duplicate' | 'ignored';
+  status: 'saved' | 'duplicate' | 'ignored' | 'updated';
   reason?: string;
   contact_id?: number;
   deal_ids: number[];
@@ -25,21 +27,31 @@ export interface InboxResult {
   created_deal: boolean;
 }
 
+/** Internal callers (a message sent from the CRM): the contact is the one the manager chose, not looked up again. */
+export interface InboxOptions {
+  contact?: User;
+}
+
+const STAFF = [RoleEnum.ADMIN, RoleEnum.MANAGER, RoleEnum.AGENT];
+
 /**
  * Where a Telegram message of a manager's chat becomes CRM data.
  *
- * Before, parisahon-telegram-service wrote the contact, the deal and the
- * event straight into Postgres, so triggers of the stage and the events the
- * API emits never happened. Now the service posts the message here
- * (POST /telegram/incoming) and the CRM's own services do the writing:
- *  - the client is found by Telegram id, then by phone; otherwise a new
- *    contact (ctr_agent) is created without a company (TELEGRAM_KNOWN_CONTACTS_ONLY=true:
- *    chats with people who are not in the CRM are ignored instead);
- *  - the message goes to every open deal of this manager with this client;
- *    without one, a deal is created in the default stage (DealService.create,
- *    so NEW_DEAL / NEW_CTR_AGENT events and the stage's triggers run);
- *  - the same Telegram message is never saved twice (tg_message_id per deal),
- *    so the service may retry after a failure.
+ * The service posts every message here (POST /telegram/incoming) and the CRM's own services do
+ * the writing:
+ *  - not for the CRM (ignored, no contact, no deal): the manager's own account, a colleague (a
+ *    staff user's Telegram id or phone), a chat the manager marked «Не клиент», a message the
+ *    manager wrote from the phone to somebody who is not in the CRM, and — with «только известные
+ *    контакты» of the manager — any chat with somebody who is not in the CRM (MessengerFilterService);
+ *  - the client is found by Telegram id, then by phone (the last 9 digits, helper/phone.ts);
+ *    otherwise a new contact (ctr_agent) is created without a company;
+ *  - the message goes into ONE deal (ClientDealsService: the deal it was written from, the
+ *    manager's open deal the conversation goes on in, a live deal of another manager, after a
+ *    close the just-closed deal with a task, else a new deal in the default stage — NEW_DEAL /
+ *    NEW_CTR_AGENT events and the stage's triggers run); a message from the phone never opens a deal;
+ *  - the same Telegram message (its id between these two people) is never saved twice, in any
+ *    deal, so the service may retry after a failure; an edit (edited: true) updates the text;
+ *  - a manager who is no longer a staff user: 410 (the service keeps the message aside).
  */
 @Injectable()
 export class TelegramInboxService {
@@ -52,26 +64,26 @@ export class TelegramInboxService {
     private triggerService: TriggerService,
     private lookup: MessengerLookupService,
     private clientDeals: ClientDealsService,
+    private filter: MessengerFilterService,
   ) {}
 
+  /** The global default of «только известные контакты» (per manager: MessengerFilterService.knownOnly). */
   static knownContactsOnly(): boolean {
-    return ['1', 'true', 'yes'].includes(
-      String(process.env.TELEGRAM_KNOWN_CONTACTS_ONLY ?? '').toLowerCase(),
-    );
+    return MessengerFilterService.globalKnownOnly();
   }
 
-  /** "+998 90 123-45-67" -> "+998901234567"; null when there are no digits. */
+  /** "+998 90 123-45-67" -> "+998901234567" (helper/phone.ts); null when there is no number. */
   static normalizePhone(phone?: string | null): string | null {
-    const digits = String(phone ?? '').replace(/[^\d]/g, '');
-    return digits ? '+' + digits : null;
+    return normalizePhone(phone ?? null);
   }
 
-  async receive(data: IncomingMessageDto): Promise<InboxResult> {
-    const agent = await this.userRepository.findOne({
-      where: { id: data.agent_id, role: In([RoleEnum.ADMIN, RoleEnum.MANAGER, RoleEnum.AGENT]) },
-    });
+  async receive(data: IncomingMessageDto, options: InboxOptions = {}): Promise<InboxResult> {
+    const agent = await this.userRepository.findOne({ where: { id: data.agent_id }, withDeleted: true });
     if (!agent) {
       throw new NotFoundException(`Staff user ${data.agent_id} does not exist`);
+    }
+    if (agent.deleted_at || !STAFF.includes(agent.role)) {
+      throw new GoneException(`User ${data.agent_id} is not a staff user any more: the Telegram session is to be disconnected`);
     }
     if (data.agent_tg_id && Number(agent.tg_id) !== Number(data.agent_tg_id)) {
       await this.userRepository.update(agent.id, { tg_id: data.agent_tg_id });
@@ -90,11 +102,19 @@ export class TelegramInboxService {
     if (Number(data.chat.tg_id) === Number(agent.tg_id)) {
       return { ...empty, reason: 'self' };
     }
+    // a colleague, or a chat the manager marked «Не клиент»
+    if (!options.contact) {
+      const reason = await this.filter.reasonToIgnore(agent.id, 'telegram', { tgId: data.chat.tg_id, phone: data.chat.phone });
+      if (reason) return { ...empty, reason };
+    }
 
-    let contact = await this.findContact(data.chat.tg_id, data.chat.phone);
+    let contact = options.contact ?? (await this.findContact(data.chat.tg_id, data.chat.phone));
     let createdContact = false;
     if (!contact) {
-      if (TelegramInboxService.knownContactsOnly()) {
+      // written from the phone to somebody who is not in the CRM: a personal chat until the person writes back
+      if (data.outgoing) return { ...empty, reason: 'outgoing_unknown' };
+      if (data.edited) return { ...empty, reason: 'edit_of_unknown_message' };
+      if (await this.filter.knownOnly(agent.id, 'telegram')) {
         return { ...empty, reason: 'unknown_contact' };
       }
       contact = await this.createContact(agent, data);
@@ -102,7 +122,7 @@ export class TelegramInboxService {
     } else {
       const patch: Partial<User> = {};
       if (!contact.tg_id) patch.tg_id = data.chat.tg_id;
-      if (!contact.phone && data.chat.phone) patch.phone = TelegramInboxService.normalizePhone(data.chat.phone);
+      if (!contact.phone && data.chat.phone) patch.phone = normalizePhone(data.chat.phone);
       if (data.chat.photo && data.chat.photo !== contact.avatar) patch.avatar = data.chat.photo;
       if (Object.keys(patch).length) {
         await this.userRepository.update(contact.id, patch);
@@ -112,42 +132,48 @@ export class TelegramInboxService {
     // the same number in WhatsApp, in the background
     if (contact.phone && !contact.wa_id && !data.outgoing) this.lookup.lookupLater(agent.id, contact.id);
 
-    // the client's open deal (own first, else another manager's), else a new one (ClientDealsService)
-    const { deals, created: createdDeal } = await this.clientDeals.dealsForMessage(agent, contact);
+    const fromUser = data.outgoing ? agent : contact;
+    const toUser = data.outgoing ? contact : agent;
 
-    // idempotent: a retry of the same Telegram message adds nothing
-    const already = await this.eventRepository.find({
-      select: { id: true, deal: { id: true } },
-      where: {
-        type: EventTypes.NEW_TELEGRAM_MESSAGE,
-        tg_message_id: data.tg_message_id,
-        outgoing: data.outgoing,
-        deal: { id: In(deals.map((d) => d.id)) },
-      },
-      relations: { deal: true },
-    });
-    const doneDealIds = new Set(already.map((e) => e.deal.id));
-    const targetDeals = deals.filter((d) => !doneDealIds.has(d.id));
-    if (targetDeals.length === 0) {
+    // idempotent: the same Telegram message between these two people, in any deal (also one moved by hand)
+    const already: { id: number; deal_id: number | null }[] = await this.eventRepository.query(
+      `SELECT id, deal_id FROM event
+        WHERE type = $1 AND tg_message_id = $2 AND outgoing = $3 AND user_id = $4 AND target_user_id = $5
+        ORDER BY id`,
+      [EventTypes.NEW_TELEGRAM_MESSAGE, data.tg_message_id, data.outgoing, fromUser.id, toUser.id],
+    );
+    if (data.edited) {
+      return already.length ? this.applyEdit(already, data, contact) : { ...empty, contact_id: contact.id, reason: 'edit_of_unknown_message' };
+    }
+    if (already.length) {
       return {
         status: 'duplicate',
         contact_id: contact.id,
-        deal_ids: deals.map((d) => d.id),
+        deal_ids: [...new Set(already.map((e) => e.deal_id).filter((id): id is number => Boolean(id)))],
         event_ids: already.map((e) => e.id),
         created_contact: createdContact,
-        created_deal: createdDeal,
+        created_deal: false,
       };
     }
 
-    const fromUser = data.outgoing ? agent : contact;
-    const toUser = data.outgoing ? contact : agent;
-    const files = await this.saveFiles(data, fromUser, targetDeals);
+    // ONE deal (ClientDealsService); a message from the phone never opens one
+    const choice = await this.clientDeals.dealForMessage(agent, contact, {
+      outgoing: data.outgoing,
+      dealId: data.deal_id ?? null,
+      afterCloseGrace: !data.outgoing,
+    });
+    if (!choice.deal) {
+      return { ...empty, contact_id: contact.id, created_contact: createdContact, reason: choice.reason ?? 'no_deal' };
+    }
+    const deal = choice.deal;
+
+    const files = await this.saveFiles(data, fromUser, [deal]);
     const eventFiles = [];
     for (const f of data.files ?? []) {
       eventFiles.push(
         f.remote
           ? await this.remoteFile(data, f)
-          : { name: f.name, path: f.path, type: f.type, caption: f.caption ?? null },
+          : { name: TelegramInboxService.fileName(f), path: f.path, type: f.type, caption: f.caption ?? null },
       );
     }
     const afterState = {
@@ -161,38 +187,67 @@ export class TelegramInboxService {
     };
     const date = data.date ? new Date(data.date) : null;
 
-    const events = targetDeals.map((deal) => {
-      const event = EventBuilder.fromType(EventTypes.NEW_TELEGRAM_MESSAGE)
-        .originatedBy(fromUser)
-        .addTargetUser(toUser)
-        .linkToDeal(deal)
-        .addAfterState(afterState)
-        .addCreatedAt(date && !isNaN(date.getTime()) ? date : null);
-      event.outgoing = data.outgoing;
-      event.tg_message_id = data.tg_message_id;
-      return event;
-    });
-    const saved = await this.eventRepository.save(events);
+    const event = EventBuilder.fromType(EventTypes.NEW_TELEGRAM_MESSAGE)
+      .originatedBy(fromUser)
+      .addTargetUser(toUser)
+      .linkToDeal(deal)
+      .addAfterState(afterState)
+      .addCreatedAt(date && !isNaN(date.getTime()) ? date : null);
+    event.outgoing = data.outgoing;
+    event.tg_message_id = data.tg_message_id;
+    const saved = await this.eventRepository.save(event);
 
     // triggers that wait for a Telegram message ("при входящем сообщении")
-    for (const deal of targetDeals) {
-      await this.triggerService.onDealEvent(fromUser, deal, ApplyTriggerWhenEnum.TG_MESSAGE_RECEIVED, {
-        outgoing: data.outgoing,
-        from_user_id: fromUser.id,
-      });
-    }
+    await this.triggerService.onDealEvent(fromUser, deal, ApplyTriggerWhenEnum.TG_MESSAGE_RECEIVED, {
+      outgoing: data.outgoing,
+      from_user_id: fromUser.id,
+    });
+    if (choice.afterClose) await this.clientDeals.noteAfterClose(deal, 'Telegram');
     this.logger.log(
-      `telegram message ${data.tg_message_id} of user ${agent.id} -> contact ${contact.id}, deals ${targetDeals.map((d) => d.id).join(',')}${files.length ? `, files ${files.length}` : ''}`,
+      `telegram message ${data.tg_message_id} of user ${agent.id} -> contact ${contact.id}, deal ${deal.id}${choice.afterClose ? ' (closed recently)' : ''}${files.length ? `, files ${files.length}` : ''}`,
     );
 
     return {
       status: 'saved',
       contact_id: contact.id,
-      deal_ids: deals.map((d) => d.id),
-      event_ids: saved.map((e) => e.id),
+      deal_ids: [deal.id],
+      event_ids: [saved.id],
       created_contact: createdContact,
-      created_deal: createdDeal,
+      created_deal: choice.created,
     };
+  }
+
+  /** A message edited in Telegram: the history shows the new text (the first one is kept as original_message). */
+  private async applyEdit(already: { id: number }[], data: IncomingMessageDto, contact: User): Promise<InboxResult> {
+    const events = await this.eventRepository.find({ where: { id: In(already.map((e) => e.id)) }, relations: { deal: true } });
+    const text = data.text ?? '';
+    const changed: Event[] = [];
+    for (const event of events) {
+      const state = { ...(event.after_state ?? {}) };
+      if (state.message === text) continue;
+      if (state.original_message === undefined) state.original_message = state.message ?? '';
+      state.message = text;
+      state.edited = true;
+      state.edited_at = new Date().toISOString();
+      event.after_state = state;
+      changed.push(event);
+    }
+    if (changed.length) await this.eventRepository.save(changed);
+    return {
+      status: changed.length ? 'updated' : 'duplicate',
+      contact_id: contact.id,
+      deal_ids: [...new Set(events.map((e) => e.deal?.id).filter((id): id is number => Boolean(id)))],
+      event_ids: events.map((e) => e.id),
+      created_contact: false,
+      created_deal: false,
+    };
+  }
+
+  /** A file without a name (a phone video often has none) gets one by its kind. */
+  static fileName(f: Pick<IncomingFileDto, 'name' | 'type'>): string {
+    const name = String(f.name ?? '').trim();
+    if (name) return name;
+    return ({ video: 'Видео', video_note: 'Видеосообщение', voice: 'Голосовое сообщение', audio: 'Аудио', photo: 'Фото', sticker: 'Стикер', animation: 'GIF' } as Record<string, string>)[f.type] ?? 'Файл';
   }
 
   private async findContact(tgId: number, phone?: string): Promise<User | null> {
@@ -202,16 +257,17 @@ export class TelegramInboxService {
     });
     if (byTg) return byTg;
 
-    const normalized = TelegramInboxService.normalizePhone(phone);
-    if (!normalized) return null;
-    // phones in the CRM are typed by hand: compare digits only
+    const key = keyOf(phone);
+    if (!key) return null;
+    // phones in the CRM are typed by hand ('+998 90 …', '90 123 45 67'): the last 9 digits, an exact number first
+    const digits = String(phone ?? '').replace(/\D/g, '');
     return this.userRepository
       .createQueryBuilder('u')
       .where('u.role = :role', { role: RoleEnum.CTR_AGENT })
-      .andWhere("regexp_replace(COALESCE(u.phone, ''), '[^0-9]', '', 'g') = :digits", {
-        digits: normalized.slice(1),
-      })
-      .orderBy('u.id', 'ASC')
+      .andWhere(`${PHONE_KEY_SQL('u.phone')} = :key`, { key })
+      .orderBy(`(regexp_replace(COALESCE(u.phone, ''), '[^0-9]', '', 'g') = :digits)`, 'DESC')
+      .addOrderBy('u.id', 'ASC')
+      .setParameter('digits', digits)
       .getOne();
   }
 
@@ -224,7 +280,7 @@ export class TelegramInboxService {
     contact.username = name || (data.chat.username ? '@' + data.chat.username : `Telegram ${data.chat.tg_id}`);
     contact.role = RoleEnum.CTR_AGENT;
     contact.tg_id = data.chat.tg_id;
-    contact.phone = TelegramInboxService.normalizePhone(data.chat.phone);
+    contact.phone = normalizePhone(data.chat.phone);
     contact.avatar = data.chat.photo || null;
     contact.created_by = agent;
     // no company and no required custom fields: a chat gives neither; the
@@ -233,23 +289,24 @@ export class TelegramInboxService {
   }
 
   /**
-   * A file the service did not download because of its size: the event gets a link instead of a
-   * path (`url`, which the feed shows under the file's name), and telegram_remote_file remembers
-   * where the file is, so GET /telegram/remote-file/:token can fetch it when somebody clicks.
+   * A file the service did not download because of its size (or could not download): the event gets
+   * a link instead of a path (`url`, which the feed shows under the file's name), and telegram_remote_file
+   * remembers where the file is, so GET /telegram/remote-file/:token can fetch it when somebody clicks.
    */
   private async remoteFile(data: IncomingMessageDto, f: IncomingFileDto) {
+    const name = TelegramInboxService.fileName(f);
     const rows = await this.eventRepository.query(
       `INSERT INTO telegram_remote_file (token, agent_id, chat_tg_id, tg_message_id, name, kind, size, mime)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (agent_id, chat_tg_id, tg_message_id) DO UPDATE SET name = EXCLUDED.name
        RETURNING token`,
       [randomBytes(16).toString('hex'), data.agent_id, data.chat.tg_id, data.tg_message_id,
-        String(f.name || 'file').slice(0, 255), f.type, f.size ?? null, f.mime ?? null],
+        name.slice(0, 255), f.type, f.size ?? null, f.mime ?? null],
     );
     const base = (process.env.CRM_PUBLIC_URL || '').replace(/\/+$/, '');
     const mb = f.size ? Math.max(1, Math.round(f.size / 1048576)) : null;
     return {
-      name: `${f.name} — ${mb ? `${mb} МБ, ` : ''}скачать из Telegram`,
+      name: `${name} — ${mb ? `${mb} МБ, ` : ''}скачать из Telegram`,
       path: '',
       type: 'link',
       caption: f.caption ?? null,
@@ -265,9 +322,9 @@ export class TelegramInboxService {
     if (!local.length) return [];
     const files = local.map((f) => {
       const file = new File();
-      file.name = f.name;
+      file.name = TelegramInboxService.fileName(f);
       file.path = f.path;
-      file.extension = extname(f.path) || extname(f.name) || null;
+      file.extension = extname(f.path) || extname(file.name) || null;
       file.from = WhichFiles.FROM_MESSAGES;
       file.uploaded_by = uploadedBy;
       file.deals = deals;

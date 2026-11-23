@@ -4,6 +4,7 @@ import { Repository } from 'typeorm';
 import { RoleEnum, User } from '../user/user.entity';
 import { MessengerLookupService, TelegramNamed } from '../messenger/messenger-lookup.service';
 import { parseRecordingName } from './recording-name';
+import { phoneKeySql } from '../helper/phone';
 
 export interface CallClient {
   // the clients of the call; empty — nobody in the CRM (or the name fits several people)
@@ -12,11 +13,15 @@ export interface CallClient {
   telegram: TelegramNamed | null;
   // the name fits several clients: nobody is chosen
   ambiguous: boolean;
+  // no contact has the number, but it is the phone of one company (its office line): that company;
+  // `contacts` then holds its primary contact, when it has one
+  company?: { id: number; name: string } | null;
 }
 
 /**
  * Whose call a recording is.
  *  - By the phone number: digits compared, the last 9 are enough (the recorder may omit the country code).
+ *    No contact with that number: the company whose own phone it is (a call from the office line).
  *  - A messenger call has no number, only the name on the manager's screen ("Анвар Оптовик"):
  *    the manager's own Telegram tells who is shown under that name (parisahon-telegram-service,
  *    POST /resolve-name) — the client with that Telegram id or phone; for WhatsApp, Viber and the
@@ -37,7 +42,14 @@ export class CallClientService {
   async find(call: { managerId: number; number?: string | null; name?: string | null; fileName?: string | null }): Promise<CallClient> {
     const digits = CallClientService.digits(call.number);
     if (digits.length >= 7) {
-      return { contacts: await this.byPhone(digits), telegram: null, ambiguous: false };
+      const contacts = await this.byPhone(digits);
+      if (contacts.length) return { contacts, telegram: null, ambiguous: false, company: null };
+      const company = await this.companyByPhone(digits);
+      if (!company) return { contacts: [], telegram: null, ambiguous: false, company: null };
+      const primary = company.primary_contact_id
+        ? await this.users.findOne({ where: { id: company.primary_contact_id, role: RoleEnum.CTR_AGENT } })
+        : null;
+      return { contacts: primary ? [primary] : [], telegram: null, ambiguous: false, company: { id: company.id, name: company.name } };
     }
     const name = (call.name ?? '').trim();
     if (name.length < 2) return { contacts: [], telegram: null, ambiguous: false };
@@ -72,5 +84,22 @@ export class CallClientService {
     return this.clients()
       .andWhere("regexp_replace(COALESCE(u.phone, ''), '[^0-9]', '', 'g') LIKE :tail", { tail: '%' + digits.slice(-9) })
       .getMany();
+  }
+
+  /**
+   * The one company (not in the trash) whose own phone ends with these digits; two or more — none.
+   * 9 digits and more: by the phone key (the index IDX_company_phone_key), a shorter number by its end.
+   */
+  private async companyByPhone(digits: string): Promise<{ id: number; name: string; primary_contact_id: number | null } | null> {
+    const byKey = digits.length >= 9;
+    const rows: { id: number; name: string; primary_contact_id: number | null }[] = await this.users.manager.query(
+      `SELECT c.id, c.name, c.primary_contact_id FROM company c
+        WHERE c.deleted_at IS NULL
+          AND length(regexp_replace(COALESCE(c.phone, ''), '[^0-9]', '', 'g')) >= 7
+          AND ${byKey ? `${phoneKeySql('c.phone')} = $1` : `regexp_replace(COALESCE(c.phone, ''), '[^0-9]', '', 'g') LIKE $1`}
+        ORDER BY c.id LIMIT 2`,
+      [byKey ? digits.slice(-9) : '%' + digits.slice(-9)],
+    );
+    return rows.length === 1 ? rows[0] : null;
   }
 }

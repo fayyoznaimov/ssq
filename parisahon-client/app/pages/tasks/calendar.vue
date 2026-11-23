@@ -138,20 +138,25 @@ const calendarOptions = ref({
 });
 
 
+// every task of the visible days, not one page of the list (25)
 async function handleDateSet({startStr, endStr}: {startStr: string, endStr: string}) {
     emits('fetchTasks', {
         from_date: moment(startStr).subtract(1, 'day').format('YYYY-MM-DD'),
         till_date: moment(endStr).format('YYYY-MM-DD'),
+        skip: 0,
+        limit: 1000,
     });
 }
 
+// an all-day task lasts until 23:59 of its last day; the calendar ends such an event on the next day
 function toEvent(task: Task) {
+    const allDay = !!task.allDay;
     return {
         id: String(task.id),
-        end: new Date(task.end),
-        start: new Date(task.start),
+        end: allDay ? moment(task.end).add(1, 'day').format('YYYY-MM-DD') : new Date(task.end),
+        start: allDay ? moment(task.start).format('YYYY-MM-DD') : new Date(task.start),
         title: task.label,
-        allDay: task.allDay,
+        allDay,
         type: task.type,
         group: task.group,
         agent: task.agent,
@@ -167,53 +172,44 @@ watch(() => props.tasks, (tasks) => {
     events.value = tasks.data.map(toEvent);
 });
 
+/**
+ * A move or a resize changes the times. The deal goes first: an automatic task names its deal and
+ * the deal's company, and the company sent first used to unlink the deal (the API keeps links now).
+ */
 function createUpdatePayload(task: Partial<Task>) {
-    const assign = { target: '', id: -1 };
-    const link = {target: '', id: -1};
-    if (task.agent) {
-        assign.target = 'agent';
-        assign.id = task.agent.id;
-    } else if (task.group) {
-        assign.target = 'group';
-        assign.id = task.group.id;
-    }
-
-    if (task.company) {
-        link.target = 'company';
-        link.id = task.company.id;
-    } else if (task.deal) {
-        link.target = 'deal';
-        link.id = task.deal.id;
-    } else if (task.ctr_agent) {
-        link.target = 'ctr_agent';
-        link.id = task.ctr_agent.id;
-    }
-
-    return {
-        label: task.label,
-        type_id: task.type?.id,
-        assign_to: assign,
-        link_to: link,
+    const payload: Record<string, any> = {
         start_time: task.start_time,
-        end_time: task.end_time,
-        allDay: task.allDay
+        end_time: task.end_time || task.start_time,
+        allDay: !!task.allDay,
     };
+    if (task.label) payload.label = task.label;
+    if (task.type?.id) payload.type_id = task.type.id;
+    if (task.agent) payload.assign_to = { target: 'agent', id: task.agent.id };
+    else if (task.group) payload.assign_to = { target: 'group', id: task.group.id };
+    if (task.deal) payload.link_to = { target: 'deal', id: task.deal.id };
+    else if (task.ctr_agent) payload.link_to = { target: 'ctr_agent', id: task.ctr_agent.id };
+    else if (task.company) payload.link_to = { target: 'company', id: task.company.id };
+    return payload;
+}
+
+// a move the API refuses goes back on the calendar
+async function saveMove(info: any) {
+    const task = fromSelectInfo(info.event);
+    if (!task.id) return;
+    const payload = createUpdatePayload(task);
+    const result = await promiseResult(taskService.patch(task.id, payload).exec());
+    if (!result.ok) {
+        info.revert?.();
+        toast.show({message: result.error.message, type: 'error', timeout: 3000});
+    }
 }
 
 async function handleDrop(info: any) {
-    const task = fromSelectInfo(info.event);
-    if (!task.id) return;
-    const payload = createUpdatePayload(task);
-    const result = await promiseResult(taskService.patch(task.id, payload).exec());
-    if (!result.ok) toast.show({message: result.error.message, type: 'error', timeout: 3000});
+    await saveMove(info);
 }
 
 async function handleResize(info: any) {
-    const task = fromSelectInfo(info.event);
-    if (!task.id) return;
-    const payload = createUpdatePayload(task);
-    const result = await promiseResult(taskService.patch(task.id, payload).exec());
-    if (!result.ok) toast.show({message: result.error.message, type: 'error', timeout: 3000});
+    await saveMove(info);
 }
 
 type SelectInfo = {
@@ -243,8 +239,9 @@ function fromSelectInfo(info: SelectInfo): Partial<Task> {
         closed_at: '',
         start_time: info.startStr,
         start: info.startStr,
-        end: info.allDay ? info.startStr : info.endStr,
-        end_time: info.allDay ? info.startStr : info.endStr,
+        // an all-day day keeps its plain date: the API makes it 00:00-23:59 of that day (not 05:00)
+        end: info.endStr || info.startStr,
+        end_time: info.endStr || info.startStr,
         created_at: info.extendedProps?.created_at || new Date().toISOString(),
         company: info.extendedProps?.company,
         ctr_agent: info.extendedProps?.ctr_agent,

@@ -1,8 +1,11 @@
-import { Body, Controller, HttpCode, HttpStatus, Post, Req } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Param, ParseIntPipe, Post, Req } from '@nestjs/common';
 import { Request } from 'express';
-import { AuthService } from './auth.service';
+import { AccessResponse, AuthService } from './auth.service';
 import { SignInDto } from './dto/sign-in.dto';
 import { Public } from './decorator/public.decorator';
+import { Roles } from './decorator/roles.decorator';
+import { AuthGuard } from './auth.guard';
+import { LoginThrottle } from './login-throttle';
 
 @Controller('auth')
 export class AuthController {
@@ -11,14 +14,34 @@ export class AuthController {
   @Public()
   @HttpCode(HttpStatus.OK)
   @Post('login')
-  signIn(@Body() data: SignInDto) {
-    return this.authService.signIn(data);
+  signIn(@Body() data: SignInDto, @Req() request: Request) {
+    return this.authService.signIn(data, LoginThrottle.clientAddress(request));
   }
 
-  /** Signs the current user out on every device: all tokens issued so far stop working. */
+  /**
+   * What the signed-in user may see and change, by the API's own rules (src/auth/access.ts):
+   * the web client builds its menu and buttons from it (utils/casl.ts).
+   */
+  @Get('access')
+  access(@Req() request: Request): Promise<AccessResponse> {
+    return this.authService.accessOf(request['user']);
+  }
+
+  /**
+   * Signs the current user out on every device: all tokens issued so far stop working,
+   * and the CRM bot is unlinked from their Telegram.
+   */
   @HttpCode(HttpStatus.NO_CONTENT)
   @Post('logout')
   async logout(@Req() request: Request): Promise<void> {
     await this.authService.logoutEverywhere(request['user'].sub);
+  }
+
+  /** The admin signs a staff user out on every device (a lost phone) and unlinks their CRM bot. */
+  @Roles(AuthGuard.ADMIN_LEVEL)
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @Post('logout/:id')
+  async logoutUser(@Param('id', ParseIntPipe) id: number): Promise<void> {
+    await this.authService.logoutEverywhere(id);
   }
 }

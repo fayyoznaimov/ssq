@@ -135,8 +135,10 @@ function breadCrumbs() {
         }
         last.push(r);
         let p = last.join('/');
+        const meta = router.resolve(`/${p}`).meta;
         subRoutes.push({
-            label: router.resolve(`/${p}`).meta.verbose,
+            // a page for a new and an existing record (/lists/companies/new) can name the new one itself
+            label: r === 'new' && meta.verboseNew ? meta.verboseNew : meta.verbose,
             to: `/${p}`,
         });
     }

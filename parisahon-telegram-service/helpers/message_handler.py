@@ -34,6 +34,8 @@ class Message:
             files: List[File],
             reply_to: Union[int, None],
             request_id: Union[str, None] = None,
+            to_phone: Union[str, None] = None,
+            deal_id: Union[int, None] = None,
     ):
         self.request_id = request_id
         self.from_user = from_user
@@ -43,6 +45,30 @@ class Message:
         self.contact = contact
         self.files = files
         self.reply_to = reply_to
+        # the client's number: a chat the in-memory session has not met yet is found by it
+        self.to_phone = to_phone
+        # the deal it was written from: echoed to the CRM when the message is recorded late
+        self.deal_id = deal_id
+
+
+TEXT_LIMIT = 4096
+
+
+def split_text(text: str, limit: int = TEXT_LIMIT) -> List[str]:
+    """Telegram takes at most 4096 characters per message: longer text goes out in parts, cut at a line or a space."""
+    text = text or ""
+    parts = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = text.rfind(" ", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        parts.append(text[:cut])
+        text = text[cut:].lstrip("\n ")
+    if text:
+        parts.append(text)
+    return parts
 
 
 class AcceptableMediaTypesEnum(Enum):
@@ -61,9 +87,13 @@ async def send_files(
         client: pyrogram.Client,
         chat_id: int,
         files: List[File],
+        sent_messages: Optional[List[Tuple[pyrogram.types.Message, Optional[File]]]] = None,
 ) -> List[Tuple[pyrogram.types.Message, File]]:
+    """Sends the files in order. `sent_messages` (when given) is filled as they go out, so a caller still
+    knows what the client got when a later file fails."""
 
-    sent_messages: List[Tuple[pyrogram.types.Message, Optional[File]]] = []
+    if sent_messages is None:
+        sent_messages = []
 
     for file in files:
         sent_message = None

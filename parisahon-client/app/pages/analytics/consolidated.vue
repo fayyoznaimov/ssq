@@ -4,6 +4,7 @@ import AddonApexcharts from '~/components/tairo/AddonApexcharts.vue';
 import type { ConsolidatedStats } from '~/types/stats';
 import moment from 'moment';
 import Money from '~/components/common/Money.vue';
+import { plainSafe } from '~/utils/sanitize';
 
 definePageMeta({
     authRoute: true,
@@ -187,12 +188,13 @@ const consolidatedByDeals = computed(() => {
     const userLabels: string[] = [];
     for (const item of consolidated.value.deals.stage_stats) {
         stageSeries.push(Number(item.deal_count_in_stage));
-        stageLabels.push(item.name);
+        // the charts render labels and tooltips as HTML
+        stageLabels.push(plainSafe(item.name));
     }
 
     for (const item of consolidated.value.deals.user_stats) {
         userSeries.push(Number(item.deal_count));
-        userLabels.push(item.username);
+        userLabels.push(plainSafe(item.username));
     }
 
     const options = {
@@ -350,7 +352,7 @@ const consolidatedByTasks = computed(() => {
     const labels: string[] = [];
     for (const item of consolidated.value.tasks.type_stats) {
         if (item.id == null) continue;
-        labels.push(item.name);
+        labels.push(plainSafe(item.name));
         series.push(Number(item.task_count));
     }
 

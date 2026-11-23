@@ -30,24 +30,47 @@ export class SeedService {
     private readonly collectionRepository: Repository<DealStageCollection>,
   ) {}
 
+  /**
+   * The first admin of an empty CRM, from .env (ADMIN_EMAIL, ADMIN_PASSWORD, ADMIN_USERNAME).
+   * Only when the database has no live admin at all: renaming or deleting that account in the CRM
+   * must not bring it back with the password from the file at the next start (the last admin cannot
+   * be deleted or demoted, so this is the way back in only for an empty or broken database).
+   * Never stops the API.
+   */
   async seedAdminUser(): Promise<void> {
-    const adminUser = await this.userRepository.findOneBy({
-      email: process.env.ADMIN_EMAIL,
-    });
-    const salt = await bcrypt.genSalt(10);
-
-    if (!adminUser) {
-      const newAdminUser = this.userRepository.create({
-        username: process.env.ADMIN_USERNAME,
-        password: await bcrypt.hash(process.env.ADMIN_PASSWORD, salt),
-        email: process.env.ADMIN_EMAIL,
-        role: RoleEnum.ADMIN,
-      });
-
-      await this.userRepository.save(newAdminUser);
+    try {
+      // soft-deleted accounts are not counted
+      if ((await this.userRepository.countBy({ role: RoleEnum.ADMIN })) > 0) {
+        console.log('Admin user already exists');
+        return;
+      }
+      const email = (process.env.ADMIN_EMAIL || '').trim();
+      const password = process.env.ADMIN_PASSWORD || '';
+      if (!email || !password) {
+        console.warn('No admin in the database and no ADMIN_EMAIL / ADMIN_PASSWORD in the environment: no admin created');
+        return;
+      }
+      // a live account with this e-mail (in any case) is not doubled; a deleted one does not hold its
+      // e-mail any more (the unique index IDX_user_email_active covers live accounts only)
+      const taken = await this.userRepository
+        .createQueryBuilder('u')
+        .where('lower(u.email) = lower(:email)', { email })
+        .getOne();
+      if (taken) {
+        console.warn(`No admin in the database, and ${email} belongs to account ${taken.id} (${taken.role}): no admin created`);
+        return;
+      }
+      await this.userRepository.save(
+        this.userRepository.create({
+          username: process.env.ADMIN_USERNAME || 'admin',
+          password: await bcrypt.hash(password, await bcrypt.genSalt(10)),
+          email,
+          role: RoleEnum.ADMIN,
+        }),
+      );
       console.log('Admin user created');
-    } else {
-      console.log('Admin user already exists');
+    } catch (error) {
+      console.error(`Admin user seed failed, the API starts anyway: ${(error as Error)?.message ?? error}`);
     }
   }
 
@@ -203,11 +226,11 @@ export class SeedService {
     console.log('Created Task Types: ', newTaskTypes);
   }
 
+  /** The default groups of an empty CRM only: groups the admin deleted do not come back at the next start. */
   async seedGroups(): Promise<void> {
     const groupNames = ['Sales', 'IT', 'Management'];
 
-    const groups = await this.groupRepository.findBy({ name: In(groupNames) });
-    if (groups.length === 0) {
+    if ((await this.groupRepository.count()) === 0) {
       const newGroups = this.groupRepository.create([
         { name: groupNames[0] },
         { name: groupNames[1] },

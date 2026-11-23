@@ -7,10 +7,11 @@
             </div>
             <div class="flex px-2 flex-wrap gap-5 justify-between">
                 <div class="flex flex-wrap items-center gap-4">
+                    <!-- the API filters by the task's span (start..deadline), not by the creation date -->
                     <DateSelect
                         v-model:start="filters.fromDate"
                         v-model:end="filters.tillDate"
-                        label="Дата создания"
+                        label="Срок"
                     />
                     <PerPageSelect v-model="filters.perPage" />
                 </div>
@@ -104,12 +105,35 @@ const isOverdue = memoize((item) => {
     return endAt.isBefore(moment()) && !item.closed_at;
 });
 
+/** "23.11, 15:00"; an all-day task: the day only. The list rows keep the times as start / end. */
+function when(value: string, allDay?: boolean) {
+    return formatDate(value, allDay ? 'DD.MM.YYYY' : 'DD.MM.YYYY, HH:mm');
+}
+
 const columns = ref<Column[]>([
     {
-        label: 'Дата исполнения',
-        name: 'closed_at',
-        dateFormat: 'MMM Do, HH:mm',
+        // the deadline; sorted by end_time on the server (the default order: the nearest first)
+        label: 'Срок',
+        name: 'end_time',
         sortable: true,
+        field(item) {
+            return when(item.end, item.allDay);
+        },
+        click(item) {
+            taskResultModal.open(item);
+        },
+        classes(item) {
+            if (isOverdue(item)) return '!text-red-600';
+        },
+        resizable: true,
+    },
+    {
+        label: 'Начало',
+        name: 'start_time',
+        sortable: true,
+        field(item) {
+            return when(item.start, item.allDay);
+        },
         click(item) {
             taskResultModal.open(item);
         },
@@ -124,8 +148,9 @@ const columns = ref<Column[]>([
         click(item) {
             taskResultModal.open(item);
         },
+        // a task of a group: the group is the assignee
         field(item) {
-            return item.agent?.username;
+            return item.agent?.username || (item.group ? `Группа «${item.group.name}»` : '');
         },
         classes(item) {
             if (isOverdue(item)) return '!text-red-600';
@@ -133,6 +158,7 @@ const columns = ref<Column[]>([
         resizable: true,
     },
     {
+        // the deal first: an automatic task names the deal and its company
         label: 'Объект',
         name: 'object',
         classes(item) {
@@ -143,10 +169,10 @@ const columns = ref<Column[]>([
         },
         link(item) {
             let link = '';
-            if (item.company) {
-                link = `/lists/companies/${item.company.id}`;
-            } else if (item.deal) {
+            if (item.deal) {
                 link = `/deals/${item.deal.id}`;
+            } else if (item.company) {
+                link = `/lists/companies/${item.company.id}`;
             } else if (item.ctr_agent) {
                 link = `/lists/contacts/${item.ctr_agent.id}`;
             }
@@ -154,15 +180,18 @@ const columns = ref<Column[]>([
         },
         field(item) {
             let value = '';
-            if (item.company) {
-                value = item.company.name;
-            } else if (item.deal) {
+            if (item.deal) {
                 value = item.deal.label;
+            } else if (item.company) {
+                value = item.company.name;
             }
             else if (item.ctr_agent) {
                 value = item.ctr_agent.username;
             }
             return value;
+        },
+        subtitle(item) {
+            return item.deal && item.company ? item.company.name : '';
         },
 
         resizable: true,
@@ -204,6 +233,16 @@ const columns = ref<Column[]>([
         resizable: true,
     },
     {
+        label: 'Выполнена',
+        name: 'closed_at',
+        dateFormat: 'DD.MM.YYYY, HH:mm',
+        sortable: true,
+        click(item) {
+            taskResultModal.open(item);
+        },
+        resizable: true,
+    },
+    {
         label: '',
         name: 'actions',
         headerStyle: { width: '100px' },
@@ -223,7 +262,8 @@ const taskModal = useModal('TaskModal');
 
 onMounted(() => {
     if (route.query.id) openSingleTask(route.query.id);
-    emits('fetchTasks');
+    // the list: one page of the filters (the board and the calendar ask for all tasks of their view)
+    emits('fetchTasks', {});
 });
 </script>
 

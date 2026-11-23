@@ -5,13 +5,14 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { AsyncLocalStorage } from 'async_hooks';
 import { Trigger, TriggerTypes } from './trigger.entity';
 import { TriggerRun, TriggerRunStatus } from './trigger-run.entity';
 import { DataSource, LessThanOrEqual, Repository } from 'typeorm';
 import { Deal } from '../deal/deal.entity';
 import { EventTypes } from '../events/event.entity';
 import { RoleEnum, User } from '../user/user.entity';
-import { OnEvent } from '@nestjs/event-emitter';
+import { EventEmitter2, OnEvent } from '@nestjs/event-emitter';
 import { TaskType } from '../task_type/task_type.entity';
 import { HelperService } from '../helper/helper.service';
 import {
@@ -22,20 +23,34 @@ import {
 import { DealStage } from '../deal_stage/deal_stage.entity';
 import { LoggerService } from '../helper/logger.service';
 import { EmailTemplate } from '../email/email.template.entity';
+import { Email } from '../email/email.entity';
+import { Filler } from '../filler/filler.entity';
 import { EmailEventDto } from '../events/dto/email.event.dto';
 import { CallRecordingEventDto } from '../events/dto/call.recording.event.dto';
-import { TriggerActionsService } from './trigger-actions.service';
+import { ACTION_NAMES, NOT_FITTING, TriggerActionsService, TriggerOutcome } from './trigger-actions.service';
+import { TRIGGER_RUN_FAILED, TriggerRunFailure } from './trigger-events';
+import { AuthUser } from '../auth/auth.guard';
+import { Access } from '../auth/access';
 
 export type TriggerKind = 'immediate' | 'delayed' | 'recurring' | 'event';
 
 export interface DealEventContext {
   outgoing?: boolean;
+  // the author of the event (for an incoming message: the contact)
   from_user_id?: number;
+  // the employee of the event: the manager of the chat or of the call. Not given: the author of an
+  // outgoing event, else the responsible of the deal (TriggerService.staffOf)
+  staff_user_id?: number;
+  // one letter goes into every open deal of its sender: a "send email" trigger answers it once
+  // (`once_key` = the letter, `fired` = the triggers that already answered it), not once per deal
+  once_key?: string;
+  fired?: Set<string>;
 }
 
 const EVENT_WHENS = [
   ApplyTriggerWhenEnum.EMAIL_RECEIVED,
   ApplyTriggerWhenEnum.TG_MESSAGE_RECEIVED,
+  ApplyTriggerWhenEnum.WA_MESSAGE_RECEIVED,
   ApplyTriggerWhenEnum.CALL_RECORDED,
 ];
 const RECURRING_WHENS = [
@@ -47,6 +62,56 @@ const RECURRING_WHENS = [
 // a run that waited longer than this (the API was down) is skipped, not executed late
 const MISSED_AFTER_MINUTES = Math.max(1, Number(process.env.TRIGGER_MISSED_AFTER_MINUTES || 24 * 60));
 const DEAL_COLUMNS_A_TRIGGER_MAY_CHANGE = ['label', 'budget', 'agent_id'];
+// whatever goes wrong, one trigger acts for one deal at most this many times in 24 hours
+const MAX_RUNS_PER_DEAL_DAY = Math.max(1, Number(process.env.TRIGGER_MAX_RUNS_PER_DEAL_DAY || 50));
+const MAX_EMAILS_PER_DEAL_DAY = Math.max(1, Number(process.env.TRIGGER_MAX_EMAILS_PER_DEAL_DAY || 5));
+// "при письме" ignores older letters: the first sync of a mailbox brings years of mail
+const EMAIL_MAX_AGE_HOURS = Math.max(1, Number(process.env.TRIGGER_EMAIL_MAX_AGE_HOURS || 24));
+// an answering machine's letter is not a client writing (and answering it would start a ping-pong)
+const AUTO_REPLY_SUBJECT =
+  /^\s*(auto(matic)?[\s_-]*(reply|response|antwort)|autoreply|out of (the )?office|автоответ|автоматический ответ|abwesenheit)/i;
+// nor is a bounce of a mail server: it quotes the letter of a trigger, and answering it bounces again
+const BOUNCE_SUBJECT =
+  /^\s*(undeliver(ed|able)|delivery (status notification|failure|has failed)|mail delivery (failed|failure|subsystem)|returned mail|failure notice|недоставлен|не доставлено|сообщение не доставлено)/i;
+const BOUNCE_SENDER = /^\s*(mailer-daemon|postmaster)@/i;
+// a row taken longer ago than this was cut off by a restart of the API in the middle of the action
+const RUNNING_STALE_MINUTES = 15;
+// finished rows older than this are deleted (the last done run of a trigger and deal stays: "only once");
+// skipped ones (a recurring trigger leaves one per deal and day for deals that do not fit) sooner
+const KEEP_RUNS_DAYS = Math.max(7, Number(process.env.TRIGGER_RUNS_KEEP_DAYS || 90));
+const KEEP_SKIPPED_DAYS = Math.max(1, Math.min(KEEP_RUNS_DAYS, Number(process.env.TRIGGER_SKIPPED_KEEP_DAYS || 30)));
+
+const LEFT_STAGE = 'сделка ушла из этапа';
+const CUT_OFF = 'прерван: API перезапустился во время выполнения';
+
+// what a trigger's setting names and is gone ("TaskType with id 5 does not exist!", HelperService.getById)
+const GONE_NAMES: Record<string, string> = {
+  TaskType: 'тип задачи',
+  User: 'сотрудник',
+  EmailTemplate: 'шаблон письма',
+  DealStage: 'этап',
+};
+
+/** An error of a run in words for a manager or an admin (the run keeps the original text). */
+export function humanError(message: string): string {
+  const text = String(message ?? '').trim();
+  const gone = /^(\w+) with id (\d+) does not exist/.exec(text);
+  if (gone && GONE_NAMES[gone[1]]) {
+    return `в настройке триггера указан ${GONE_NAMES[gone[1]]} (№${gone[2]}), которого больше нет — триггер нужно исправить`;
+  }
+  return text || 'неизвестная ошибка';
+}
+
+/** "a day", "3 hours", "30 minutes" in Russian, for the reasons of skipped runs. */
+function minutesText(minutes: number): string {
+  if (minutes % 1440 === 0) return minutes === 1440 ? 'сутки' : `${minutes / 1440} дн.`;
+  if (minutes % 60 === 0) return `${minutes / 60} ч`;
+  return `${minutes} мин`;
+}
+
+function affected(result: any): number {
+  return Array.isArray(result) ? Number(result[1] ?? 0) : 0;
+}
 
 /**
  * Triggers of the funnel stages.
@@ -55,15 +120,36 @@ const DEAL_COLUMNS_A_TRIGGER_MAY_CHANGE = ['label', 'budget', 'agent_id'];
  *  - immediate: right after the deal is created in / moved to the stage;
  *  - delayed: N minutes after that, or at an exact date and time;
  *  - recurring: every day / week / month / year while the deal stays in the stage;
- *  - event: when a Telegram message or an email of the deal arrives (`onDealEvent`).
+ *  - event: when a Telegram or WhatsApp message, an email or a call of the deal arrives (`onDealEvent`).
  * Delayed and recurring executions are rows of `trigger_run` (the schedule lives
- * in the database); TriggerScheduler executes the due rows. Every execution is
- * caught and logged: a broken trigger is a failed run, never a crash of the API.
+ * in the database); TriggerScheduler executes the due rows, each taken by one UPDATE
+ * (pending -> running), so two ticks never execute one row. Every execution is caught
+ * and logged: a broken trigger is a failed run (a message to the admins in the bot,
+ * TRIGGER_RUN_FAILED, and a note «Автоматика не сработала …» in the deal's history), never a
+ * crash of the API.
+ *
+ * No loops, bounded repeats:
+ *  - nothing a trigger's action produces (its letter, in any deal) fires event triggers (`acting`),
+ *    and its letters say Auto-Submitted, so that the client's answering machine does not reply;
+ *  - "при письме" ignores old letters (the first sync of a mailbox), spam, answering machines and bounces,
+ *    and one letter that lands in several open deals is answered by a "send email" trigger once;
+ *  - a trigger acts for a deal only once if so set (default for "create deal"), not again within
+ *    its pause (`cooldown_minutes`, default a day for "send email"), and never more than
+ *    TRIGGER_MAX_RUNS_PER_DEAL_DAY (50; letters TRIGGER_MAX_EMAILS_PER_DEAL_DAY, 5) times a day;
+ *  - "create task" does not add the same task while it is still open in the deal.
+ * The letter of a "send email" that fires on entering the stage or on an event is queued (a run due
+ * at once) and sent right after the request: neither the kanban nor an incoming message waits for
+ * the mail server.
  * What a trigger does to the deal is TriggerActionsService's.
  */
 @Injectable()
 export class TriggerService {
   private readonly logger = new Logger(TriggerService.name);
+  /** Set while a trigger action runs: the events it causes are its own, event triggers ignore them. */
+  private static readonly acting = new AsyncLocalStorage<{ trigger_id: number; deal_id: number }>();
+  private lastCleanup = 0;
+  // a pass over the queue (letters due now) is already scheduled
+  private queuedPass = false;
 
   constructor(
     @InjectRepository(Trigger)
@@ -76,18 +162,34 @@ export class TriggerService {
     private helperService: HelperService,
     private loggerService: LoggerService,
     private actions: TriggerActionsService,
+    private eventEmitter: EventEmitter2,
   ) {}
 
   // ------------------------------------------------------------------ CRUD
 
-  async fetchAll(stageId: number): Promise<any> {
+  /**
+   * The triggers of a stage. Admins and managers (the settings page) also get `runs`: does the
+   * trigger work — failed runs of the last 7 days, the last error (an error may name a client's
+   * address, so not for agents).
+   */
+  async fetchAll(stageId: number, user: AuthUser = null): Promise<any> {
     const stage = await this.helperService.getById(DealStage, stageId, [
       'triggers',
     ]);
+    const triggers = stage.triggers.sort((a, b) => a.id - b.id);
+    const withStats = !user || new Access(user).isManager;
+    const [stats, names] = await Promise.all([
+      withStats ? this.runStats(triggers.map((t) => t.id)) : Promise.resolve(new Map<number, any>()),
+      this.fillerNames(),
+    ]);
 
-    return stage.triggers
-      .sort((a, b) => a.id - b.id)
-      .map((trigger) => this.modifyDataAttribute(trigger));
+    return triggers.map((trigger) => {
+      const item = this.modifyDataAttribute(this.withCurrentFieldNames(trigger, names));
+      if (withStats) {
+        item.runs = stats.get(trigger.id) ?? { failed: 0, last_error: null, last_failed_at: null, last_done_at: null };
+      }
+      return item;
+    });
   }
 
   async fetchOne(stageId: number, triggerId: number): Promise<any> {
@@ -104,18 +206,31 @@ export class TriggerService {
       );
     }
 
-    return this.modifyDataAttribute(trigger);
+    return this.modifyDataAttribute(this.withCurrentFieldNames(trigger, await this.fillerNames()));
   }
 
-  /** The schedule and the history of a trigger: planned, done and failed runs, newest first. */
-  async fetchRuns(stageId: number, triggerId: number, limit = 100): Promise<any[]> {
+  /**
+   * The schedule and the history of a trigger: planned, done and failed runs, newest first.
+   * A user who may not see every deal gets the runs of the deals they may see only
+   * (labels of messenger deals carry the client's name and phone).
+   */
+  async fetchRuns(stageId: number, triggerId: number, limit = 100, user: AuthUser = null): Promise<any[]> {
     await this.fetchOne(stageId, triggerId);
-    const runs = await this.runRepository.find({
-      where: { trigger: { id: triggerId } },
-      relations: { deal: true },
-      order: { run_at: 'DESC', id: 'DESC' },
-      take: Math.min(Math.max(limit, 1), 500),
-    });
+    const qb = this.runRepository
+      .createQueryBuilder('r')
+      .leftJoinAndSelect('r.deal', 'd')
+      .where('r.trigger_id = :trigger', { trigger: triggerId })
+      .orderBy('r.run_at', 'DESC')
+      .addOrderBy('r.id', 'DESC')
+      .limit(Math.min(Math.max(limit, 1), 500));
+    if (user) {
+      const access = new Access(user);
+      if (!access.isManager) {
+        const visible = access.dealSql('d', 'view');
+        qb.andWhere(visible.sql, visible.params);
+      }
+    }
+    const runs = await qb.getMany();
     return runs.map((run) => ({
       id: run.id,
       deal_id: run.deal?.id ?? null,
@@ -124,8 +239,37 @@ export class TriggerService {
       run_at: run.run_at,
       status: run.status,
       executed_at: run.executed_at,
-      error: run.error,
+      // a failure in words («указан тип задачи (№5), которого больше нет»), the row keeps the original
+      error: run.status === TriggerRunStatus.FAILED && run.error ? humanError(run.error) : run.error,
+      note: run.note ?? null,
     }));
+  }
+
+  /** Failed runs of the last 7 days per trigger, the last error, the last success. */
+  private async runStats(triggerIds: number[]): Promise<Map<number, any>> {
+    if (triggerIds.length === 0) return new Map();
+    const rows: any[] = await this.dataSource.query(
+      `SELECT trigger_id,
+              COUNT(*) FILTER (WHERE status = $3)::int AS failed,
+              MAX(executed_at) FILTER (WHERE status = $3) AS last_failed_at,
+              (ARRAY_AGG(error ORDER BY executed_at DESC) FILTER (WHERE status = $3))[1] AS last_error,
+              MAX(executed_at) FILTER (WHERE status = $4) AS last_done_at
+         FROM trigger_run
+        WHERE trigger_id = ANY($1) AND executed_at > $2
+        GROUP BY trigger_id`,
+      [triggerIds, new Date(Date.now() - 7 * 86_400_000), TriggerRunStatus.FAILED, TriggerRunStatus.DONE],
+    );
+    return new Map(
+      rows.map((r) => [
+        Number(r.trigger_id),
+        {
+          failed: r.failed,
+          last_error: r.last_error ? humanError(r.last_error) : null,
+          last_failed_at: r.last_failed_at,
+          last_done_at: r.last_done_at,
+        },
+      ]),
+    );
   }
 
   private modifyDataAttribute(trigger: Trigger): any {
@@ -146,25 +290,26 @@ export class TriggerService {
       data.apply_when.time &&
       !/^([01]?[0-9]|2[0-3]):[0-5][0-9]$/.test(data.apply_when.time)
     ) {
-      throw new BadRequestException(`Time should be in HH:MM format`);
+      throw new BadRequestException(`Время укажите в формате ЧЧ:ММ`);
     }
     if (
       data.apply_when.when === ApplyTriggerWhenEnum.RIGHT_AWAY &&
       (data.apply_when.after_minutes ?? 0) < 0
     ) {
-      throw new BadRequestException('after_minutes cannot be negative');
+      throw new BadRequestException('Задержка не может быть отрицательной');
     }
 
-    await this.throwIfInvalidDealFiltersProvided(data.deal_filters ?? []);
+    const fillers = await this.dealFillers();
+    const dealFilters = await this.normalizedFilters(data.deal_filters ?? [], fillers);
 
     if (data.type === TriggerTypes.CHANGE_FIELDS) {
-      await this.throwIfInvalidDealFiltersProvided(data.change_fields_data.fields);
+      data.change_fields_data.fields = await this.normalizedFilters(data.change_fields_data.fields ?? [], fillers, true);
       const readOnly = (data.change_fields_data.fields ?? [])
         .filter((f) => !f.is_filler && !DEAL_COLUMNS_A_TRIGGER_MAY_CHANGE.includes(f.field))
         .map((f) => f.field);
       if (readOnly.length) {
         throw new BadRequestException(
-          `A trigger may change only ${DEAL_COLUMNS_A_TRIGGER_MAY_CHANGE.join(', ')} and custom fields, not: ${readOnly.join(', ')}`,
+          `Триггер может менять только ответственного, бюджет, название и доп. поля, не: ${readOnly.join(', ')}`,
         );
       }
     }
@@ -177,7 +322,7 @@ export class TriggerService {
     if (data.type === TriggerTypes.CREATE_DEAL) {
       if (Number(data.create_deal_data?.stage_id) === Number(dealStageId)) {
         throw new BadRequestException(
-          'A "create deal" trigger cannot create the deal in its own stage',
+          'Триггер «Создать сделку» не может создавать сделку в своём же этапе',
         );
       }
       await this.helperService.getById(DealStage, data.create_deal_data.stage_id);
@@ -191,22 +336,21 @@ export class TriggerService {
     if (data.type === TriggerTypes.CHANGE_AGENT) {
       const agent = await this.helperService.getById(User, data.change_agent_data.agent_id);
       if (agent.role === RoleEnum.CTR_AGENT) {
-        throw new BadRequestException('The new responsible must be a staff user');
+        throw new BadRequestException('Новым ответственным может быть только сотрудник');
       }
     }
 
     if (!triggerEntity) {
       triggerEntity = new Trigger();
     }
+    const isUpdate = !!triggerEntity.id;
+    // the planned runs stay when only the action or the conditions change
+    const scheduleBefore = isUpdate ? TriggerService.scheduleKey(triggerEntity) : null;
 
     triggerEntity.deal_stage = await this.helperService.getById(DealStage, dealStageId);
     triggerEntity.type = data.type;
     triggerEntity.data = data[this.getTargetDataAttributeName(data.type)];
-    triggerEntity.deal_filters = (data.deal_filters ?? []).map((f) => ({
-      field: f.field,
-      value: f.value,
-      is_filler: f.is_filler,
-    })) as DealFilter[];
+    triggerEntity.deal_filters = dealFilters;
     triggerEntity.apply_when = data.apply_when.when;
     triggerEntity.apply_when_data = data.apply_when;
     triggerEntity.target_user = null;
@@ -220,14 +364,28 @@ export class TriggerService {
     triggerEntity.is_delayed = kind === 'delayed';
     triggerEntity.is_recurring = kind === 'recurring' || kind === 'event';
 
-    const isUpdate = !!triggerEntity.id;
     const saved = await this.triggerRepository.save(triggerEntity);
-    if (isUpdate) {
-      // the schedule of the old version is void
+    if (isUpdate && scheduleBefore !== TriggerService.scheduleKey(saved)) {
+      // the schedule of the old version is void; the scheduler plans the new one
+      // (delayed: from the moment the deal entered the stage, see planMissingDelayedRuns)
       await this.runRepository.delete({ trigger: { id: saved.id }, status: TriggerRunStatus.PENDING });
     }
     // the same shape as GET: <type>_data instead of data, plus kind
     return this.modifyDataAttribute(saved);
+  }
+
+  /** What defines when the trigger runs: a change of it voids the planned runs. */
+  private static scheduleKey(trigger: Pick<Trigger, 'apply_when' | 'apply_when_data'>): string {
+    const d: any = trigger.apply_when_data ?? {};
+    return JSON.stringify([
+      trigger.apply_when,
+      Number(d.after_minutes ?? 0),
+      d.date ? String(d.date instanceof Date ? d.date.toISOString() : d.date).slice(0, 10) : null,
+      d.time ?? null,
+      d.week_day ?? null,
+      d.day ?? null,
+      d.month ?? null,
+    ]);
   }
 
   async updateTrigger(id: number, dealStageId: number, data: AssignTriggerDto): Promise<void> {
@@ -249,26 +407,69 @@ export class TriggerService {
     await this.triggerRepository.delete({ id });
   }
 
-  async throwIfInvalidDealFiltersProvided(dealFilters: DealFilter[]): Promise<void> {
-    const availableFilters = await this.helperService.getDealColumns();
-    const invalidFilters = [];
+  private dealFillers(): Promise<Filler[]> {
+    return this.dataSource.getRepository(Filler).find({ where: { target: 'deal' } });
+  }
 
-    for (const dealFilter of dealFilters ?? []) {
-      const found = availableFilters.some(
-        (available) =>
-          dealFilter.field === available.field &&
-          !!dealFilter.is_filler === available.is_filler,
-      );
-      if (!found) {
-        invalidFilters.push(dealFilter.field);
+  private async fillerNames(): Promise<Map<number, string>> {
+    return new Map((await this.dealFillers()).map((f) => [f.id, f.field]));
+  }
+
+  /**
+   * Conditions (or the fields of "change fields", `withLabel`: the settings page shows their label) as
+   * they are stored: a custom field with its id and current name, so that renaming the field keeps
+   * the trigger. Unknown fields: 400 with their names.
+   */
+  private async normalizedFilters(filters: DealFilter[], fillers: Filler[], withLabel = false): Promise<DealFilter[]> {
+    const columns = (await this.helperService.getDealColumns()).filter((c) => !c.is_filler).map((c) => c.field);
+    const invalid: string[] = [];
+    const result: DealFilter[] = [];
+    for (const f of filters ?? []) {
+      if (f.is_filler) {
+        const filler =
+          (f.filler_id ? fillers.find((x) => x.id === Number(f.filler_id)) : undefined) ??
+          fillers.find((x) => x.field === f.field);
+        if (!filler) {
+          invalid.push(f.field);
+          continue;
+        }
+        const kept: any = { field: filler.field, value: f.value, is_filler: true, filler_id: filler.id };
+        if (withLabel) kept.label = filler.field;
+        result.push(kept);
+      } else {
+        if (!columns.includes(f.field)) {
+          invalid.push(f.field);
+          continue;
+        }
+        const kept: any = { field: f.field, value: f.value, is_filler: false };
+        if (withLabel && (f as any).label) kept.label = (f as any).label;
+        result.push(kept);
       }
     }
-
-    if (invalidFilters.length !== 0) {
-      throw new BadRequestException(
-        `Provided invalid deal filters: ${invalidFilters.join(', ')}`,
-      );
+    if (invalid.length) {
+      throw new BadRequestException(`Условия триггера ссылаются на поля, которых нет: ${invalid.join(', ')}`);
     }
+    return result;
+  }
+
+  async throwIfInvalidDealFiltersProvided(dealFilters: DealFilter[]): Promise<void> {
+    await this.normalizedFilters(dealFilters ?? [], await this.dealFillers());
+  }
+
+  /** The trigger with the current names of its custom fields (they are kept by id). */
+  private withCurrentFieldNames(trigger: Trigger, names: Map<number, string>): Trigger {
+    const rename = (list: DealFilter[]) =>
+      (list ?? []).map((f: any) => {
+        if (!f?.is_filler || !f.filler_id || !names.has(Number(f.filler_id))) return f;
+        const name = names.get(Number(f.filler_id));
+        return f.label !== undefined ? { ...f, field: name, label: name } : { ...f, field: name };
+      });
+    const copy = Object.assign(Object.create(Object.getPrototypeOf(trigger)), trigger) as Trigger;
+    copy.deal_filters = rename(trigger.deal_filters);
+    if (trigger.type === TriggerTypes.CHANGE_FIELDS && trigger.data?.fields) {
+      copy.data = { ...trigger.data, fields: rename(trigger.data.fields) };
+    }
+    return copy;
   }
 
   getTargetDataAttributeName(type: TriggerTypes): string {
@@ -303,21 +504,44 @@ export class TriggerService {
     return 'immediate';
   }
 
+  /**
+   * How often a trigger may act for one deal (the recurring ones follow their schedule):
+   * only once ever (default: "create deal" — a deal that comes back to the stage gets no second
+   * copy) and not again within `cooldown_minutes` (default: a day for "send email").
+   */
+  static repeatRule(trigger: Pick<Trigger, 'type' | 'apply_when' | 'apply_when_data'>): { once: boolean; cooldownMinutes: number } {
+    const data: any = trigger.apply_when_data ?? {};
+    const once = typeof data.once_per_deal === 'boolean' ? data.once_per_deal : trigger.type === TriggerTypes.CREATE_DEAL;
+    let cooldownMinutes = 0;
+    if (TriggerService.kindOf(trigger) !== 'recurring') {
+      const given = data.cooldown_minutes;
+      const set = given !== undefined && given !== null && given !== '' && Number.isFinite(Number(given));
+      cooldownMinutes = set ? Math.max(0, Number(given)) : trigger.type === TriggerTypes.SEND_EMAIL ? 24 * 60 : 0;
+    }
+    return { once, cooldownMinutes };
+  }
+
   private static parseTime(time?: string): [number, number] {
     const [h, m] = String(time || '00:00').split(':').map(Number);
     return [Number.isFinite(h) ? h : 0, Number.isFinite(m) ? m : 0];
   }
 
-  /** When a delayed trigger fires for a deal that entered the stage at `enteredAt`; null = never (time passed). */
+  /**
+   * When a delayed trigger fires for a deal that entered the stage at `enteredAt`; null = never.
+   * "At an exact time" is for the deals that are in the stage at that time: a deal that comes
+   * after it gets no run (it used to get a run skipped as missed, one row per deal).
+   */
   static delayedRunAt(trigger: Trigger, enteredAt: Date): Date | null {
     const data = trigger.apply_when_data ?? ({} as any);
     if (trigger.apply_when === ApplyTriggerWhenEnum.EXACT_TIME) {
-      const date = new Date(data.date);
+      // "2026-11-24" (what the form sends) is that day here: new Date() reads it as UTC midnight,
+      // which is the day before west of UTC; a full timestamp keeps its local day
+      const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(data.date ?? '').trim());
+      const date = day ? new Date(Number(day[1]), Number(day[2]) - 1, Number(day[3])) : new Date(data.date);
       if (isNaN(date.getTime())) return null;
       const [h, m] = TriggerService.parseTime(data.time);
       date.setHours(h, m, 0, 0);
-      // a date in the past is planned too: the scheduler skips it as missed, which is visible in the runs
-      return date;
+      return date.getTime() > enteredAt.getTime() ? date : null;
     }
     const runAt = new Date(enteredAt);
     runAt.setMinutes(runAt.getMinutes() + Number(data.after_minutes ?? 0));
@@ -371,8 +595,8 @@ export class TriggerService {
   // ------------------------------------------------------------------ entry points
 
   /**
-   * The deal was created in or moved to `stage`: immediate triggers run now,
-   * delayed and recurring ones are planned; pending runs of other stages are cancelled.
+   * The deal was created in or moved to `stage`: immediate triggers run now (a letter right after
+   * the request), delayed and recurring ones are planned; pending runs of other stages are cancelled.
    */
   async onDealEnteredStage(
     originatedBy: User,
@@ -381,6 +605,7 @@ export class TriggerService {
     depth = 0,
   ): Promise<void> {
     if (!stage) return;
+    let queued = 0;
     try {
       await this.cancelRunsOfOtherStages(deal.id, stage.id);
       const triggers = await this.triggersOfStage(stage.id);
@@ -388,6 +613,17 @@ export class TriggerService {
       for (const trigger of triggers) {
         const kind = TriggerService.kindOf(trigger);
         if (kind === 'immediate') {
+          const blocked = await this.repeatBlock(trigger, deal.id);
+          if (blocked) {
+            await this.recordSkipped(trigger.id, deal.id, blocked.reason);
+            continue;
+          }
+          if (trigger.type === TriggerTypes.SEND_EMAIL) {
+            // a letter waits for the mail server (seconds, up to a minute): it is queued, due now,
+            // and sent right after this request instead of holding the kanban
+            if (await this.planRun(trigger, deal, now)) queued++;
+            continue;
+          }
           await this.executeRecorded(originatedBy, deal, trigger, depth);
         } else if (kind === 'delayed') {
           const runAt = TriggerService.delayedRunAt(trigger, now);
@@ -401,14 +637,32 @@ export class TriggerService {
       this.loggerService.error(`triggers of stage ${stage.id} for deal ${deal.id}`, (error as Error).stack);
       this.logger.error(`triggers of stage ${stage.id} for deal ${deal.id}: ${(error as Error).message}`);
     }
+    if (queued) this.executeQueuedSoon();
   }
 
-  /** Kept for the old callers: immediate triggers of a stage. */
+  /**
+   * The queued letters go out right after the current request, not at the next tick of the
+   * scheduler (one pass for everything queued meanwhile). Safe next to a tick: every row is
+   * taken by one UPDATE (claim).
+   */
+  private executeQueuedSoon(): void {
+    if (this.queuedPass) return;
+    this.queuedPass = true;
+    setTimeout(() => {
+      this.queuedPass = false;
+      this.executeDueRuns().catch((error) =>
+        this.logger.warn(`queued trigger runs: ${(error as Error).message}`),
+      );
+    }, 0);
+  }
+
+  /** Kept for the old callers: immediate triggers of a stage (with the same limits on repeats). */
   async handleTriggers(originatedBy: User, deal: Deal, triggers: Trigger[] = []): Promise<void> {
     for (const trigger of triggers) {
-      if (TriggerService.kindOf(trigger) === 'immediate') {
-        await this.executeRecorded(originatedBy, deal, trigger);
-      }
+      if (TriggerService.kindOf(trigger) !== 'immediate') continue;
+      const blocked = await this.repeatBlock(trigger, deal.id);
+      if (blocked) await this.recordSkipped(trigger.id, deal.id, blocked.reason);
+      else await this.executeRecorded(originatedBy, deal, trigger);
     }
   }
 
@@ -417,9 +671,13 @@ export class TriggerService {
   async onCallRecorded(data: CallRecordingEventDto): Promise<void> {
     if (!data?.deal?.id || data.history) return;
     try {
+      // a call event: originated_by is the contact, target_user the manager on the call; the
+      // direction is read as the history reads it (EventListener: not false = outgoing)
+      const outgoing = data.recording?.outgoing !== false;
       await this.onDealEvent(data.target_user ?? data.originated_by, data.deal, ApplyTriggerWhenEnum.CALL_RECORDED, {
-        outgoing: data.recording?.outgoing,
-        from_user_id: data.originated_by?.id,
+        outgoing,
+        from_user_id: outgoing ? data.target_user?.id : data.originated_by?.id,
+        staff_user_id: data.target_user?.id ?? data.recording?.user?.id,
       });
     } catch (error) {
       this.logger.warn(`call triggers of deal ${data.deal.id}: ${(error as Error).message}`);
@@ -430,12 +688,19 @@ export class TriggerService {
   @OnEvent(EventTypes.NEW_EMAIL.toString())
   async onEmailEvent(data: EmailEventDto[] | EmailEventDto): Promise<void> {
     const items = Array.isArray(data) ? data : [data];
+    // one letter comes for each open deal of its sender (one batch): a "send email" trigger answers it once
+    const fired = new Set<string>();
     for (const item of items) {
       if (!item?.deal?.id) continue;
+      if (!TriggerService.emailMayFire(item.email)) continue;
+      const letter = item.email?.message_id || (item.email?.id ? `#${item.email.id}` : undefined);
       try {
+        // originated_by: the sender of an outgoing letter, the contact of an incoming one
         await this.onDealEvent(item.originated_by, item.deal, ApplyTriggerWhenEnum.EMAIL_RECEIVED, {
           outgoing: item.email?.outgoing,
-          from_user_id: item.email?.from_user?.id,
+          from_user_id: item.originated_by?.id ?? item.email?.from_user?.id,
+          once_key: letter,
+          fired,
         });
       } catch (error) {
         this.logger.warn(`email triggers of deal ${item.deal.id}: ${(error as Error).message}`);
@@ -444,8 +709,29 @@ export class TriggerService {
   }
 
   /**
-   * Something happened in the deal (a Telegram message, an email, a call):
+   * A letter that may fire "при письме": not older than TRIGGER_EMAIL_MAX_AGE_HOURS (the first sync
+   * of a mailbox replays years of mail), not spam or deleted, not an answering machine's or a
+   * mail server's bounce.
+   */
+  static emailMayFire(email: Email | undefined, now = Date.now()): boolean {
+    if (!email) return true;
+    if (email.is_spam || email.deleted_at) return false;
+    const sent = email.sent_at ? new Date(email.sent_at).getTime() : NaN;
+    if (Number.isFinite(sent) && now - sent > EMAIL_MAX_AGE_HOURS * 3_600_000) return false;
+    if (!email.outgoing) {
+      const subject = email.subject ?? '';
+      if (AUTO_REPLY_SUBJECT.test(subject) || BOUNCE_SUBJECT.test(subject)) return false;
+      if (BOUNCE_SENDER.test(email.from ?? '')) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Something happened in the deal (a Telegram or WhatsApp message, an email, a call):
    * the triggers of its current stage that wait for this event run.
+   * Never on what a trigger's action produced (no loops: its letter, in this deal or another one);
+   * a message that does not fit a trigger's conditions, or comes within its pause, leaves no row
+   * (one per message would flood the history).
    */
   async onDealEvent(
     originatedBy: User,
@@ -453,22 +739,126 @@ export class TriggerService {
     when: ApplyTriggerWhenEnum,
     context: DealEventContext = {},
   ): Promise<number> {
+    const acting = TriggerService.acting.getStore();
+    if (acting) {
+      // the event comes from the action of a trigger (its letter): never a reason for another run
+      this.logger.debug(`event of deal ${deal.id} made by trigger ${acting.trigger_id}: no triggers`);
+      return 0;
+    }
     const stageId = deal.stage?.id ?? (await this.stageIdOf(deal.id));
     if (!stageId) return 0;
     const triggers = (await this.triggersOfStage(stageId)).filter((t) => t.apply_when === when);
     let fired = 0;
+    let queued = 0;
+    let staff: number | null | undefined;
     for (const trigger of triggers) {
       const data = trigger.apply_when_data ?? ({} as any);
       if (typeof data.outgoing === 'boolean' && context.outgoing !== undefined && data.outgoing !== context.outgoing) {
         continue;
       }
-      if (data.from_user_id && Number(data.from_user_id) !== Number(context.from_user_id)) {
+      if (data.from_user_id) {
+        if (staff === undefined) staff = await this.staffOf(deal, context);
+        if (Number(data.from_user_id) !== Number(staff)) continue;
+      }
+      // the same letter in another open deal of the client: already answered
+      const answered =
+        trigger.type === TriggerTypes.SEND_EMAIL && context.once_key && context.fired
+          ? `${trigger.id}:${context.once_key}`
+          : null;
+      if (answered && context.fired.has(answered)) continue;
+      if (await this.actions.precheck(deal, trigger)) continue;
+      const blocked = await this.repeatBlock(trigger, deal.id);
+      if (blocked) {
+        // the daily limit is worth one visible row a day; a pause or "once" is the normal case
+        if (blocked.limit) await this.recordLimitOnce(trigger.id, deal.id, blocked.reason);
         continue;
       }
-      await this.executeRecorded(originatedBy, deal, trigger);
+      if (trigger.type === TriggerTypes.SEND_EMAIL) {
+        // the letter is queued and sent right after: the incoming message is not held by the mail
+        // server; a letter already waiting in the queue for this deal is not queued twice
+        if (await this.planRun(trigger, deal, new Date())) queued++;
+      } else {
+        await this.executeRecorded(originatedBy, deal, trigger);
+      }
+      if (answered) context.fired.add(answered);
       fired++;
     }
+    if (queued) this.executeQueuedSoon();
     return fired;
+  }
+
+  /** The employee of an event: given, else the author of an outgoing one, else the responsible of the deal. */
+  private async staffOf(deal: Deal, context: DealEventContext): Promise<number | null> {
+    if (context.staff_user_id) return Number(context.staff_user_id);
+    if (context.outgoing && context.from_user_id) return Number(context.from_user_id);
+    if (deal.agent?.id) return deal.agent.id;
+    const row = await this.dealRepository
+      .createQueryBuilder('d')
+      .select('d.agent_id', 'agent_id')
+      .where('d.id = :id', { id: deal.id })
+      .getRawOne();
+    return row?.agent_id ?? null;
+  }
+
+  // ------------------------------------------------------------------ repeats
+
+  /**
+   * Why the trigger must not act for the deal now (null = it may): it acts only once and did,
+   * its pause after the last action has not passed, or it reached the daily limit (`limit`).
+   * A run that is executing right now (two messages at once) counts as done.
+   */
+  private async repeatBlock(trigger: Trigger, dealId: number, exceptRunId = 0): Promise<{ reason: string; limit: boolean } | null> {
+    const rule = TriggerService.repeatRule(trigger);
+    const max = trigger.type === TriggerTypes.SEND_EMAIL ? MAX_EMAILS_PER_DEAL_DAY : MAX_RUNS_PER_DEAL_DAY;
+    const [row] = await this.dataSource.query(
+      `SELECT COUNT(*) FILTER (WHERE status IN ($3, $4, $5) AND executed_at > $6)::int AS day,
+              MAX(executed_at) FILTER (WHERE status IN ($3, $5)) AS last_done,
+              COUNT(*) FILTER (WHERE status IN ($3, $5))::int AS done
+         FROM trigger_run
+        WHERE trigger_id = $1 AND deal_id = $2 AND id <> $7`,
+      [
+        trigger.id,
+        dealId,
+        TriggerRunStatus.DONE,
+        TriggerRunStatus.FAILED,
+        TriggerRunStatus.RUNNING,
+        new Date(Date.now() - 86_400_000),
+        exceptRunId,
+      ],
+    );
+    if (rule.once && Number(row?.done) > 0) {
+      return { reason: 'уже выполнялся для этой сделки (только один раз)', limit: false };
+    }
+    if (rule.cooldownMinutes > 0 && row?.last_done && Date.now() - new Date(row.last_done).getTime() < rule.cooldownMinutes * 60_000) {
+      return { reason: `не чаще раза в ${minutesText(rule.cooldownMinutes)} для сделки`, limit: false };
+    }
+    if (Number(row?.day) >= max) {
+      return { reason: `лимит: не больше ${max} срабатываний за сутки для одной сделки`, limit: true };
+    }
+    return null;
+  }
+
+  private async recordSkipped(triggerId: number, dealId: number, reason: string): Promise<void> {
+    try {
+      const now = new Date();
+      await this.dataSource.query(
+        `INSERT INTO trigger_run (trigger_id, deal_id, run_at, status, executed_at, error) VALUES ($1, $2, $3, $4, $3, $5)`,
+        [triggerId, dealId, now, TriggerRunStatus.SKIPPED, reason.slice(0, 2000)],
+      );
+    } catch (error) {
+      this.logger.warn(`cannot record a skipped run of trigger ${triggerId}: ${(error as Error).message}`);
+    }
+  }
+
+  private async recordLimitOnce(triggerId: number, dealId: number, reason: string): Promise<void> {
+    const rows = await this.dataSource.query(
+      `SELECT 1 FROM trigger_run WHERE trigger_id = $1 AND deal_id = $2 AND status = $3 AND error = $4 AND executed_at > $5 LIMIT 1`,
+      [triggerId, dealId, TriggerRunStatus.SKIPPED, reason, new Date(Date.now() - 86_400_000)],
+    );
+    if (rows.length === 0) {
+      this.logger.warn(`trigger ${triggerId} reached its daily limit for deal ${dealId}`);
+      await this.recordSkipped(triggerId, dealId, reason);
+    }
   }
 
   // ------------------------------------------------------------------ schedule
@@ -495,85 +885,99 @@ export class TriggerService {
       `UPDATE trigger_run r SET status = $1, executed_at = now(), error = $5
          FROM trigger t
         WHERE t.id = r.trigger_id AND r.deal_id = $2 AND r.status = $3 AND t.deal_stage_id <> $4`,
-      [TriggerRunStatus.SKIPPED, dealId, TriggerRunStatus.PENDING, stageId, 'the deal left the stage'],
+      [TriggerRunStatus.SKIPPED, dealId, TriggerRunStatus.PENDING, stageId, LEFT_STAGE],
     );
   }
 
-  /** One pending run per trigger and deal. */
+  /**
+   * One pending run per trigger and deal: one statement, and the unique partial index
+   * IDX_trigger_run_pending catches the planning from a request and from the scheduler at once.
+   */
   async planRun(trigger: Trigger, deal: Deal, runAt: Date): Promise<TriggerRun | null> {
-    const pending = await this.runRepository.findOne({
-      where: { trigger: { id: trigger.id }, deal: { id: deal.id }, status: TriggerRunStatus.PENDING },
-    });
-    if (pending) return null;
-    const run = new TriggerRun();
-    run.trigger = trigger;
-    run.deal = deal;
-    run.run_at = runAt;
-    run.status = TriggerRunStatus.PENDING;
-    return this.runRepository.save(run);
+    const rows: { id: number }[] = await this.dataSource.query(
+      `INSERT INTO trigger_run (trigger_id, deal_id, run_at, status)
+       SELECT $1::int, $2::int, $3::timestamp, $4::varchar
+        WHERE NOT EXISTS (SELECT 1 FROM trigger_run r WHERE r.trigger_id = $1::int AND r.deal_id = $2::int AND r.status = $4::varchar)
+       ON CONFLICT DO NOTHING
+       RETURNING id`,
+      [trigger.id, deal.id, runAt, TriggerRunStatus.PENDING],
+    );
+    if (!rows?.length) return null;
+    return Object.assign(new TriggerRun(), { id: rows[0].id, trigger, deal, run_at: runAt, status: TriggerRunStatus.PENDING });
   }
 
-  /**
-   * Scheduler: delayed runs that are missing. A deal in the stage without any run of the
-   * trigger (it got there past the API, or the API was down at that moment) is planned from
-   * the moment it entered the stage (last_stage_change, else created_at). Deals that entered
-   * before the trigger was created are left alone: the trigger did not exist for them.
-   */
-  async planMissingDelayedRuns(): Promise<number> {
-    const triggers = await this.triggerRepository
+  /** Triggers of the stages of the active funnel. */
+  private activeTriggers(): Promise<Trigger[]> {
+    return this.triggerRepository
       .createQueryBuilder('t')
       .leftJoinAndSelect('t.deal_stage', 's')
       .leftJoin('s.collection', 'c')
       .where('c.is_active = true')
       .getMany();
+  }
+
+  /**
+   * Scheduler: delayed runs that are missing. A deal in the stage without a run of the trigger
+   * for its current stay (it got there past the API, the API was down at that moment, or the
+   * trigger was changed) is planned from the moment it entered the stage (last_stage_change,
+   * else created_at); a run of an earlier stay does not count. Deals that entered before the
+   * trigger was created are left alone: the trigger did not exist for them.
+   */
+  async planMissingDelayedRuns(): Promise<number> {
+    const triggers = (await this.activeTriggers()).filter((t) => TriggerService.kindOf(t) === 'delayed');
     let planned = 0;
-    for (const trigger of triggers.filter((t) => TriggerService.kindOf(t) === 'delayed')) {
-      const deals = await this.dealRepository
-        .createQueryBuilder('d')
-        .where('d.stage_id = :stage', { stage: trigger.deal_stage.id })
-        .andWhere('d.closed_at IS NULL')
-        .andWhere('d.deleted_at IS NULL')
-        // "after N minutes" is about entering the stage, so deals that entered before the trigger
-        // existed are left alone; "at an exact time" is for every deal that is in the stage then
-        // all timestamps are in one zone (migration 1794960000000-time-zone), compared as they are
-        .andWhere(
-          trigger.apply_when === ApplyTriggerWhenEnum.EXACT_TIME
-            ? '1 = 1'
-            : `COALESCE(d.last_stage_change, d.created_at) >= (SELECT t.created_at FROM "trigger" t WHERE t.id = :trigger)`,
-          { trigger: trigger.id },
-        )
-        .andWhere('NOT EXISTS (SELECT 1 FROM trigger_run r WHERE r.trigger_id = :trigger AND r.deal_id = d.id)', { trigger: trigger.id })
-        .getMany();
+    for (const trigger of triggers) {
+      if (trigger.apply_when === ApplyTriggerWhenEnum.EXACT_TIME) {
+        // a date long past can plan nothing that would still run: no query for it on every tick
+        const at = TriggerService.delayedRunAt(trigger, new Date(0));
+        if (!at || Date.now() - at.getTime() > MISSED_AFTER_MINUTES * 60_000) continue;
+      }
+      // "after N minutes" is about entering the stage, so deals that entered before the trigger
+      // existed are left alone; "at an exact time" is for every deal that is in the stage then.
+      // All timestamps are in one zone (migration 1794960000000-time-zone), compared as they are.
+      const deals: { id: number; entered_at: Date }[] = await this.dataSource.query(
+        `SELECT d.id, COALESCE(d.last_stage_change, d.created_at) AS entered_at
+           FROM deal d
+          WHERE d.stage_id = $1 AND d.closed_at IS NULL AND d.deleted_at IS NULL
+            AND ($3::boolean OR COALESCE(d.last_stage_change, d.created_at) >= (SELECT t.created_at FROM "trigger" t WHERE t.id = $2))
+            AND NOT EXISTS (SELECT 1 FROM trigger_run r
+                             WHERE r.trigger_id = $2 AND r.deal_id = d.id
+                               AND (r.status IN ($4, $5) OR r.created_at >= COALESCE(d.last_stage_change, d.created_at)))`,
+        [
+          trigger.deal_stage.id,
+          trigger.id,
+          trigger.apply_when === ApplyTriggerWhenEnum.EXACT_TIME,
+          TriggerRunStatus.PENDING,
+          TriggerRunStatus.RUNNING,
+        ],
+      );
       for (const deal of deals) {
-        const runAt = TriggerService.delayedRunAt(trigger, deal.last_stage_change ?? deal.created_at ?? new Date());
-        if (runAt && (await this.planRun(trigger, deal, runAt))) planned++;
+        const runAt = TriggerService.delayedRunAt(trigger, new Date(deal.entered_at));
+        if (runAt && (await this.planRun(trigger, { id: deal.id } as Deal, runAt))) planned++;
       }
     }
     return planned;
   }
 
-  /** Scheduler: every open deal in a stage with recurring triggers has its next run planned. */
+  /** Scheduler: every open deal in a stage with recurring triggers has its next run planned (one statement per trigger). */
   async planRecurringRuns(): Promise<number> {
-    const triggers = await this.triggerRepository
-      .createQueryBuilder('t')
-      .leftJoinAndSelect('t.deal_stage', 's')
-      .leftJoin('s.collection', 'c')
-      .where('t.apply_when IN (:...whens)', { whens: RECURRING_WHENS })
-      .andWhere('c.is_active = true')
-      .getMany();
+    const triggers = (await this.activeTriggers()).filter((t) => RECURRING_WHENS.includes(t.apply_when));
     let planned = 0;
     const now = new Date();
     for (const trigger of triggers) {
-      const deals = await this.dealRepository
-        .createQueryBuilder('d')
-        .where('d.stage_id = :stage', { stage: trigger.deal_stage.id })
-        .andWhere('d.closed_at IS NULL')
-        .andWhere('d.deleted_at IS NULL')
-        .getMany();
-      for (const deal of deals) {
-        const runAt = TriggerService.nextOccurrence(trigger, now);
-        if (runAt && (await this.planRun(trigger, deal, runAt))) planned++;
-      }
+      const runAt = TriggerService.nextOccurrence(trigger, now);
+      if (!runAt) continue;
+      const rows: any[] = await this.dataSource.query(
+        `INSERT INTO trigger_run (trigger_id, deal_id, run_at, status)
+         SELECT $1::int, d.id, $2::timestamp, $3::varchar
+           FROM deal d
+          WHERE d.stage_id = $4 AND d.closed_at IS NULL AND d.deleted_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM trigger_run r WHERE r.trigger_id = $1::int AND r.deal_id = d.id AND r.status IN ($3::varchar, $5::varchar))
+         ON CONFLICT DO NOTHING
+         RETURNING id`,
+        [trigger.id, runAt, TriggerRunStatus.PENDING, trigger.deal_stage.id, TriggerRunStatus.RUNNING],
+      );
+      planned += rows?.length ?? 0;
     }
     return planned;
   }
@@ -582,11 +986,18 @@ export class TriggerService {
   async runDue(): Promise<{ planned: number; executed: number; failed: number; skipped: number }> {
     const planned = (await this.planMissingDelayedRuns()) + (await this.planRecurringRuns());
     const outcome = await this.executeDueRuns();
+    await this.cleanupOldRuns();
     return { planned, ...outcome };
   }
 
-  /** Scheduler: executes the runs whose time has come; the result stays in the row. */
+  /**
+   * Scheduler: executes the runs whose time has come; the result stays in the row.
+   * Each row is taken by one UPDATE (pending -> running): a second tick, POST /triggers/run-due
+   * at the same moment or another API process skips it. A row left `running` by a restart is
+   * failed after RUNNING_STALE_MINUTES (not executed again: a letter or a copy is not repeated).
+   */
   async executeDueRuns(limit = 200): Promise<{ executed: number; failed: number; skipped: number }> {
+    await this.failCutOffRuns();
     const due = await this.runRepository.find({
       where: { status: TriggerRunStatus.PENDING, run_at: LessThanOrEqual(new Date()) },
       relations: { trigger: { deal_stage: true, target_user: true }, deal: { stage: true, created_by: true, agent: true } },
@@ -595,30 +1006,40 @@ export class TriggerService {
     });
     const outcome = { executed: 0, failed: 0, skipped: 0 };
     for (const run of due) {
+      if (!(await this.claim(run.id))) continue;
       const trigger = run.trigger;
       const deal = run.deal;
       const now = new Date();
       if (!trigger || !deal || deal.deleted_at || deal.stage?.id !== trigger.deal_stage?.id) {
-        await this.finishRun(run, TriggerRunStatus.SKIPPED, 'the deal left the stage');
+        await this.finishRun(run.id, TriggerRunStatus.SKIPPED, LEFT_STAGE);
         outcome.skipped++;
         continue;
       }
       const kind = TriggerService.kindOf(trigger);
       if (now.getTime() - run.run_at.getTime() > MISSED_AFTER_MINUTES * 60 * 1000) {
         // the API was not running at that time: a task "after 10 minutes" two days late only confuses
-        await this.finishRun(run, TriggerRunStatus.SKIPPED, `missed by more than ${MISSED_AFTER_MINUTES} minutes`);
+        await this.finishRun(run.id, TriggerRunStatus.SKIPPED, `не выполнен вовремя: опоздание больше ${MISSED_AFTER_MINUTES} мин (API не работал)`);
         outcome.skipped++;
       } else {
-        const originatedBy = deal.created_by ?? deal.agent ?? null;
-        try {
-          await this.executeTrigger(originatedBy, deal, trigger);
-          await this.finishRun(run, TriggerRunStatus.DONE);
-          outcome.executed++;
-        } catch (error) {
-          await this.finishRun(run, TriggerRunStatus.FAILED, (error as Error).message);
-          outcome.failed++;
-          this.loggerService.error(`trigger ${trigger.id} failed for deal ${deal.id}`, (error as Error).stack);
-          this.logger.warn(`trigger ${trigger.id} failed for deal ${deal.id}: ${(error as Error).message}`);
+        const blocked = await this.repeatBlock(trigger, deal.id, run.id);
+        if (blocked) {
+          await this.finishRun(run.id, TriggerRunStatus.SKIPPED, blocked.reason);
+          outcome.skipped++;
+        } else {
+          const originatedBy = deal.created_by ?? deal.agent ?? null;
+          try {
+            const result = await this.executeTrigger(originatedBy, deal, trigger);
+            await this.finishWith(run.id, result);
+            if (result.status === 'done') outcome.executed++;
+            else outcome.skipped++;
+          } catch (error) {
+            const message = (error as Error).message;
+            await this.finishRun(run.id, TriggerRunStatus.FAILED, message);
+            outcome.failed++;
+            this.loggerService.error(`trigger ${trigger.id} failed for deal ${deal.id}`, (error as Error).stack);
+            this.logger.warn(`trigger ${trigger.id} failed for deal ${deal.id}: ${message}`);
+            await this.reportFailure(trigger, deal, message);
+          }
         }
       }
       if (kind === 'recurring' && !deal.closed_at) {
@@ -629,56 +1050,161 @@ export class TriggerService {
     return outcome;
   }
 
-  private async finishRun(run: TriggerRun, status: TriggerRunStatus, error: string = null): Promise<void> {
-    await this.runRepository.update(run.id, {
+  /** Takes a due row for this execution; false = somebody else took it. */
+  private async claim(runId: number): Promise<boolean> {
+    const result = await this.dataSource.query(
+      `UPDATE trigger_run SET status = $2, executed_at = $3 WHERE id = $1 AND status = $4`,
+      [runId, TriggerRunStatus.RUNNING, new Date(), TriggerRunStatus.PENDING],
+    );
+    return affected(result) === 1;
+  }
+
+  private async failCutOffRuns(): Promise<void> {
+    const result = await this.dataSource.query(
+      `UPDATE trigger_run SET status = $1, error = $2 WHERE status = $3 AND executed_at < $4`,
+      [TriggerRunStatus.FAILED, CUT_OFF, TriggerRunStatus.RUNNING, new Date(Date.now() - RUNNING_STALE_MINUTES * 60_000)],
+    );
+    const n = affected(result);
+    if (n) this.logger.warn(`${n} trigger run(s) were cut off by a restart: marked failed`);
+  }
+
+  /**
+   * Done and failed rows older than TRIGGER_RUNS_KEEP_DAYS (90) go, skipped ones older than
+   * TRIGGER_SKIPPED_KEEP_DAYS (30); the last done run of each trigger and deal stays ("only once").
+   */
+  private async cleanupOldRuns(): Promise<void> {
+    if (Date.now() - this.lastCleanup < 6 * 3_600_000) return;
+    this.lastCleanup = Date.now();
+    try {
+      const result = await this.dataSource.query(
+        `DELETE FROM trigger_run r
+          WHERE ((r.status IN ($1, $3) AND r.created_at < $4) OR (r.status = $2 AND r.created_at < $5))
+            AND NOT (r.status = $1 AND r.id = (SELECT MAX(x.id) FROM trigger_run x
+                                                WHERE x.trigger_id = r.trigger_id AND x.deal_id = r.deal_id AND x.status = $1))`,
+        [
+          TriggerRunStatus.DONE,
+          TriggerRunStatus.SKIPPED,
+          TriggerRunStatus.FAILED,
+          new Date(Date.now() - KEEP_RUNS_DAYS * 86_400_000),
+          new Date(Date.now() - KEEP_SKIPPED_DAYS * 86_400_000),
+        ],
+      );
+      const n = affected(result);
+      if (n) this.logger.log(`trigger history: ${n} old run(s) removed (kept: ${KEEP_RUNS_DAYS} days, skipped ${KEEP_SKIPPED_DAYS})`);
+    } catch (error) {
+      this.logger.warn(`trigger history cleanup: ${(error as Error).message}`);
+    }
+  }
+
+  private async finishRun(runId: number, status: TriggerRunStatus, error: string = null, note: string = null): Promise<void> {
+    await this.runRepository.update(runId, {
       status,
       executed_at: new Date(),
       error: error ? error.slice(0, 2000) : null,
+      note: note ? note.slice(0, 2000) : null,
     });
+  }
+
+  private async finishWith(runId: number, result: TriggerOutcome): Promise<void> {
+    if (result.status === 'done') await this.finishRun(runId, TriggerRunStatus.DONE, null, result.note ?? null);
+    else await this.finishRun(runId, TriggerRunStatus.SKIPPED, result.note || NOT_FITTING);
+  }
+
+  /**
+   * A failed run is heard of: the admins in the bot (BotWaitingService, TRIGGER_RUN_FAILED) and the
+   * people of the deal in its history («Автоматика не сработала …», once a day per trigger and deal),
+   * so that a letter that did not go out is not taken for sent.
+   */
+  private async reportFailure(trigger: Trigger, deal: Deal, error: string): Promise<void> {
+    const reason = humanError(error).slice(0, 500);
+    const action = ACTION_NAMES[trigger.type] ?? 'действие';
+    const payload: TriggerRunFailure = {
+      trigger_id: trigger.id,
+      trigger_type: trigger.type,
+      action,
+      stage_id: trigger.deal_stage?.id ?? null,
+      stage_name: trigger.deal_stage?.name ?? null,
+      deal_id: deal.id,
+      deal_display_id: deal.display_id ?? null,
+      deal_label: deal.label ?? null,
+      error: reason,
+    };
+    try {
+      this.eventEmitter.emit(TRIGGER_RUN_FAILED, payload);
+    } catch (e) {
+      this.logger.warn(`cannot report the failure of trigger ${trigger.id}: ${(e as Error).message}`);
+    }
+    try {
+      // this failure is a row already: another one within a day means the deal was told; a recurring
+      // trigger that keeps failing tells it once, until it works again (not a note every day)
+      const [row] = await this.dataSource.query(
+        `SELECT COUNT(*) FILTER (WHERE r.executed_at > $4)::int AS day,
+                COUNT(*) FILTER (WHERE r.id > COALESCE((SELECT MAX(x.id) FROM trigger_run x
+                                                         WHERE x.trigger_id = $1 AND x.deal_id = $2 AND x.status = $5), 0))::int AS streak
+           FROM trigger_run r
+          WHERE r.trigger_id = $1 AND r.deal_id = $2 AND r.status = $3`,
+        [trigger.id, deal.id, TriggerRunStatus.FAILED, new Date(Date.now() - 86_400_000), TriggerRunStatus.DONE],
+      );
+      if (Number(row?.day ?? 0) > 1) return;
+      if (TriggerService.kindOf(trigger) === 'recurring' && Number(row?.streak ?? 0) > 1) return;
+      const stage = trigger.deal_stage?.name;
+      await this.actions.noteInDeal(
+        deal.id,
+        `Автоматика не сработала: «${action}»${stage ? ` (триггер этапа «${stage}»)` : ''} — ${reason}`,
+        { trigger_id: trigger.id },
+      );
+    } catch (e) {
+      this.logger.warn(`cannot note the failure of trigger ${trigger.id} in deal ${deal.id}: ${(e as Error).message}`);
+    }
   }
 
   // ------------------------------------------------------------------ execution
 
-  /** Executes now and leaves a done / failed row in trigger_run; never throws. */
+  /** Executes now and leaves a done / skipped / failed row in trigger_run; never throws. */
   private async executeRecorded(originatedBy: User, deal: Deal, trigger: Trigger, depth = 0): Promise<void> {
-    const run = new TriggerRun();
-    run.trigger = trigger;
-    run.deal = deal;
-    run.run_at = new Date();
-    run.status = TriggerRunStatus.PENDING;
-    let saved: TriggerRun | null = null;
+    let runId: number | null = null;
     try {
-      saved = await this.runRepository.save(run);
+      const now = new Date();
+      const rows: { id: number }[] = await this.dataSource.query(
+        `INSERT INTO trigger_run (trigger_id, deal_id, run_at, status, executed_at) VALUES ($1, $2, $3, $4, $3) RETURNING id`,
+        [trigger.id, deal.id, now, TriggerRunStatus.RUNNING],
+      );
+      runId = rows?.[0]?.id ?? null;
     } catch (error) {
       this.logger.warn(`cannot record a run of trigger ${trigger.id}: ${(error as Error).message}`);
     }
     try {
-      await this.executeTrigger(originatedBy, deal, trigger, depth);
-      if (saved) await this.finishRun(saved, TriggerRunStatus.DONE);
+      const result = await this.executeTrigger(originatedBy, deal, trigger, depth);
+      if (runId) await this.finishWith(runId, result);
     } catch (error) {
-      if (saved) await this.finishRun(saved, TriggerRunStatus.FAILED, (error as Error).message);
+      const message = (error as Error).message;
+      if (runId) await this.finishRun(runId, TriggerRunStatus.FAILED, message);
       this.loggerService.error(`trigger ${trigger.id} failed for deal ${deal.id}`, (error as Error).stack);
-      this.logger.warn(`trigger ${trigger.id} (${trigger.type}) failed for deal ${deal.id}: ${(error as Error).message}`);
+      this.logger.warn(`trigger ${trigger.id} (${trigger.type}) failed for deal ${deal.id}: ${message}`);
+      await this.reportFailure(trigger, deal, message);
     }
   }
 
   /**
    * Executes one trigger for one deal now (TriggerActionsService). Throws on failure (the caller records it).
    * A deal made by a "create deal" trigger enters its stage here, one level deeper.
+   * Runs inside `acting`: the events the action causes do not fire event triggers.
    */
   async executeTrigger(
     originatedBy: User,
     deal: Deal,
     trigger: Trigger,
     depth = 0,
-  ): Promise<void> {
-    await this.actions.executeTrigger(
-      originatedBy,
-      deal,
-      trigger,
-      depth,
-      (by, copy, stage, level) =>
-        this.onDealEnteredStage(by, copy, stage, level),
+  ): Promise<TriggerOutcome> {
+    return TriggerService.acting.run({ trigger_id: trigger.id, deal_id: deal.id }, () =>
+      this.actions.executeTrigger(
+        originatedBy,
+        deal,
+        trigger,
+        depth,
+        (by, copy, stage, level) =>
+          this.onDealEnteredStage(by, copy, stage, level),
+      ),
     );
   }
 }

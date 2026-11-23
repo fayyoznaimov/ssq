@@ -220,7 +220,7 @@ const lateWarning = computed(() => (report.value?.summary.in_sla_share ?? 100) <
                 >
                     {{ report?.summary.waiting_now ?? '—' }}
                 </span>
-                <span class="text-sm text-muted-500 dark:text-muted-400">клиент написал последним дольше {{ report?.norm.waiting_hours ?? 2 }} ч назад</span>
+                <span class="text-sm text-muted-500 dark:text-muted-400">клиент написал последним дольше {{ report?.norm.waiting_hours ?? 2 }} ч назад, за любой период</span>
             </BaseCard>
         </div>
 
@@ -230,7 +230,8 @@ const lateWarning = computed(() => (report.value?.summary.in_sla_share ?? 100) <
                     По менеджерам
                 </BaseHeading>
                 <span class="text-sm text-muted-500 dark:text-muted-400">
-                    Время считается в рабочие часы: {{ report?.norm.work_hours ?? '09:00-18:00' }}
+                    Время считается в рабочие часы: {{ report?.norm.work_hours ?? '09:00-18:00' }}.
+                    Ответ — сообщение, письмо или исходящий звонок клиенту
                 </span>
             </div>
             <div class="relative overflow-x-auto">
@@ -245,9 +246,12 @@ const lateWarning = computed(() => (report.value?.summary.in_sla_share ?? 100) <
         </BaseCard>
 
         <BaseCard class="p-6 flex flex-col gap-4">
-            <BaseHeading as="h3" size="md" weight="semibold" lead="tight" class="text-muted-800 dark:text-white">
-                Клиенты ждут ответа
-            </BaseHeading>
+            <div class="flex flex-wrap items-baseline justify-between gap-2">
+                <BaseHeading as="h3" size="md" weight="semibold" lead="tight" class="text-muted-800 dark:text-white">
+                    Клиенты ждут ответа
+                </BaseHeading>
+                <span class="text-sm text-muted-500 dark:text-muted-400">сейчас, не зависит от выбранного периода</span>
+            </div>
             <div v-if="!isLoading && (report?.waiting.length ?? 0) === 0" class="text-sm text-muted-500 dark:text-muted-400">
                 Все клиенты получили ответ.
             </div>

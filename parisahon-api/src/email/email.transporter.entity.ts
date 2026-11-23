@@ -27,6 +27,13 @@ export class EmailTransporter {
   @JoinColumn({ name: 'user_id' })
   created_by: User;
 
+  /**
+   * When the mail server last accepted this address and password (checked on every save). Only a
+   * checked mailbox shows its letters to its owner; one saved before the check existed does not.
+   */
+  @Column({ type: 'timestamp', nullable: true, default: null })
+  verified_at: Date;
+
   @CreateDateColumn()
   created_at: Date;
 }

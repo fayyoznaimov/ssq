@@ -50,7 +50,10 @@ export class ProductController {
     return instanceToPlain(this.productService.fetchById(id));
   }
 
+  // the catalogue is changed by admin and manager, as it is deleted (DELETE below) and as the client
+  // shows it (utils/casl.ts); everybody reads it and picks products in deals
   @Post()
+  @Roles(AuthGuard.MANAGER_LEVEL)
   async createProduct(
     @Body() body: CreateProductDto,
     @Req() request: Request,
@@ -59,6 +62,7 @@ export class ProductController {
   }
 
   @Patch(':id')
+  @Roles(AuthGuard.MANAGER_LEVEL)
   async updateProduct(
     @Body() body: UpdateProductDto,
     @Param('id', ParseIntPipe) id: number,

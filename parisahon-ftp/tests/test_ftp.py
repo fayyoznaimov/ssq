@@ -16,7 +16,7 @@ import unittest
 import warnings
 
 from helpers import CUBE_NAME, SERVICE_DIR, FakeApi, read
-from config import Config
+from config import Config, parse_networks
 from crm import CrmApi
 from forwarder import Forwarder
 from ftpd import make_server
@@ -47,6 +47,9 @@ def free_port_range(count=6):
 
 class FtpCase(unittest.TestCase):
     tls = False
+    tls_required = False
+    plain_networks = None
+    plain_download = True
     auth_cache_sec = 300.0
 
     def setUp(self):
@@ -64,7 +67,8 @@ class FtpCase(unittest.TestCase):
                 self.skipTest("openssl cannot make a certificate")
         self.config = Config(root=os.path.join(self.tmp, "data"), state_dir=os.path.join(self.tmp, "state"), api_url=self.fake.url,
                              service_token=self.fake.service_token, host="127.0.0.1", port=0, passive_ports=free_port_range(),
-                             settle_sec=0.0, scan_sec=0.2, auth_cache_sec=self.auth_cache_sec, tls_cert=cert, tls_key=key)
+                             settle_sec=0.0, scan_sec=0.2, auth_cache_sec=self.auth_cache_sec, tls_cert=cert, tls_key=key,
+                             tls_required=self.tls_required, plain_networks=self.plain_networks, plain_download=self.plain_download)
         self.state = State(self.config.state_db)
         self.api = CrmApi(self.fake.url, self.fake.service_token, timeout=3, upload_timeout=5)
         self.forwarder = Forwarder(self.config, self.state, self.api)
@@ -404,17 +408,113 @@ class TlsTest(FtpCase):
         self.assertIn("AUTH TLS", secure.sendcmd("FEAT"))
         with self.assertLogs("ftp.server", "INFO") as logs:
             secure.login("crm", TOKEN_A)  # ftplib sends AUTH TLS before USER
+            self.wait_for(lambda: logs.output)  # the server thread logs the login a moment after the client has its 230
         self.assertIn("login user=5", logs.output[0])
         self.assertTrue(logs.output[0].endswith(" tls"))
         secure.prot_p()
         secure.storbinary("STOR over tls.wav", io.BytesIO(b"t" * 2000))
         self.assertTrue(self.received(5, "over tls.wav"))
         self.assertEqual(secure.nlst(), ["over tls.wav"])
-        plain = self.login(TOKEN_A)
+        with self.assertLogs("ftp.server", "INFO") as logs:
+            plain = self.login(TOKEN_A)
+            self.wait_for(lambda: logs.output)  # the server thread logs the login a moment after the client has its 230
+        self.assertTrue(logs.output[0].endswith(" plain"), "the log tells which phones still send without TLS")
         plain.storbinary("STOR plain.wav", io.BytesIO(b"p" * 2000))
         self.assertTrue(self.received(5, "plain.wav"))
         self.forwarder.scan_once()
         self.assertEqual(sorted(self.fake.names()), ["over tls.wav", "plain.wav"])
+
+
+class PlainNetworksTest(FtpCase):
+    plain_networks = parse_networks("10.99.0.0/16")
+
+    def test_plain_login_from_outside_is_refused_before_the_password(self):
+        client = self.connect()
+        with self.assertLogs("ftp.server", "WARNING") as logs:
+            with self.assertRaises(ftplib.error_perm) as raised:
+                client.sendcmd("USER crm")
+            self.wait_for(lambda: logs.output)
+        self.assertTrue(str(raised.exception).startswith("550"), str(raised.exception))
+        self.assertIn("login refused ip=127.0.0.1: plain FTP from outside FTP_PLAIN_NETWORKS", logs.output[0])
+        with self.assertRaises(ftplib.error_perm) as raised:
+            client.sendcmd("PASS " + TOKEN_A)
+        self.assertTrue(str(raised.exception).startswith("503"), "no user name was taken: the password is not checked")
+        self.assertEqual(self.fake.recorder_calls, 0, "the token never reached the API")
+        self.assertFalse(os.path.exists(self.home(5)))
+
+
+class PlainNetworkAllowedTest(FtpCase):
+    plain_networks = parse_networks("192.168.1.0/24 127.0.0.0/8")
+
+    def test_plain_login_from_the_office_network(self):
+        client = self.login(TOKEN_A)
+        client.storbinary("STOR a.wav", io.BytesIO(b"a" * 300))
+        self.assertTrue(self.received(5, "a.wav"))
+
+
+class PlainUploadOnlyTest(FtpCase):
+    plain_download = False
+
+    def test_plain_session_uploads_but_cannot_read_back(self):
+        client = self.login(TOKEN_A)
+        client.mkd("calls")
+        client.storbinary("STOR calls/a.wav.tmp", io.BytesIO(b"1234567890"))
+        client.rename("calls/a.wav.tmp", "calls/a.wav")
+        self.assertTrue(client.sendcmd("MFMT 20261121090312 calls/a.wav").startswith("213"))
+        client.voidcmd("TYPE I")
+        client.storbinary("APPE calls/a.wav", io.BytesIO(b"more"))
+        self.assertEqual(client.size("calls/a.wav"), 14)
+        self.assertEqual(client.nlst("calls"), ["a.wav"])
+        with self.assertRaises(ftplib.error_perm) as raised:
+            client.retrbinary("RETR calls/a.wav", lambda chunk: None)
+        self.assertTrue(str(raised.exception).startswith("550"), str(raised.exception))
+        self.assertIn("FTPS", str(raised.exception))
+        client.delete("calls/a.wav")
+        self.assertEqual(client.nlst("calls"), [])
+
+
+@unittest.skipUnless(shutil.which("openssl"), "no openssl")
+class TlsRequiredTest(FtpCase):
+    tls = True
+    tls_required = True
+
+    def test_plain_ftp_is_refused_and_ftps_works(self):
+        plain = self.connect()
+        with self.assertRaises(ftplib.error_perm) as raised:
+            plain.login("crm", TOKEN_A)
+        self.assertTrue(str(raised.exception).startswith("550"), str(raised.exception))
+        self.assertEqual(self.fake.recorder_calls, 0)
+        secure = self.connect(ftplib.FTP_TLS, context=ssl._create_unverified_context())
+        secure.login("crm", TOKEN_A)
+        secure.prot_p()
+        secure.storbinary("STOR over tls.wav", io.BytesIO(b"t" * 2000))
+        self.assertTrue(self.received(5, "over tls.wav"))
+        self.forwarder.scan_once()
+        self.assertEqual(self.fake.names(), ["over tls.wav"])
+
+
+@unittest.skipUnless(shutil.which("openssl"), "no openssl")
+class TlsFromAnywhereTest(FtpCase):
+    tls = True
+    plain_networks = parse_networks("10.99.0.0/16")
+    plain_download = False
+
+    def test_ftps_from_any_network_with_downloads(self):
+        plain = self.connect()
+        with self.assertRaises(ftplib.error_perm) as raised:
+            plain.login("crm", TOKEN_A)
+        self.assertIn("use FTPS", str(raised.exception))
+        secure = self.connect(ftplib.FTP_TLS, context=ssl._create_unverified_context())
+        with self.assertLogs("ftp.server", "INFO") as logs:
+            secure.login("crm", TOKEN_A)
+            self.wait_for(lambda: logs.output)
+        self.assertTrue(logs.output[0].endswith(" tls"), logs.output[0])
+        secure.prot_p()
+        secure.storbinary("STOR a.wav", io.BytesIO(b"x" * 100))
+        self.assertTrue(self.received(5, "a.wav"))
+        chunks = []
+        secure.retrbinary("RETR a.wav", chunks.append)
+        self.assertEqual(b"".join(chunks), b"x" * 100, "over FTPS the sync app may read its files back")
 
 
 class ProcessTest(unittest.TestCase):

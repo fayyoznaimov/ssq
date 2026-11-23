@@ -11,6 +11,12 @@
 <script lang="ts" setup>
 import "moment/dist/locale/ru";
 import "@vuepic/vue-datepicker/dist/main.css";
+
+// The tab says «Сделки — Parisa CRM»; a page without a title of its own is «Parisa CRM»
+const APP_TITLE = "Parisa CRM";
+useHead({
+    titleTemplate: (title) => (title && title !== APP_TITLE ? `${title} — ${APP_TITLE}` : APP_TITLE),
+});
 </script>
 
 <style>

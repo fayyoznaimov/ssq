@@ -12,12 +12,13 @@ import { CallDealService } from './call-deal.service';
 import { CallClientService } from './call-client.service';
 import { CallsController } from './calls.controller';
 import { CallsUploadController } from './calls-upload.controller';
+import { CallHistoryController } from './call-history.controller';
 import { CallsScheduler } from './calls.scheduler';
 
 @Module({
   imports: [TypeOrmModule.forFeature([RecorderToken, CallUpload, Recording, User, Deal]), HelperModule, MessengerModule],
   providers: [CallsService, CallClientService, CallDealService, CallsScheduler],
-  controllers: [CallsController, CallsUploadController],
+  controllers: [CallsController, CallsUploadController, CallHistoryController],
   exports: [CallsService],
 })
 export class CallsModule {}

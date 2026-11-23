@@ -7,6 +7,7 @@ import {
   Body,
   Controller,
   Get,
+  Logger,
   Post,
   Req,
   UnauthorizedException,
@@ -35,7 +36,9 @@ import { parseRecordingName, plausibleCallTime } from './recording-name';
  * service's folder scanner with X-Telegram-Service-Token plus user_id; or the
  * FTP receiver (parisahon-ftp) with X-Calls-Service-Token plus user_id.
  * A recorder that sends nothing but the file (Cube ACR through FTP): the number,
- * the direction and the time of the call are read from the name of the file.
+ * the direction and the time of the call are read from the name of the file;
+ * so is a call whose .json cannot be read (the recording is never refused for it).
+ * Up to CALLS_UPLOAD_MAX_MB (default 200 MB) per file: an hour-long WAV fits.
  * No JWT (@Public): phones have no CRM login.
  *
  * GET /calls/recorder — whose recorder token this is (the FTP receiver checks the
@@ -60,9 +63,14 @@ export class CallsUploadAuthGuard implements CanActivate {
   }
 }
 
+/** Largest audio file POST /calls/upload takes (CALLS_UPLOAD_MAX_MB, default 200; nginx in front has its own limit). */
+export const CALLS_UPLOAD_MAX_BYTES = Math.max(1, Number(process.env.CALLS_UPLOAD_MAX_MB) || 200) * 1024 * 1024;
+
 @Public()
 @Controller('calls')
 export class CallsUploadController {
+  private readonly logger = new Logger(CallsUploadController.name);
+
   constructor(private calls: CallsService) {}
 
   @Get('recorder')
@@ -83,7 +91,7 @@ export class CallsUploadController {
       }),
       // names arrive as UTF-8 bytes read as latin1: "Феруз ↗.amr" must stay readable
       fileFilter: FileService.fixNameEncoding,
-      limits: { fileSize: 50 * 1024 * 1024 },
+      limits: { fileSize: CALLS_UPLOAD_MAX_BYTES },
     }),
   )
   async upload(
@@ -129,18 +137,22 @@ export class CallsUploadController {
     let number: string | null = body.number ?? null;
     let direction: string | null = body.direction ?? null;
     if (metaFile) {
+      // the .json is optional: one that cannot be read is skipped (the name of the file still tells the call),
+      // the recording itself is never refused for it — a refused file is not sent again and would be lost
       try {
         const meta = JSON.parse(await fs.readFile(metaFile.path, 'utf8'));
-        if (duration === null && meta.duration !== undefined) duration = Number(meta.duration);
-        if (!number && meta.callee) number = String(meta.callee);
-        if (!number && meta.number) number = String(meta.number);
-        if (!direction && meta.direction) direction = String(meta.direction);
+        if (meta && typeof meta === 'object') {
+          if (duration === null && meta.duration !== undefined) duration = Number(meta.duration);
+          if (!number && meta.callee) number = String(meta.callee);
+          if (!number && meta.number) number = String(meta.number);
+          if (!direction && meta.direction) direction = String(meta.direction);
+        }
       } catch (error) {
-        await cleanup();
-        throw new BadRequestException(`The meta file is not JSON: ${(error as Error).message}`);
+        this.logger.warn(`call upload of user ${user.id} (${audio.originalname}): the meta file is not JSON, ignored: ${(error as Error).message}`);
       }
       await fs.unlink(metaFile.path).catch(() => undefined);
     }
+    if (direction && !['incoming', 'outgoing'].includes(direction.toLowerCase())) direction = null;
     // what the request did not say is in the name of the file
     const named = parseRecordingName(audio.originalname);
     // a messenger call: the recorder knows the name from the phone book only ("callee":"Textile Trading")

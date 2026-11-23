@@ -7,6 +7,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { DataSource } from 'typeorm';
+import { OnEvent } from '@nestjs/event-emitter';
 import { createHash, randomBytes } from 'node:crypto';
 import { RecognitionService } from '../recognition/recognition.service';
 import { BotAccess, loadStaffUser } from './bot-access';
@@ -15,6 +16,7 @@ import { BotCrmService, CompanyDraft, PendingAction, humanStamp } from './bot-cr
 import { BotSpeechService, SpeechError } from './bot-speech.service';
 import { InlineKeyboard, TelegramApiError, TelegramBotApi, TgCallbackQuery, TgMedia, TgMessage, TgUpdate } from './telegram-bot.api';
 import { AuthUser } from '../auth/auth.guard';
+import { SIGNED_OUT_EVENT, SignedOut } from '../auth/sign-out';
 
 /**
  * Telegram bot of the CRM for the sales team (long polling, no public URL
@@ -168,6 +170,19 @@ export class BotService implements OnApplicationBootstrap, OnApplicationShutdown
     }
   }
 
+  /** A new password or «выйти на всех устройствах» (auth/sign-out.ts) has already removed the link: say why. */
+  @OnEvent(SIGNED_OUT_EVENT)
+  async onSignedOut(signedOut: SignedOut) {
+    for (const chatId of signedOut?.chatIds ?? []) {
+      this.assistant.forget(chatId);
+      await this.send(
+        chatId,
+        'Этот Telegram отключён от CRM: пароль сменён или выполнен выход на всех устройствах. Подключить снова: CRM → Профиль → «Telegram-бот».',
+      ).catch(() => undefined);
+    }
+    if (signedOut?.chatIds?.length) this.logger.log(`CRM user ${signedOut.userId} signed out everywhere: the bot chat is unlinked`);
+  }
+
   private async onStart(msg: TgMessage, code: string | undefined) {
     const chatId = String(msg.chat.id);
     if (!code) {
@@ -183,8 +198,13 @@ export class BotService implements OnApplicationBootstrap, OnApplicationShutdown
     }
     const user = await loadStaffUser(this.dataSource, row.user_id);
     if (!user) return this.send(chatId, 'Этот пользователь CRM удалён или заблокирован.');
+    // the chat the user had linked before (another phone or Telegram account) is replaced
+    const previous: string[] = [];
     await this.dataSource.transaction(async (m) => {
-      await m.query('DELETE FROM bot_account WHERE user_id = $1 OR chat_id = $2', [user.sub, chatId]);
+      const removed = returned(
+        await m.query('DELETE FROM bot_account WHERE user_id = $1 OR chat_id = $2 RETURNING chat_id', [user.sub, chatId]),
+      );
+      for (const old of removed) if (String(old.chat_id) !== chatId) previous.push(String(old.chat_id));
       await m.query('INSERT INTO bot_account (user_id, chat_id, tg_username) VALUES ($1, $2, $3)', [
         user.sub,
         chatId,
@@ -192,7 +212,15 @@ export class BotService implements OnApplicationBootstrap, OnApplicationShutdown
       ]);
     });
     this.assistant.forget(chatId);
-    this.logger.log(`CRM user ${user.sub} linked a Telegram chat`);
+    // ... and is told so: a link made by somebody else with the user's CRM login does not go unnoticed
+    for (const old of previous) {
+      this.assistant.forget(old);
+      await this.send(
+        old,
+        `Этот Telegram отключён от CRM: ${user.username} подключил бота CRM в другом чате. Если это были не вы — смените пароль в CRM.`,
+      ).catch(() => undefined);
+    }
+    this.logger.log(`CRM user ${user.sub} linked a Telegram chat${previous.length ? ' (the previous chat is unlinked)' : ''}`);
     return this.send(chatId, `Готово, вы вошли как ${user.username}.\n\n${this.help}`);
   }
 

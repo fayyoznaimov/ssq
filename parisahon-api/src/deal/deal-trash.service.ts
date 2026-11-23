@@ -121,8 +121,9 @@ export class DealTrashService {
       );
 
       if (defaultStage) {
+        // the stage for new deals is a working one: the deal is open there
         await manager.query(
-          `UPDATE deal SET stage_id = $2, last_stage_change = $3 WHERE id = $1`,
+          `UPDATE deal SET stage_id = $2, last_stage_change = $3, closed_at = NULL WHERE id = $1`,
           [id, defaultStage.id, new Date()],
         );
         await manager.query(

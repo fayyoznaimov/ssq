@@ -2,7 +2,7 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Group } from 'src/group/group.entity';
 import { RoleEnum, User } from 'src/user/user.entity';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { UpsertObjectivesDto } from './dto/create.objective.dto';
 import { HelperService } from 'src/helper/helper.service';
 import { ResultsObjectiveQuery } from './dto/results.objective.dto';
@@ -110,16 +110,21 @@ export class ObjectiveService {
    * summed every non-cancelled deal by creation date, open ones included.
    *
    * Every group and every staff member is listed, with 0 when nothing was
-   * closed, so a plan without a fact is visible too.
+   * closed, so a plan without a fact is visible too. An employee who has left
+   * (deleted account) stays in the group for the periods with their sales: the
+   * group's fact of a past month no longer shrinks when someone leaves. Sales of
+   * staff in no group come as the group "Вне групп" (id null, no plan).
    */
   async fetchObjectiveResults(
     query: ResultsObjectiveQuery,
   ): Promise<Record<string, any>> {
     const period = periodBounds(query);
 
-    // Groups with their staff (contacts of clients are not employees)
+    // Groups with their staff (contacts of clients are not employees); deleted
+    // accounts too, they are dropped below unless they sold in the period
     const groups = await this.groupRepository
       .createQueryBuilder('t0')
+      .withDeleted()
       .leftJoinAndSelect('t0.users', 't1', 't1.role != :ctr_agent', {
         ctr_agent: RoleEnum.CTR_AGENT,
       })
@@ -150,17 +155,21 @@ export class ObjectiveService {
       });
     }
 
-    const result = groups.map((group) => {
-      const users = (group.users ?? []).map((user) => {
-        const fact = factByUser.get(user.id);
-        return {
-          id: user.id,
-          username: user.username,
-          objectives: user.objectives,
-          total_budget: fact ? fact.total_budget : 0,
-          deal_count: fact ? fact.deal_count : 0,
-        };
-      });
+    const row = (user: User) => {
+      const fact = factByUser.get(user.id);
+      return {
+        id: user.id,
+        username: user.username,
+        objectives: user.objectives,
+        total_budget: fact ? fact.total_budget : 0,
+        deal_count: fact ? fact.deal_count : 0,
+        deleted: !!user.deleted_at,
+      };
+    };
+    const listed = (user: User) => !user.deleted_at || factByUser.has(user.id);
+
+    const result: Record<string, any>[] = groups.map((group) => {
+      const users = (group.users ?? []).filter(listed).map(row);
 
       const total_budget = users.reduce((sum, u) => sum + u.total_budget, 0);
 
@@ -174,6 +183,28 @@ export class ObjectiveService {
         users,
       };
     });
+
+    // sales of staff who are in no group: counted too, as a group without a plan
+    const grouped = new Set(groups.flatMap((group) => (group.users ?? []).map((user) => user.id)));
+    const outside = [...factByUser.keys()].filter((id) => !grouped.has(id));
+    if (outside.length) {
+      const people = await this.userRepository.find({
+        where: { id: In(outside) },
+        withDeleted: true,
+        order: { username: 'ASC' },
+      });
+      const users = people.filter((user) => user.role !== RoleEnum.CTR_AGENT).map(row);
+      if (users.length) {
+        result.push({
+          id: null,
+          name: 'Вне групп',
+          objectives: null,
+          objetives: null,
+          total_budget: users.reduce((sum, u) => sum + u.total_budget, 0),
+          users,
+        });
+      }
+    }
 
     return { groups: result };
   }

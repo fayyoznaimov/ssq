@@ -259,6 +259,8 @@ UNION ALL SELECT 'event', count(*) FROM event WHERE after_state::text LIKE '%AUD
 """
 
 ORIGINAL_ACTIVE_COLLECTION = None
+# setting rows (id, default_stage_id) before the run: «Этап для новых сделок» is changed by the run and put back
+ORIGINAL_SETTINGS = None
 
 
 def cleanup():
@@ -276,6 +278,13 @@ def cleanup():
         # never leave an AUDIT collection active
         sql("UPDATE collection SET is_active = (id = %d)" % ORIGINAL_ACTIVE_COLLECTION)
 
+    if ORIGINAL_SETTINGS is not None:
+        # the stage for new deals as it was (PATCH /stages/default and the activation of a collection move it)
+        for setting_id, stage_id in ORIGINAL_SETTINGS:
+            sql("UPDATE setting SET default_stage_id = %s WHERE id = %s" % (stage_id or "NULL", setting_id))
+        known = ",".join(str(setting_id) for setting_id, _ in ORIGINAL_SETTINGS) or "0"
+        sql("DELETE FROM setting WHERE id NOT IN (%s)" % known)
+
     sql(CLEANUP_SQL)
 
 
@@ -286,9 +295,10 @@ def leftovers():
 # --------------------------------------------------------------------------- the run
 
 def main():
-    global TOKEN, ORIGINAL_ACTIVE_COLLECTION
+    global TOKEN, ORIGINAL_ACTIVE_COLLECTION, ORIGINAL_SETTINGS
 
     ORIGINAL_ACTIVE_COLLECTION = int(scalar("SELECT id FROM collection WHERE is_active = true ORDER BY id LIMIT 1"))
+    ORIGINAL_SETTINGS = [(int(row[0]), row[1]) for row in sql("SELECT id, COALESCE(default_stage_id::text, '') FROM setting ORDER BY id")]
     cleanup()
 
     status, body = http("POST", "/auth/login", {"email": "admin@gmail.com", "password": env("ADMIN_PASSWORD")}, auth=False)
@@ -387,6 +397,11 @@ def main():
     check("migration %s is applied" % MIGRATION, count("SELECT count(*) FROM migrations WHERE name = '%s'" % MIGRATION) == 1)
     check("deal.deleted_at column exists", count("SELECT count(*) FROM information_schema.columns WHERE table_name = 'deal' AND column_name = 'deleted_at'") == 1)
     check("deal.display_id has a unique index", count("SELECT count(*) FROM pg_indexes WHERE tablename = 'deal' AND indexdef ILIKE '%UNIQUE%display_id%'") == 1)
+    for name in ("DealClosedAt1795220000000", "DefaultStageActive1795220000100", "CompanyIsOldRestore1795220000200"):
+        check("migration %s is applied" % name, count("SELECT count(*) FROM migrations WHERE name = '%s'" % name) == 1)
+    closing_names = "'%s', '%s'" % (env("DEAL_STAGE_CLOSED"), env("DEAL_STAGE_CLOSED_NOT_REALIZED"))
+    check("closed_at follows the stage: no deal of a working stage is marked closed",
+          count("SELECT count(*) FROM deal d JOIN deal_stage s ON s.id = d.stage_id WHERE d.closed_at IS NOT NULL AND s.name NOT IN (%s)" % closing_names) == 0)
 
     # ================================================================= create
     section("Create deal")
@@ -452,6 +467,15 @@ def main():
     r = form_patch(D, P + "-main", products=[{"product_id": product1, "quantity": 3, "price": 50}, {"product_id": product2, "quantity": 1, "price": 10}])
     rows = products_of(D)
     check("products: update quantity + add second product", r[0] == 200 and len(rows) == 2 and rows[0][0] == before_products[0][0] and rows[0][2] == "3", rows)
+    # the history says which product the quantity is of (it said «quantity: 2 → 3» of no product, DEAL-9)
+    change = []
+    for _ in range(10):  # the history is written by an event listener, right after the answer
+        change = sql("SELECT after_state->'data'->>'subject', after_state->'data'->>'old_value', after_state->'data'->>'new_value' FROM event "
+                     "WHERE deal_id = %d AND after_state->'data'->>'field' = 'quantity' ORDER BY id DESC LIMIT 1" % D)
+        if change:
+            break
+        time.sleep(0.5)
+    check("... the quantity change in the history names the product", change == [[P + "-prod-1", "2", "3"]], change)
     r = form_patch(D, P + "-main", products=[{"product_id": product2, "quantity": 1, "price": 10}])
     rows = products_of(D)
     check("products: a product missing from the list is removed", r[0] == 200 and len(rows) == 1 and int(rows[0][1]) == product2, rows)
@@ -466,6 +490,31 @@ def main():
                    fillers=[{"deal_filler_id": int(df[0][0]), "value": "alpha changed"}])
     check("edit form updates a custom field value",
           r[0] == 200 and scalar("SELECT value FROM deal_filler WHERE id = %s" % df[0][0]) == "alpha changed", r)
+
+    # ================================================================= edit form: the company of the deal
+    section("Edit form: the company of the deal")
+    # the deal form saves the company only when its fields were changed and never sends «Старый клиент»;
+    # it used to send is_old: false (a repeat client became "new") and {company_filler_id, value} (-> 400)
+    sql("UPDATE company SET is_old = true WHERE id = %d" % company_id)
+    cf = int(scalar("SELECT id FROM company_filler WHERE company_id = %d AND filler_id = %d" % (company_id, f_company)))
+    r = http("PATCH", "/companies/%d" % company_id, {
+        "name": P + "-co", "email": "audit-%s@example.com" % RUN, "phone": "+998000000000",
+        "fillers": [{"id": cf, "company_filler_id": cf, "value": "UZ audit"}], "fillers_create": [],
+    })
+    time.sleep(1)
+    check("PATCH /companies/:id with the deal form's payload -> 200, «Старый клиент» is kept",
+          r[0] == 200 and scalar("SELECT is_old FROM company WHERE id = %d" % company_id) == "t", r)
+    check("... and no «is_old» change in the history of the company's deals",
+          count("SELECT count(*) FROM event e JOIN deal d ON d.id = e.deal_id WHERE d.company_id = %d "
+                "AND e.after_state -> 'data' ->> 'field' = 'is_old'" % company_id) == 0)
+    sql("UPDATE company SET is_old = false WHERE id = %d" % company_id)
+    # the company field cleared in the form: company_id: null takes the company off the deal
+    r = create_deal("company-off")
+    off = r[1]["id"] if r[0] == 201 else None
+    r = form_patch(off, P + "-company-off", company_id=None) if off else r
+    check("PATCH {company_id: null} -> the deal has no company", off and r[0] == 200 and deal_row(off)["company"] is None, (r, off and deal_row(off)))
+    if off:
+        http("DELETE", "/deals/%d" % off)
 
     # ================================================================= edit form: errors
     section("Edit form: wrong ids")
@@ -483,6 +532,20 @@ def main():
 
     r = form_patch(D_PLAIN, P + "-nostage", deal_stage_id=stage_closed)
     check("moving to a closing stage through the form sets closed_at", r[0] == 200 and deal_row(D_PLAIN)["closed"], deal_row(D_PLAIN))
+
+    # a deal taken back to work is open again: messages, calls, letters, triggers, the autopilot and
+    # «клиент ждёт» read closed_at IS NULL as open (closed_at used to stay forever)
+    r = http("PATCH", "/deals/%d/stage" % D_PLAIN, {"stage_id": stage_created})
+    check("taken back from a closing stage (kanban) -> closed_at is cleared", r[0] == 200 and not deal_row(D_PLAIN)["closed"], deal_row(D_PLAIN))
+    check("... and the «Закрыты» filter (closed_before) no longer lists it",
+          deal_ids("ids=%d&closed_before=2100-01-01" % D_PLAIN) == [], deal_ids("ids=%d&closed_before=2100-01-01" % D_PLAIN))
+    r = form_patch(D_PLAIN, P + "-nostage", deal_stage_id=stage_closed)
+    check("... closed again through the form -> closed_at is set again", r[0] == 200 and deal_row(D_PLAIN)["closed"], deal_row(D_PLAIN))
+    r = create_deal("born-closed", stage_id=stage_closed)
+    born = r[1]["id"] if r[0] == 201 else None
+    check("a deal created right in a closing stage is closed (closed_at set)", born and deal_row(born)["closed"], r)
+    if born:
+        http("DELETE", "/deals/%d" % born)
 
     # ================================================================= tasks
     section("Tasks (POST /tasks)")
@@ -523,6 +586,24 @@ def main():
           r[0] == 201 and count("SELECT count(*) FROM deal_file WHERE \"dealId\" = %d" % D) == 1, r)
     r = http("POST", "/deals/99999999/comments", {"comment": P + " json comment"})
     check("comment for a missing deal -> 404", r[0] == 404, r)
+
+    # ================================================================= files tab
+    section("Files tab (GET / DELETE /deals/:id/files)")
+    if D_NOCO:
+        for name in ("old", "new"):
+            raw, hdr = multipart({}, [("files", "%s-%s.txt" % (P, name), b"audit " + name.encode())])
+            r = http("POST", "/deals/%d/files" % D_NOCO, raw=raw, headers=hdr)
+            check("upload %s file -> 201" % name, r[0] == 201, r)
+        r = http("GET", "/deals/%d/files?sort[id]=-1&limit=1" % D_NOCO)
+        newest = r[1]["data"][0] if r[0] == 200 and r[1]["data"] else {}
+        check("the files tab asks the newest first, page by page (count of all files)",
+              newest.get("name") == P + "-new.txt" and r[1]["count"] == 2 and newest.get("from") == "uploaded_from_files_tab", r)
+        if newest.get("id"):
+            r = http("DELETE", "/deals/%d/files/%d" % (D_NOCO, newest["id"]))
+            check("DELETE a file of the deal -> 200, the history says who removed which file",
+                  r[0] in (200, 204) and wait_for(lambda: count(
+                      "SELECT count(*) FROM event WHERE deal_id = %d AND user_id = %d AND after_state -> 'data' ->> 'new_value' = '%s-new.txt'"
+                      % (D_NOCO, admin_id, P)), 1) == 1, r)
 
     # ================================================================= filters
     section("Filters (GET /deals)")
@@ -592,15 +673,33 @@ def main():
     check("same query for /deals/stats -> 200", r[0] == 200, r)
 
     section("Task filters / statistics")
+    # "Сделки без задач" = an open deal without an OPEN task (no next step), as on the desktop and in the
+    # autopilot: D_NEXT has only a done task; D_PLAIN is closed (no tasks at all) and does not count
+    r = create_deal("next")
+    D_NEXT = r[1]["id"] if r[0] == 201 else None
+    check("deal with a done task only -> 201", D_NEXT is not None, r)
+    if D_NEXT:
+        live.append(D_NEXT)
+        r = create_task(P + "-task-done", "deal", D_NEXT, now - 5 * hour, now - 4 * hour)
+        done_id = r[1]["id"] if r[0] == 201 else None
+        r = http("PATCH", "/tasks/%s/close" % done_id, {"result": P + " done"}) if done_id else r
+        check("its only task is closed", done_id and r[0] == 200 and count("SELECT count(*) FROM task WHERE id = %d AND closed_at IS NOT NULL" % done_id) == 1, r)
     check("tasks[]=overdue -> deal with an open task in the past", deal_ids(lbl + "&tasks[]=overdue") == [D], deal_ids(lbl + "&tasks[]=overdue"))
-    check("tasks[]=no_task -> deals without tasks", deal_ids(lbl + "&tasks[]=no_task") == [D_PLAIN], deal_ids(lbl + "&tasks[]=no_task"))
+    check("tasks[]=no_task -> open deals without an open task (not the closed deal, not deals with open tasks)",
+          deal_ids(lbl + "&tasks[]=no_task") == [D_NEXT], (deal_ids(lbl + "&tasks[]=no_task"), D_NEXT))
     check("tasks[]=today -> deal with a task around now", D_NOCO in deal_ids(lbl + "&tasks[]=today"), deal_ids(lbl + "&tasks[]=today"))
     r = http("GET", "/deals?" + lbl + "&tasks[]=today&tasks[]=tomorrow&tasks[]=this_week&tasks[]=this_month&tasks[]=this_quarter&tasks[]=overdue&tasks[]=no_task&agent[fillers][0][id]=%d&agent[fillers][0][value]=x" % f_user)
     check("all task filters + agent custom field together -> 200", r[0] == 200, r)
     r = http("GET", "/deals/stats?" + lbl)
     stats = r[1][0] if r[0] == 200 and r[1] else {}
     check("stats: deals_with_overdue_tasks counts deals with open tasks in the past", str(stats.get("deals_with_overdue_tasks")) == "1", stats)
-    check("stats: deals_without_tasks", str(stats.get("deals_without_tasks")) == "1", stats)
+    check("stats: deals_without_tasks = open deals without an open task", str(stats.get("deals_without_tasks")) == "1", stats)
+    # "Задач на сегодня" = open tasks due today (the API's day, Asia/Karachi), not the tasks created today
+    local_now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5)))
+    utc = datetime.timezone.utc
+    due_today = sum(1 for end in (now - 2 * hour, now + hour)  # the open tasks of D and D_NOCO (the done one is not counted)
+                    if end.replace(tzinfo=utc).astimezone(local_now.tzinfo).date() == local_now.date())
+    check("stats: task_count_for_today = open tasks due today (%d)" % due_today, str(stats.get("task_count_for_today")) == str(due_today), stats)
 
     # week range (pure function, checked for fixed dates inside the API container)
     js = (
@@ -667,6 +766,76 @@ def main():
     r = http("GET", "/deals/%d/events?sort[id]=-1&skip=0&limit=50&exclude_event_types[]=%d" % (D, EVENT_NEW_DEAL_STAGE))
     check("deal events: exclude_event_types[] (deal page filter) is applied",
           r[0] == 200 and r[1]["count"] > 0 and all(e["type"] != EVENT_NEW_DEAL_STAGE for e in r[1]["data"]), r)
+
+    # ================================================================= search box, sort by stage, kanban
+    section("Search box (q), sort by stage, kanban board (GET /deals/board)")
+    qs = lambda text: urllib.parse.quote(text, safe="")
+    run_deals = lambda where="TRUE": sorted(int(row[0]) for row in sql(
+        "SELECT d.id FROM deal d WHERE d.label LIKE '%s-%%' AND d.deleted_at IS NULL AND (%s)" % (P, where)))
+    check("q=№<number> -> that deal", deal_ids(lbl + "&q=" + qs("№%s" % D_display)) == [D], deal_ids(lbl + "&q=" + qs("№%s" % D_display)))
+    with_contact = run_deals('EXISTS (SELECT 1 FROM deal_user du WHERE du."dealId" = d.id AND du."userId" = %d)' % contact_id)
+    check("q=<the client's name> -> the deals of that contact",
+          with_contact and deal_ids(lbl + "&limit=100&q=" + qs(P + "-contact")) == with_contact, (deal_ids(lbl + "&limit=100&q=" + qs(P + "-contact")), with_contact))
+    with_company = run_deals("d.company_id = %d" % company_id)
+    check("q=<the company's phone as typed> (+998 00 000-00-00) -> the deals of the company, by digits",
+          with_company and deal_ids(lbl + "&limit=100&q=" + qs("+998 00 000-00-00")) == with_company,
+          (deal_ids(lbl + "&limit=100&q=" + qs("+998 00 000-00-00")), with_company))
+    of_company = run_deals('d.company_id = %d OR EXISTS (SELECT 1 FROM deal_user du JOIN "user" u ON u.id = du."userId" '
+                           'WHERE du."dealId" = d.id AND u.company_id = %d)' % (company_id, company_id))
+    check("q=<the company's name> -> the deals of the company and of its contacts",
+          deal_ids(lbl + "&limit=100&q=" + qs(P + "-co")) == of_company, (deal_ids(lbl + "&limit=100&q=" + qs(P + "-co")), of_company))
+    check("q that matches nothing -> 0", deals_count(lbl + "&q=" + qs("zz-nothing-" + RUN)) == 0)
+
+    r = http("GET", "/deals?" + lbl + "&limit=100&sort[stage]=1")
+    got = [d["id"] for d in r[1]["data"]] if r[0] == 200 else r
+    want = [int(row[0]) for row in sql("SELECT d.id FROM deal d JOIN deal_stage s ON s.id = d.stage_id WHERE d.label LIKE '%s-%%' "
+                                       "AND d.deleted_at IS NULL ORDER BY s.\"order\", s.id, d.id" % P)]
+    check("sort[stage] follows the pipeline (the position of the stage), then the deal id", got == want, (got, want))
+    pages = []
+    for skip in range(len(live)):
+        r = http("GET", "/deals?" + lbl + "&limit=1&skip=%d&sort[budget]=-1" % skip)
+        pages += [d["id"] for d in r[1]["data"]] if r[0] == 200 else [None]
+    check("pages of an equal sort key (budget) neither repeat nor skip deals", sorted(pages) == sorted(live), pages)
+
+    def board(query):
+        r = http("GET", "/deals/board?" + lbl + query)
+        return r if r[0] == 200 else (r[0], {"stages": [], "data": [], "error": r[1]})
+
+    def board_totals(body):
+        return {s["stage_id"]: s["count"] for s in body["stages"]}
+
+    expected = {}
+    for stage_id, n in sql("SELECT stage_id, count(*) FROM deal WHERE label LIKE '%s-%%' AND deleted_at IS NULL GROUP BY stage_id" % P):
+        expected[int(stage_id)] = int(n)
+    r = board("")
+    check("GET /deals/board -> 200, the totals of every column counted over all its deals", r[0] == 200 and board_totals(r[1]) == expected, (r, expected))
+    check("... the cards of the board are this run's deals with the filters applied",
+          r[0] == 200 and sorted(d["id"] for d in r[1]["data"]) == run_deals(), r)
+    budget = scalar("SELECT COALESCE(sum(budget), 0) FROM deal WHERE label LIKE '%s-%%' AND deleted_at IS NULL AND stage_id = %d" % (P, stage_created))
+    column = [s for s in r[1]["stages"] if s["stage_id"] == stage_created] if r[0] == 200 else []
+    check("... the budget of a column is summed by the server", column and float(column[0]["budget"]) == float(budget), (column, budget))
+    in_created = sorted(run_deals("d.stage_id = %d" % stage_created), reverse=True)
+    r = board("&per_stage=1")
+    cards = [d["id"] for d in r[1]["data"] if (d.get("stage") or {}).get("id") == stage_created]
+    check("per_stage=1 -> the newest card of a column, the totals are still of the whole column",
+          len(in_created) >= 2 and cards == in_created[:1] and board_totals(r[1]).get(stage_created) == len(in_created), (cards, in_created))
+    r = board("&per_stage=1&stages=%d&before_id=%d" % (stage_created, in_created[0] if in_created else 0))
+    check("«Показать ещё»: before_id gives the next card of the column", [d["id"] for d in r[1]["data"]] == in_created[1:2], (r, in_created))
+    r = board("&ids=%d" % D)
+    check("ids= -> only that deal (a live update re-reads the changed cards)", [d["id"] for d in r[1]["data"]] == [D], r)
+    # a closing column shows the deals closed lately; older ones are counted in the list only
+    sql("UPDATE deal SET closed_at = now() - interval '40 days' WHERE id = %d" % D_PLAIN)
+    try:
+        r = board("")
+        check("a deal closed 40 days ago is not on the board (closed_days=30)",
+              D_PLAIN not in [d["id"] for d in r[1]["data"]] and board_totals(r[1]).get(stage_closed, 0) == expected.get(stage_closed, 0) - 1, r)
+        r = board("&closed_days=0")
+        check("... closed_days=0 -> every closed deal", D_PLAIN in [d["id"] for d in r[1]["data"]], r)
+        check("... and the list still has it", D_PLAIN in deal_ids(lbl + "&limit=100"), deal_ids(lbl + "&limit=100"))
+    finally:
+        sql("UPDATE deal SET closed_at = now() WHERE id = %d" % D_PLAIN)
+    r = http("GET", "/deals/board?per_stage=500")
+    check("per_stage over 200 -> 400", r[0] == 400, r)
 
     section("Pagination")
     for bad in ("1001", "100000", "0", "-5", "abc", "1.5"):
@@ -772,12 +941,34 @@ def main():
     r = http("DELETE", "/stages/collections/99999999")
     check("delete a missing collection -> 404", r[0] == 404, r)
 
+    # «Этап для новых сделок» (Telegram, WhatsApp, calls, mail, the bot): chosen in «Настроить воронку»
+    section("Stage for new deals (GET / PATCH /stages/default)")
+    r = http("GET", "/stages/default")
+    check("GET /stages/default -> a working stage of the active collection",
+          r[0] == 200 and isinstance(r[1], dict) and scalar("SELECT collection_id FROM deal_stage WHERE id = %d" % r[1]["id"]) == str(ORIGINAL_ACTIVE_COLLECTION)
+          and r[1]["name"] not in (env("DEAL_STAGE_CLOSED"), env("DEAL_STAGE_CLOSED_NOT_REALIZED")), r)
+    r = http("PATCH", "/stages/default", {"stage_id": stage_closed})
+    check("PATCH /stages/default with a closing stage -> 400", r[0] == 400, r)
+    r = http("PATCH", "/stages/default", {"stage_id": stage_y})
+    check("PATCH /stages/default with a stage of an inactive collection -> 400", r[0] == 400, r)
+    r = http("PATCH", "/stages/default", {"stage_id": stage_prepay})
+    check("PATCH /stages/default with a working stage of the active collection -> 200",
+          r[0] == 200 and http("GET", "/stages/default")[1].get("id") == stage_prepay, r)
+    r = create_deal("default-stage", stage_id=None)
+    check("a deal without a stage goes to the chosen stage", r[0] == 201 and (r[1].get("stage") or {}).get("id") == stage_prepay, r)
+    if r[0] == 201:
+        http("DELETE", "/deals/%d" % r[1]["id"])
+
     r = http("POST", "/stages/collections", {"name": P + "-coll-C"})
     coll_c = r[1]["id"]
     try:
         r = http("PATCH", "/stages/collections/%d/activate" % coll_c, {})
         active = sql("SELECT id FROM collection WHERE is_active = true")
         check("activate a collection -> 200, exactly one active", r[0] == 200 and active == [[str(coll_c)]], (r, active))
+        same_name = scalar("SELECT id FROM deal_stage WHERE collection_id = %d AND name = '%s' ORDER BY id LIMIT 1" % (coll_c, env("DEAL_STAGE_PREPAYMENT")))
+        r = http("GET", "/stages/default")
+        check("... the stage for new deals moved to the stage of the same name of the new collection",
+              r[0] == 200 and str((r[1] or {}).get("id")) == same_name, (r, same_name))
         r = http("GET", "/stages")
         check("GET /stages returns stages of the active collection",
               r[0] == 200 and len(r[1]) == 5 and count("SELECT count(*) FROM deal_stage WHERE collection_id = %d" % coll_c) == 5, r)
@@ -791,9 +982,80 @@ def main():
         r = http("PATCH", "/stages/collections/%d/activate" % ORIGINAL_ACTIVE_COLLECTION, {})
     check("re-activate the original collection -> 200, exactly one active",
           r[0] == 200 and sql("SELECT id FROM collection WHERE is_active = true") == [[str(ORIGINAL_ACTIVE_COLLECTION)]], r)
+    r = http("GET", "/stages/default")
+    check("... and the stage for new deals came back to it", r[0] == 200 and (r[1] or {}).get("id") == stage_prepay, r)
     r = http("PATCH", "/stages/collections/99999999/activate", {})
     check("activate a missing collection -> 404 and the active one is kept",
           r[0] == 404 and sql("SELECT id FROM collection WHERE is_active = true") == [[str(ORIGINAL_ACTIVE_COLLECTION)]], r)
+
+    # ================================================================= history feed
+    section("History feed (GET /deals/:id/events)")
+    # newest first by the time of the event: a row written later about an earlier moment stands where it happened
+    e_now = int(scalar("INSERT INTO event (type, deal_id, user_id, after_state) VALUES (5, %d, %d, "
+                       "jsonb_build_object('data', jsonb_build_object('comment', '%s-feed-now', 'files', '[]'::jsonb))) RETURNING id" % (D, admin_id, P)))
+    e_past = int(scalar("INSERT INTO event (type, deal_id, user_id, after_state, created_at) VALUES (5, %d, %d, "
+                        "jsonb_build_object('data', jsonb_build_object('comment', '%s-feed-past', 'files', '[]'::jsonb)), now() - interval '2 days') RETURNING id"
+                        % (D, admin_id, P)))
+    r = http("GET", "/deals/%d/events?sort[id]=-1&skip=0&limit=100" % D)
+    ids = [e["id"] for e in r[1]["data"]] if r[0] == 200 else []
+    check("the feed is newest first by the time of the event, not by id",
+          e_now in ids and e_past in ids and ids.index(e_now) < ids.index(e_past), ids[:10])
+
+    # who did it: a deleted account by its name, marked deleted (it was «—»); a person, not the whole account
+    gone = int(scalar("INSERT INTO \"user\" (username, email, role, deleted_at) VALUES ('%s-gone', 'audit-gone-%s@example.com', 'agent', now()) RETURNING id"
+                      % (P, RUN)))
+    e_gone = int(scalar("INSERT INTO event (type, deal_id, user_id, after_state) VALUES (5, %d, %d, "
+                        "jsonb_build_object('data', jsonb_build_object('comment', '%s-by-gone', 'files', '[]'::jsonb))) RETURNING id" % (D, gone, P)))
+    r = http("GET", "/deals/%d/events?limit=100" % D)
+    rows = {e["id"]: e for e in r[1]["data"]} if r[0] == 200 else {}
+    by_gone = (rows.get(e_gone) or {}).get("originated_by") or {}
+    check("an event of a deleted employee keeps the name, marked deleted", by_gone.get("username") == P + "-gone" and by_gone.get("deleted_at"), by_gone)
+    by_admin = (rows.get(e_now) or {}).get("originated_by") or {}
+    check("the author in the feed is a name, not the account (no rights, e-mail, Telegram id)",
+          by_admin.get("id") == admin_id and not any(k in by_admin for k in ("permissions", "email", "tg_id", "objectives")), by_admin)
+
+    # a task change is a new entry with its author; the entry of the creation stays as it was written
+    t_deal = int(scalar("SELECT id FROM task WHERE label = '%s-task-deal'" % P))
+    first_label = lambda: scalar("SELECT after_state->'data'->>'label' FROM event WHERE type = 6 AND task_id = %d ORDER BY id LIMIT 1" % t_deal)
+    updates = lambda: count("SELECT count(*) FROM event WHERE type = 17 AND task_id = %d" % t_deal)
+    task_body = {"label": P + "-task-deal-renamed", "type_id": task_type_id, "assign_to": {"target": "agent", "id": admin_id},
+                 "link_to": {"target": "deal", "id": D}, "start_time": iso(now - 3 * hour), "end_time": iso(now - 2 * hour), "allDay": False}
+    r = http("PATCH", "/tasks/%d" % t_deal, task_body)
+    check("PATCH /tasks/:id -> a «Задача изменена» entry by the editor",
+          r[0] == 200 and wait_for(updates, 1) == 1
+          and scalar("SELECT user_id FROM event WHERE type = 17 AND task_id = %d" % t_deal) == str(admin_id), (r, updates()))
+    check("... the entry of the creation keeps the text the task was created with", first_label() == P + "-task-deal", first_label())
+    r = http("PATCH", "/tasks/%d" % t_deal, task_body)
+    time.sleep(1)
+    check("... the same PATCH again adds no entry", r[0] == 200 and updates() == 1, updates())
+
+    # a comment edit says so and keeps the earlier text
+    c_id = int(scalar("SELECT id FROM event WHERE deal_id = %d AND type = 5 AND after_state->'data'->>'comment' = '%s json comment'" % (D, P)))
+    r = http("PATCH", "/deals/%d/comments/%d" % (D, c_id), {"comment": P + " json comment edited"})
+    state = sql("SELECT after_state->'data'->>'comment', (after_state->'data'->>'edited_at') IS NOT NULL, "
+                "before_state->'data'->'versions'->0->>'comment' FROM event WHERE id = %d" % c_id)
+    check("a comment edit: the new text, marked edited, the earlier text kept",
+          r[0] == 200 and state == [[P + " json comment edited", "t", P + " json comment"]], (r, state))
+
+    # a message moved to another deal leaves a trace in the deal it left and says where it came from
+    if D_PLAIN:
+        wa = int(scalar("INSERT INTO event (type, deal_id, user_id, outgoing, external_id, after_state) VALUES (16, %d, %d, false, '%s-wa', "
+                        "jsonb_build_object('message', '%s-wa message', 'files', '[]'::jsonb, 'outgoing', false)) RETURNING id"
+                        % (D_PLAIN, contact_id, P, P)))
+        r = http("PATCH", "/deals/events/remap", {"event_id": wa, "replace_with_deal_id": D})
+        trace = sql("SELECT user_id, after_state->'data'->'to_deal'->>'id', after_state->'data'->>'event_id' FROM event WHERE type = 18 AND deal_id = %d" % D_PLAIN)
+        came = scalar("SELECT after_state->'moved'->0->'from_deal'->>'id' FROM event WHERE id = %d AND deal_id = %d" % (wa, D))
+        check("remap: the deal it left keeps a trace (who, where to), the message says where it came from",
+              r[0] == 200 and trace == [[str(admin_id), str(D), str(wa)]] and came == str(D_PLAIN), (r, trace, came))
+
+    # the closing of a task points to the task (a task of a company or a contact is in their feed)
+    if D_NOCO:
+        r = create_task(P + "-task-close", "deal", D_NOCO, now - hour, now + hour)
+        closing = r[1]["id"] if r[0] == 201 else None
+        r = http("PATCH", "/tasks/%d/close" % closing, {"result": P + " closed"}) if closing else r
+        check("the «Задача выполнена» entry points to its task",
+              closing and r[0] == 200
+              and wait_for(lambda: count("SELECT count(*) FROM event WHERE type = 7 AND task_id = %d" % closing), 1) == 1, r)
 
     # ================================================================= delete
     section("Delete deal (soft delete)")

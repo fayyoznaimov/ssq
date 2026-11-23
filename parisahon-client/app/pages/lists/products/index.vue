@@ -29,7 +29,7 @@
                 v-model="name"
                 :classes="{wrapper: 'w-full'}"
                 icon="ph:list-magnifying-glass"
-                placeholder="Поиск"
+                placeholder="Название или артикул"
                 size="lg"
             />
         </div>
@@ -77,6 +77,8 @@ import { useAsync } from '~/composables/useAsync';
 import type { Filler } from '~/types/filler';
 import {type PaginatedResponse} from '~/types/generics';
 import type { Product } from '~/types/product';
+import moment from 'moment';
+
 import {debounce} from '~/utils/search';
 
 definePageMeta({
@@ -110,19 +112,23 @@ const { data: products, run: runProducts, isLoading: productsLoading } = useAsyn
 });
 
 const columns = computed(() => {
-    const out: Column[] = [{
-        label: 'Имя',
-        name: 'name',
-        resizable: true,
-    }];
+    const toCard = (product: Product) => ({name: 'lists-products-id', params: {id: product.id}});
+    const out: Column[] = [
+        { label: 'Имя', name: 'name', resizable: true, sortable: true, link: toCard },
+        { label: 'Артикул', name: 'sku', resizable: true, link: toCard, field: (product: Product) => product.sku ?? '' },
+        { label: 'Ед.', name: 'unit', link: toCard, field: (product: Product) => product.unit ?? '' },
+        // the base price of one unit; empty: not set
+        { label: 'Цена', name: 'price', link: toCard, field: (product: Product) => product.price == null ? '' : Number(product.price).toLocaleString('ru-RU', { maximumFractionDigits: 2 }) },
+    ];
 
     for (let i = 0, len = fillers.value.product?.length || 0; i < len; i++) {
         const filler = fillers.value.product[i];
         out.push({
             label: filler.field,
-            name: 'name',
+            // a column key of its own (every extra field was "name": the same key twice)
+            name: `filler-${filler.id}`,
             resizable: true,
-            field: (product: Product) => product.product_fillers.find((f) => f.filler.id === filler.id)?.value,
+            field: (product: Product) => product.product_fillers?.find((f) => f.filler?.id === filler.id)?.value,
         });
     }
 
@@ -131,18 +137,31 @@ const columns = computed(() => {
     return out;
 });
 
-// `{name}` sent the ref object ("[object Object]") instead of the typed text
-const searchByName = debounce((value: string) => runProducts(productService.find(value ? {name: value} : {}).exec()), 300);
+// The search, the creation date, the page and the sorting go in one request: the search was a request
+// of its own (a page change dropped it), and the date was never sent.
 function fetchProducts() {
-    runProducts(productService.find({
+    const query: Record<string, any> = {
         skip: (currentPage.value - 1) * perPage.value,
         limit: perPage.value,
         sort: sortBy.value,
-    }).exec());
+    };
+    const text = name.value.trim();
+    if (text) query.name = text;
+    // local days (the picker gives UTC moments)
+    if (dateFilter.start) query.created_from = moment(dateFilter.start).format('YYYY-MM-DD');
+    if (dateFilter.end) query.created_till = moment(dateFilter.end).format('YYYY-MM-DD');
+    runProducts(productService.find(query).exec());
 }
 
-watch(name, searchByName);
-watch([currentPage, sortBy, perPage, dateFilter], fetchProducts);
+// a new search or date starts from the first page
+function fromFirstPage() {
+    if (currentPage.value !== 1) currentPage.value = 1;
+    else fetchProducts();
+}
+
+watch(name, debounce(fromFirstPage, 300));
+watch(dateFilter, fromFirstPage);
+watch([currentPage, sortBy, perPage], fetchProducts);
 onMounted(() => {
     fetchProducts();
     runFillers(fillersService.find({target: 'product'}).exec());

@@ -21,8 +21,8 @@ async function search() {
     searching.value = true;
     try {
         const params: Record<string, any> = { limit: 8, sort: { id: -1 } };
-        if (/^\d+$/.test(q)) params.display_id = Number(q);
-        else if (q) params.label = q;
+        // the number, the name, the client's name or phone, the company (GET /deals?q=)
+        if (q) params.q = q;
         const res: any = await dealService.find(params).exec();
         results.value = (res?.data ?? res ?? []).filter((d: Deal) => d.id !== props.dealId);
     } catch {

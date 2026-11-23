@@ -13,6 +13,8 @@ import {
 @Index('IDX_recording_user', ['user'])
 // created by migration 1795130000000-perf-indexes (partial / expression indexes): TypeORM must leave them alone
 @Index('IDX_recording_created', { synchronize: false })
+// the last 9 digits of the number (calls of a company by its phones): migration 1795290000000-call-number-index
+@Index('IDX_recording_number_tail', { synchronize: false })
 @Entity()
 export class Recording {
   @PrimaryGeneratedColumn()

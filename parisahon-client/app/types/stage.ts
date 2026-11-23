@@ -14,6 +14,8 @@ export type Stage = {
     triggers: StageTrigger[];
     color: string;
     collection_id?: number;
+    // GET /stages: a closing stage («успешно реализовано», «закрыто и не реализовано»)
+    is_closing?: boolean;
 }
 
 export type DealFilter = {
@@ -21,6 +23,8 @@ export type DealFilter = {
     is_filler: boolean;
     field: string;
     value: string;
+    // a custom field: its id (the API fills it in; the name may change)
+    filler_id?: number;
 }
 
 export enum TriggerType {
@@ -42,17 +46,25 @@ export enum ApplyWhenType {
     EveryYear = 'every_year',
     TgMessageReceived = 'tg_message_received',
     EmailReceived = 'email_received',
+    WaMessageReceived = 'wa_message_received',
+    CallRecorded = 'call_recorded',
 }
 
-export type ApplyWhen =
+// how often a trigger may act for one deal (not set: the API's default for the action)
+export type ApplyWhenRepeat = { once_per_deal?: boolean; cooldown_minutes?: number }
+
+export type ApplyWhen = (
 |  {when: `${ApplyWhenType.RightAway}`, after_minutes: number}
 |  {when: `${ApplyWhenType.AtExactTime}`, date: string, time: string}
 |  {when: `${ApplyWhenType.EveryDay}`, time: string}
 |  {when: `${ApplyWhenType.EveryWeek}`, time: string, week_day: number}
 |  {when: `${ApplyWhenType.EveryMonth}`, time: string, day: number}
 |  {when: `${ApplyWhenType.EveryYear}`, time: string, day: number, month: number}
-|  {when: `${ApplyWhenType.TgMessageReceived}`, outgoing?: boolean}
-|  {when: `${ApplyWhenType.EmailReceived}`, outgoing?: boolean}
+|  {when: `${ApplyWhenType.TgMessageReceived}`, outgoing?: boolean, from_user_id?: number}
+|  {when: `${ApplyWhenType.EmailReceived}`, outgoing?: boolean, from_user_id?: number}
+|  {when: `${ApplyWhenType.WaMessageReceived}`, outgoing?: boolean, from_user_id?: number}
+|  {when: `${ApplyWhenType.CallRecorded}`, outgoing?: boolean, from_user_id?: number}
+) & ApplyWhenRepeat
 
 export type BaseTrigger = {
     id: number;
@@ -82,6 +94,8 @@ export type CreateTaskData = {
     type_id: number;
     end_time_in_minutes: number;
     all_day: boolean;
+    // «Конец дня»: the end of the working day (end_time_in_minutes is then 0)
+    deadline?: 'end_of_working_day';
     responsible: {
         user?: string;
         exact_user_id?: number;

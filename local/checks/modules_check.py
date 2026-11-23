@@ -181,9 +181,11 @@ DELETE FROM event WHERE deal_id IN (SELECT id FROM _d) OR task_id IN (SELECT id 
    OR (deal_id IS NULL AND (after_state::text LIKE '%AUDIT-%' OR before_state::text LIKE '%AUDIT-%'));
 DELETE FROM bot_reminder WHERE task_id IN (SELECT id FROM _t);
 DELETE FROM task WHERE id IN (SELECT id FROM _t);
+DELETE FROM task_type WHERE name LIKE 'AUDIT-%';
 DELETE FROM deal_stage_record WHERE deal_id IN (SELECT id FROM _d);
 DELETE FROM deal_file WHERE "dealId" IN (SELECT id FROM _d);
 DELETE FROM file WHERE name LIKE 'AUDIT-%';
+DELETE FROM recording WHERE path LIKE 'AUDIT-%';
 DELETE FROM deal_user WHERE "dealId" IN (SELECT id FROM _d) OR "userId" IN (SELECT id FROM _u);
 DELETE FROM deal_product WHERE deal_id IN (SELECT id FROM _d) OR product_id IN (SELECT id FROM _p);
 DELETE FROM deal WHERE id IN (SELECT id FROM _d);
@@ -296,6 +298,73 @@ def main():
           "%s %s" % (status, message_of((status, body))))
     status, body = http("GET", "/companies/999999999/events")
     check("unknown company -> 404", status == 404, status)
+    status, body = http("GET", "/companies/%d/events?limit=25" % company_id)
+    deals_of = sorted((e.get("deal") or {}).get("id") for e in (body or {}).get("data", [])) if status == 200 else []
+    check("the feed says which deal an event is of (two deals in one feed)", deals_of == sorted([deal1, deal2]), deals_of)
+    # a task of the company itself (no deal) is in its feed: it was shown once and gone after a reload
+    status, body = http("POST", "/tasks", {
+        "label": "%s-company-task" % P, "type_id": task_type_id,
+        "assign_to": {"target": "agent", "id": admin_id}, "link_to": {"target": "company", "id": company_id},
+        "start_time": now.strftime("%Y-%m-%dT%H:%M:%S"), "end_time": (now + datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S"),
+        "allDay": False,
+    })
+    check("a task linked to the company -> 201", status == 201, "%s %s" % (status, message_of((status, body))))
+    company_task = body.get("id") if status == 201 and isinstance(body, dict) else None
+
+    def company_feed_has_task():
+        st, bd = http("GET", "/companies/%d/events?limit=25" % company_id)
+        return st == 200 and any(e.get("type") == 6 and (e.get("after_state") or {}).get("data", {}).get("id") == company_task
+                                 for e in (bd or {}).get("data", []))
+    deadline = time.time() + 8
+    seen = company_feed_has_task()
+    while not seen and time.time() < deadline:
+        time.sleep(0.5)
+        seen = company_feed_has_task()
+    check("... and its «Задача поставлена» is in the company feed", company_task and seen, company_task)
+
+    section("Contact feed (GET /users/:id/events, /users/:id/deals)")
+    status, body = http("GET", "/users/%d/events?limit=25" % contact_id, token=agent["token"])
+    comments = [((e.get("after_state") or {}).get("data") or {}).get("comment") for e in (body or {}).get("data", [])] if status == 200 else []
+    check("an agent reads the feed of a contact -> 200 with the events of its deal (was 403 for every contact)",
+          status == 200 and "%s-comment-%d" % (P, deal1) in comments, (status, comments))
+    status, body = http("GET", "/users/%d/deals" % contact_id, token=agent["token"])
+    check("... and the deals of the contact -> 200", status == 200 and any(d.get("id") == deal1 for d in (body or [])), status)
+    status, _ = http("GET", "/users/%d/events" % admin_id, token=agent["token"])
+    check("... but not the history of another employee -> 403", status == 403, status)
+    status, _ = http("GET", "/users/%d/events" % agent["id"], token=agent["token"])
+    check("... their own history -> 200", status == 200, status)
+
+    section("Feeds within the rights: «свои сделки» and the mail switch (ACL-4, MAIL-9)")
+    # deal2 becomes the agent's; a letter in deal1 (not the agent's) and one in deal2
+    sql("UPDATE deal SET agent_id = %d WHERE id = %d" % (agent["id"], deal2))
+    mail_events = [int(scalar(
+        "INSERT INTO event (type, deal_id, user_id, outgoing, after_state) VALUES (9, %d, %d, false, "
+        "jsonb_build_object('data', jsonb_build_object('id', NULL, 'subject', '%s-mail-%d', 'body', '<p>secret</p>', 'outgoing', false, 'to', '[]'::jsonb, 'files', '[]'::jsonb))) RETURNING id"
+        % (deal, contact_id, P, deal))) for deal in (deal1, deal2)]
+    own_deals = dict(permissions, deal=dict(permissions["deal"], view=1), mail=False)
+    sql("UPDATE \"user\" SET permissions = '%s'::jsonb WHERE id = %d" % (json.dumps(own_deals), agent["id"]))
+
+    def feed_of(path):
+        st, bd = http("GET", path, token=agent["token"])
+        return st, {e.get("id"): e for e in (bd or {}).get("data", [])} if st == 200 else {}
+
+    for name, path in (("company", "/companies/%d/events?limit=50" % company_id), ("contact", "/users/%d/events?limit=50" % contact_id)):
+        st, rows = feed_of(path)
+        texts = [((e.get("after_state") or {}).get("data") or {}).get("comment") for e in rows.values()]
+        check("%s feed of an agent with «own deals»: nothing of a colleague's deal (comment, letter)" % name,
+              st == 200 and "%s-comment-%d" % (P, deal1) not in texts and mail_events[0] not in rows, (st, texts, list(rows)[:10]))
+        if name == "company":
+            mine = rows.get(mail_events[1]) or {}
+            check("... their own deal is there; a letter without the mail right: hidden, no subject or text",
+                  "%s-comment-%d" % (P, deal2) in texts and (mine.get("after_state") or {}).get("hidden") is True
+                  and not ((mine.get("after_state") or {}).get("data") or {}).get("subject")
+                  and "secret" not in json.dumps(mine), mine)
+    sql("UPDATE \"user\" SET permissions = '%s'::jsonb WHERE id = %d" % (json.dumps(permissions), agent["id"]))
+    st, rows = feed_of("/companies/%d/events?limit=50" % company_id)
+    check("... with every deal and the mail right: both letters, with their subjects",
+          st == 200 and all(((rows.get(i) or {}).get("after_state") or {}).get("data", {}).get("subject") for i in mail_events), (st, list(rows)[:10]))
+    sql("DELETE FROM event WHERE id IN (%s)" % ",".join(str(i) for i in mail_events))
+    sql("UPDATE deal SET agent_id = NULL WHERE id = %d" % deal2)
 
     section("Source of a contact (GET /companies/:id/agent/:contact/source)")
     status, body = http("GET", "/companies/%d/agent/%d/source" % (company_id, contact_id))
@@ -388,15 +457,27 @@ def main():
     sql("DELETE FROM filler WHERE id IN (%d, %d, %d, %d)" % (f_req_co, f_req_user, f_req_prod, f_req_deal))
 
     # ================================================================= contacts
+    # a local number nobody has (Telegram / WhatsApp / calls compare the last 9 digits): a contact's phone
+    # must be free since the duplicate-phone rule (UserService.assertPhoneIsFree), the QA data has +99890111000x
+    def free_local9():
+        while True:
+            candidate = "77" + "".join(str(secrets.randbelow(10)) for _ in range(7))
+            if not count("SELECT count(*) FROM \"user\" WHERE right(regexp_replace(COALESCE(phone, ''), '[^0-9]', '', 'g'), 9) = '%s'" % candidate):
+                return candidate
+
     section("Primary contact of a company: its phone and email stand in for the company's")
+    prim_phone1 = "+998" + free_local9()
+    prim_phone2 = prim_phone1
+    while prim_phone2 == prim_phone1:
+        prim_phone2 = "+998" + free_local9()
     status, body = http("POST", "/companies", company_payload("%s-co-prim" % P, phone=None, users=[
-        {"username": "%s-prim-1" % P, "email": "audit-mod-prim1-%s@example.test" % RUN, "phone": "+998901110001", "role": "ctr_agent", "fillers": []},
-        {"username": "%s-prim-2" % P, "email": "audit-mod-prim2-%s@example.test" % RUN, "phone": "+998901110002", "role": "ctr_agent", "fillers": []}]))
+        {"username": "%s-prim-1" % P, "email": "audit-mod-prim1-%s@example.test" % RUN, "phone": prim_phone1, "role": "ctr_agent", "fillers": []},
+        {"username": "%s-prim-2" % P, "email": "audit-mod-prim2-%s@example.test" % RUN, "phone": prim_phone2, "role": "ctr_agent", "fillers": []}]))
     check("company created without a phone of its own, with two contacts -> 201", status == 201, "%s %s" % (status, message_of((status, body))))
     co_prim = body["id"] if status == 201 else 0
     row = sql("SELECT phone, email, primary_contact_id = (SELECT id FROM \"user\" WHERE username = '%s-prim-1') FROM company WHERE id = %d" % (P, co_prim))
     check("the first contact is the primary one and lent the company its phone and email",
-          row and row[0] == ["+998901110001", "audit-mod-prim1-%s@example.test" % RUN, "t"], row)
+          row and row[0] == [prim_phone1, "audit-mod-prim1-%s@example.test" % RUN, "t"], row)
     status, body = http("GET", "/companies/%d" % co_prim)
     prim2 = int(scalar("SELECT id FROM \"user\" WHERE username = '%s-prim-2'" % P))
     check("GET /companies/:id shows primary_contact_id", status == 200 and body.get("primary_contact_id") == int(scalar("SELECT id FROM \"user\" WHERE username = '%s-prim-1'" % P)), body.get("primary_contact_id") if status == 200 else status)
@@ -406,12 +487,12 @@ def main():
     sql("UPDATE company SET phone = NULL, email = NULL WHERE id = %d" % co_prim)
     status, body = http("GET", "/companies/%d" % co_prim)
     check("with an empty phone of its own the company shows the new primary contact's phone and says so",
-          status == 200 and body.get("primary_contact_id") == prim2 and body.get("phone") == "+998901110002" and body.get("phone_from_contact") == "%s-prim-2" % P, (status, body.get("phone"), body.get("phone_from_contact")))
+          status == 200 and body.get("primary_contact_id") == prim2 and body.get("phone") == prim_phone2 and body.get("phone_from_contact") == "%s-prim-2" % P, (status, body.get("phone"), body.get("phone_from_contact")))
     status, body = http("PATCH", "/companies/%d" % co_prim, {"name": "%s-co-prim" % P, "is_old": False, "fillers": [], "fillers_create": [], "users": [], "primary_contact_id": contact_id})
     check("a contact of another company cannot be the primary one -> 400", status == 400, status)
     status, body = http("GET", "/companies?limit=100&name=%s-co-prim" % P)
     listed = next((c for c in (body.get("data") or []) if c.get("id") == co_prim), None) if status == 200 else None
-    check("the companies list shows the contact's phone too", listed and listed.get("phone") == "+998901110002", listed and listed.get("phone"))
+    check("the companies list shows the contact's phone too", listed and listed.get("phone") == prim_phone2, listed and listed.get("phone"))
 
     section("Contacts list (GET /contacts)")
     status, body = http("GET", "/contacts?name=%s&limit=50" % P)
@@ -454,6 +535,177 @@ def main():
     status, body = http("GET", "/contacts?name=%s&limit=50" % P)
     check("GET /contacts still 200 after the edit", status == 200, status)
 
+    # ================================================================= companies, contacts, staff (AUDIT people)
+    section("Companies, contacts and staff: the card, the lists and the rights (CO-1..CO-14, ACL-2..ACL-18)")
+    local9 = free_local9()
+    local_text = "%s %s %s %s" % (local9[:2], local9[2:5], local9[5:7], local9[7:])
+
+    # CO-1: a contact as Telegram makes it (no company, no e-mail) is saved from its card
+    channel_contact = int(scalar("INSERT INTO \"user\" (username, role) VALUES ('%s-tg-contact', 'ctr_agent') RETURNING id" % P))
+    status, body = http("PATCH", "/users/%d" % channel_contact, {
+        "username": "%s-tg-contact" % P, "role": "ctr_agent", "email": "", "phone": local_text,
+        "fillers": [], "fillers_create": list(prod_required_user)})
+    check("CO-1: a contact without company and e-mail is saved from its card (\"\" e-mail, local phone) -> 200",
+          status in (200, 201), "%s %s" % (status, message_of((status, body))))
+    row = sql("SELECT phone, email IS NULL, company_id IS NULL FROM \"user\" WHERE id = %d" % channel_contact)
+    check("CO-6: the local phone is stored as +998..., the e-mail stays empty, no company",
+          row and row[0] == ["+998" + local9, "t", "t"], row)
+
+    # CO-6: the same number typed another way is the same client
+    status, body = http("POST", "/companies", company_payload("%s-co-dup-phone" % P, users=[
+        {"username": "%s-dup-phone" % P, "phone": "+998 %s" % local_text, "role": "ctr_agent", "fillers": []}]))
+    check("CO-6: a company whose new contact has a taken phone (another format) -> 400, nothing created",
+          status == 400 and count("SELECT count(*) FROM company WHERE name = '%s-co-dup-phone'" % P) == 0,
+          "%s %s" % (status, message_of((status, body))))
+
+    # CO-14: attaching a contact to a company: its deals without a company follow, the move is logged
+    channel_deal = new_deal("%s-deal-channel" % P, company="NULL")
+    sql('INSERT INTO deal_user ("dealId", "userId") VALUES (%d, %d)' % (channel_deal, channel_contact))
+    status, body = http("PATCH", "/users/%d" % channel_contact, {
+        "username": "%s-tg-contact" % P, "role": "ctr_agent", "company_id": company_empty, "fillers": [], "fillers_create": []})
+    check("CO-14: the contact is attached to a company -> 200", status in (200, 201), "%s %s" % (status, message_of((status, body))))
+    check("... its deal without a company now belongs to that company",
+          count("SELECT count(*) FROM deal WHERE id = %d AND company_id = %d" % (channel_deal, company_empty)) == 1)
+    for _ in range(10):  # the history is written by an event listener
+        if count("SELECT count(*) FROM event WHERE deal_id = %d AND after_state::text LIKE '%%%s-co-empty%%'" % (channel_deal, P)):
+            break
+        time.sleep(0.5)
+    check("... and the move is in the deal's history",
+          count("SELECT count(*) FROM event WHERE deal_id = %d AND after_state::text LIKE '%%%s-co-empty%%'" % (channel_deal, P)) >= 1)
+
+    # CO-2 / ACL-9: custom field values are matched by the field and only the record's own values change
+    f_co = int(scalar("INSERT INTO filler (target, field) VALUES ('company', '%s-код') RETURNING id" % P))
+    own_value = int(scalar("INSERT INTO company_filler (company_id, filler_id, value) VALUES (%d, %d, 'K-1') RETURNING id" % (company_id, f_co)))
+    other_value = int(scalar("INSERT INTO company_filler (company_id, filler_id, value) VALUES (%d, %d, 'K-2') RETURNING id" % (company_empty, f_co)))
+    status, body = http("GET", "/companies/%d" % company_id)
+    card_fillers = (body or {}).get("fillers", []) if status == 200 else []
+    card_users = (body or {}).get("users", []) if status == 200 else []
+    check("CO-2: the card gives each value with its field (filler_id), for the company and its contacts",
+          any(f.get("id") == own_value and f.get("filler_id") == f_co for f in card_fillers)
+          and any(f.get("id") == uf_id and f.get("filler_id") == f_user for u in card_users for f in u.get("fillers", [])),
+          (card_fillers, card_users))
+    status, body = http("PATCH", "/companies/%d" % company_id, {"fillers": [{"id": other_value, "value": "hacked"}]})
+    check("ACL-9: a value id of ANOTHER company -> 400, that value is untouched",
+          status == 400 and scalar("SELECT value FROM company_filler WHERE id = %d" % other_value) == "K-2",
+          "%s %s" % (status, message_of((status, body))))
+    status, body = http("PATCH", "/companies/%d" % company_id, {"fillers": [{"filler_id": f_co, "value": "K-1 new"}]})
+    check("CO-2: a field set by its definition changes the company's own value only",
+          status == 200 and scalar("SELECT value FROM company_filler WHERE id = %d" % own_value) == "K-1 new"
+          and scalar("SELECT value FROM company_filler WHERE id = %d" % other_value) == "K-2",
+          "%s %s" % (status, message_of((status, body))))
+    other_uf = int(scalar("INSERT INTO user_filler (user_id, filler_id, value) VALUES (%d, %d, 'Бухгалтер') RETURNING id" % (channel_contact, f_user)))
+    status, body = http("PATCH", "/users/%d" % contact_id, {
+        "username": "%s-contact Иванов" % P, "role": "ctr_agent", "fillers": [{"user_filler_id": other_uf, "value": "hacked"}]})
+    check("ACL-9: a contact value id of ANOTHER contact -> 400, untouched",
+          status == 400 and scalar("SELECT value FROM user_filler WHERE id = %d" % other_uf) == "Бухгалтер",
+          "%s %s" % (status, message_of((status, body))))
+
+    # CO-3: contacts are added and detached in the company card; a contact without e-mail does not block it
+    status, body = http("PATCH", "/companies/%d" % company_empty, {"users": [
+        {"id": channel_contact, "username": "%s-tg-contact" % P, "email": None, "phone": "+998" + local9, "fillers": []},
+        {"username": "%s-card-new" % P, "email": "", "phone": "", "fillers": list(prod_required_user)}]})
+    new_card_contact = int(scalar("SELECT COALESCE(max(id), 0) FROM \"user\" WHERE username = '%s-card-new' AND company_id = %d" % (P, company_empty)))
+    check("CO-3: PATCH company with a contact without e-mail and a NEW contact -> 200, the contact is created",
+          status == 200 and new_card_contact > 0, "%s %s" % (status, message_of((status, body))))
+    status, body = http("PATCH", "/companies/%d" % company_empty, {"users": [
+        {"id": contact_id, "username": "%s-contact Иванов" % P, "fillers": []}]})
+    check("ACL-12: a contact of ANOTHER company cannot be rewritten through this card -> 400",
+          status == 400 and count("SELECT count(*) FROM \"user\" WHERE id = %d AND company_id = %d" % (contact_id, company_id)) == 1,
+          "%s %s" % (status, message_of((status, body))))
+    status, body = http("PATCH", "/companies/%d" % company_empty, {"removed_user_ids": [new_card_contact]})
+    check("CO-3: removed_user_ids detaches the contact (it stays in the CRM without a company)",
+          status == 200 and count("SELECT count(*) FROM \"user\" WHERE id = %d AND company_id IS NULL AND deleted_at IS NULL" % new_card_contact) == 1,
+          "%s %s" % (status, message_of((status, body))))
+
+    # CO-9 / CO-4: one search box and the «Без сделок» filter
+    status, body = http("GET", "/companies?limit=100&q=%s" % urllib.parse.quote("%s-contact Иванов" % P))
+    check("CO-9: the companies list finds a company by its contact's name (q)",
+          status == 200 and any(c.get("id") == company_id for c in body.get("data", [])), "%s %s" % (status, message_of((status, body))))
+    status, body = http("GET", "/companies?limit=100&q=%s&no_deals=true" % P)
+    ids = [c.get("id") for c in (body or {}).get("data", [])] if status == 200 else []
+    check("CO-9: no_deals=true lists companies without deals only (was 400)",
+          status == 200 and company_id not in ids, "%s %s" % (status, message_of((status, body))))
+    status, body = http("GET", "/contacts?q=%s&role=ctr_agent&limit=50" % local9)
+    check("CO-4: the contacts list finds a contact by the phone digits (q) without choosing a field",
+          status == 200 and any(r["id"] == channel_contact for r in body.get("data", [])), "%s %s" % (status, message_of((status, body))))
+    status, body = http("GET", "/contacts?name=%s&role=ctr_agent&limit=50" % P)
+    data = (body or {}).get("data", []) if status == 200 else []
+    check("CO-4: role=ctr_agent lists contacts with and without a company, no companies",
+          status == 200 and data and all(r["type"] == "ctr_agent" for r in data) and any(r["id"] == new_card_contact for r in data),
+          "%s %s" % (status, [(r["type"], r["id"]) for r in data]))
+
+    # CO-11 / CALL-3: the «Звонки» and «Файлы» tabs of the company
+    rec_path = "%s-call.mp3" % P
+    sql("INSERT INTO recording (duration, user_id, outgoing, path, from_number) VALUES (42, %d, false, '%s', '+998900000001')" % (admin_id, rec_path))
+    status, body = http("GET", "/companies/%d/sources?limit=50" % company_id)
+    check("CO-11: GET /companies/:id/sources -> 200 with the files of the company's deals",
+          status == 200 and any(f.get("path") == "uploads/%s-file.txt" % P for f in body.get("files", [])), "%s %s" % (status, message_of((status, body))))
+    check("CALL-3: ... and the call made from the contact's phone (the tab was always empty)",
+          status == 200 and any(r.get("path") == rec_path for r in body.get("recordings", [])), (body or {}).get("recordings") if status == 200 else status)
+    sql("DELETE FROM recording WHERE path = '%s'" % rec_path)
+
+    # CO-8: a deleted company can be found and restored; its name can be used again
+    trash_co = int(scalar("INSERT INTO company (name, is_old, created_by) VALUES ('%s-co-trash', false, %d) RETURNING id" % (P, admin_id)))
+    http("DELETE", "/companies/%d" % trash_co)
+    status, body = http("GET", "/companies/trash?q=%s-co-trash&limit=50" % P)
+    check("CO-8: the deleted company is in GET /companies/trash",
+          status == 200 and any(c.get("id") == trash_co for c in body.get("data", [])), "%s %s" % (status, message_of((status, body))))
+    status, body = http("PATCH", "/companies/%d/restore" % trash_co, {})
+    check("CO-8: PATCH /companies/:id/restore brings it back",
+          status == 200 and count("SELECT count(*) FROM company WHERE id = %d AND deleted_at IS NULL" % trash_co) == 1,
+          "%s %s" % (status, message_of((status, body))))
+    sql("UPDATE company SET deleted_at = now() WHERE id = %d" % trash_co)
+    status, body = http("POST", "/companies", company_payload("%s-co-trash" % P))
+    check("CO-8: the name of a deleted company can be given to a new one (was 'already exists')",
+          status == 201, "%s %s" % (status, message_of((status, body))))
+    status, body = http("GET", "/fillers/%d/usage" % f_co)
+    check("CO-8: GET /fillers/:id/usage counts the values a deleted field would take with it",
+          status == 200 and isinstance(body, dict) and body.get("values") == 2, "%s %s" % (status, body))
+
+    # CO-13: a rename to a taken name is a 400, not a 500
+    status, body = http("PATCH", "/companies/%d" % company_empty, {"name": "%s-co" % P})
+    check("CO-13: renaming to the name of another company -> 400 (was 500)", status == 400, "%s %s" % (status, message_of((status, body))))
+
+    # ACL-6 / TASK-17: the staff list of the pickers
+    status, body = http("GET", "/users/staff", token=agent["token"])
+    staff = (body or {}).get("data", []) if status == 200 else []
+    check("ACL-6: GET /users/staff -> staff accounts only, the new agent included, no contacts",
+          status == 200 and any(u.get("id") == agent["id"] for u in staff) and all(u.get("role") != "ctr_agent" for u in staff),
+          "%s %s" % (status, message_of((status, body))))
+
+    # CO-10 / ACL-7 / ACL-12: the lists and the creation of contacts follow the rights
+    limited = dict(permissions, company=dict(permissions["company"], view=1),
+                   contact=dict(permissions["contact"], view=1, create=0))
+    sql("UPDATE \"user\" SET permissions = '%s'::jsonb WHERE id = %d" % (json.dumps(limited), agent["id"]))
+    status, body = http("GET", "/companies?limit=100&q=%s" % P, token=agent["token"])
+    check("CO-10: «own» company view: GET /companies does not list a colleague's company",
+          status == 200 and all(c.get("id") != company_id for c in body.get("data", [])), "%s %s" % (status, message_of((status, body))))
+    status, body = http("GET", "/contacts?name=%s&limit=50" % P, token=agent["token"])
+    check("ACL-7: «own» contact view: GET /contacts does not list a colleague's contact",
+          status == 200 and all(not (r["type"] == "ctr_agent" and r["id"] == contact_id) for r in body.get("data", [])),
+          "%s %s" % (status, message_of((status, body))))
+    status, body = http("POST", "/users", {"username": "%s-no-right" % P, "role": "ctr_agent"}, token=agent["token"])
+    check("ACL-12: no «Создание контактов»: POST /users (a contact) -> 403", status == 403, "%s %s" % (status, message_of((status, body))))
+    status, body = http("POST", "/companies", company_payload("%s-co-no-right" % P, users=[
+        {"username": "%s-no-right" % P, "role": "ctr_agent", "fillers": []}]), token=agent["token"])
+    check("ACL-12: ... nor through a new company with contacts -> 403", status == 403, "%s %s" % (status, message_of((status, body))))
+    sql("UPDATE \"user\" SET permissions = '%s'::jsonb WHERE id = %d" % (json.dumps(permissions), agent["id"]))
+
+    # ACL-18: one's own name and phone
+    status, body = http("PATCH", "/users/me", {"username": "%s-agent" % P, "phone": local_text}, token=agent["token"])
+    check("ACL-18: PATCH /users/me changes one's own phone (stored as +998...)",
+          status == 200 and scalar("SELECT phone FROM \"user\" WHERE id = %d" % agent["id"]) == "+998" + local9,
+          "%s %s" % (status, message_of((status, body))))
+    status, body = http("PATCH", "/users/me", {"username": "%s-agent" % P, "phone": ""}, token=agent["token"])
+    check("ACL-18: ... and \"\" clears it", status == 200 and scalar("SELECT phone FROM \"user\" WHERE id = %d" % agent["id"]) in (None, ""), status)
+
+    # CO-12: a product has an article, a unit and a price with kopecks
+    prod_required_product = [{"filler_id": int(r[0]), "value": "x"} for r in sql("SELECT id FROM filler WHERE target = 'product' AND is_required AND field NOT LIKE 'AUDIT-%'")]
+    status, body = http("POST", "/products", {"name": "%s-prod-price" % P, "sku": "AUD-1", "unit": "м", "price": "12,50", "fillers": prod_required_product})
+    check("CO-12: a product with an article, a unit and the price 12,50 -> 201",
+          status == 201 and scalar("SELECT price::text || '/' || sku || '/' || unit FROM product WHERE name = '%s-prod-price'" % P) == "12.50/AUD-1/м",
+          "%s %s" % (status, message_of((status, body))))
+
     # ================================================================= products
     section("Products")
     status, body = http("GET", "/products?name=Пижам&limit=50")
@@ -461,7 +713,7 @@ def main():
           status == 200 and any(p["id"] == product_id for p in body.get("data", [])), "%s %s" % (status, message_of((status, body))))
     products_vue = client_file(os.path.join("pages", "lists", "products", "index.vue"))
     check("client: the products search sends the typed text, not the ref object",
-          "productService.find({name})" not in products_vue and "{name: value}" in products_vue)
+          "productService.find({name})" not in products_vue and "query.name = text" in products_vue)
 
     for key in ("deal_count", "total_price_sold", "average_price_per_product", "average_quantity_per_deal"):
         status, body = http("GET", "/products/statistics?sort[%s]=-1&limit=50" % key)
@@ -474,6 +726,146 @@ def main():
     check("sorting by a column that is not allowed -> 400", status == 400, status)
     analytics_vue = client_file(os.path.join("pages", "analytics", "products", "index.vue"))
     check("client: products analytics shows no random demo numbers", "Math.random" not in analytics_vue and "mockData" not in analytics_vue)
+
+    # ================================================================= tasks
+    section("Tasks (GET/POST/PATCH /tasks, task types, linkables)")
+    hour = datetime.timedelta(hours=1)
+
+    def iso(dt):
+        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+    def new_task(label, link, assignee=None, token=None, **extra):
+        body = {"label": label, "assign_to": {"target": "agent", "id": assignee or admin_id}, "link_to": link,
+                "start_time": iso(now + 24 * hour), "end_time": iso(now + 25 * hour), "allDay": False}
+        body.update(extra)
+        st, bd = http("POST", "/tasks", body, token=token)
+        return st, (bd.get("id") if st == 201 and isinstance(bd, dict) else None), bd
+
+    # TASK-1: a task without a type gets the default one
+    status, t_notype, body = new_task("%s-task-notype" % P, {"target": "deal", "id": deal1})
+    check("POST /tasks without type_id -> 201, the task gets a type (a typeless task broke the board and the deal history)",
+          t_notype and scalar("SELECT type_id IS NOT NULL FROM task WHERE id = %d" % t_notype) == "t",
+          "%s %s" % (status, message_of((status, body))))
+    # ... and the client never reads the type of a task without a guard (a null type blanked the deal history)
+    unguarded = [name for name in (os.path.join("components", "task", "TaskColumn.vue"),
+                                   os.path.join("components", "common", "EventsList.vue"),
+                                   os.path.join("components", "common", "DealActionsNav.vue"),
+                                   os.path.join("pages", "tasks", "calendar.vue"),
+                                   os.path.join("pages", "tasks", "index.vue"))
+                 # a line that tests type?. first is guarded (if (task.type?.id) payload.type_id = task.type.id)
+                 if any(re.search(r"(task|data|item)\.type\.(name|id)\b", line) and "type?." not in line
+                        for line in client_file(name).splitlines())]
+    check("client: the task board, calendar and deal history read task.type?.name (a typeless task is shown as 'Задача')",
+          not unguarded, unguarded)
+
+    # TASK-2: an automatic task names the deal and its company; a move keeps both
+    t_auto = int(scalar(
+        "INSERT INTO task (label, start_time, end_time, type_id, agent_id, \"createdById\", deal_id, company_id) "
+        "VALUES ('%s-task-auto', '%s', '%s', %d, %d, %d, %d, %d) RETURNING id"
+        % (P, ts(now + 24 * hour), ts(now + 25 * hour), task_type_id, admin_id, admin_id, deal1, company_id)))
+    sql("INSERT INTO bot_reminder (task_id) VALUES (%d)" % t_auto)
+    status, body = http("PATCH", "/tasks/%d" % t_auto, {"label": "%s-task-auto renamed" % P})
+    check("PATCH with the label only -> 200, the bot's 'reminded' mark stays (same time, same person)",
+          status == 200 and count("SELECT count(*) FROM bot_reminder WHERE task_id = %d" % t_auto) == 1,
+          "%s %s" % (status, message_of((status, body))))
+    status, body = http("PATCH", "/tasks/%d" % t_auto, {"start_time": iso(now + 48 * hour), "end_time": iso(now + 49 * hour), "allDay": False})
+    row = sql("SELECT deal_id, company_id, type_id, label FROM task WHERE id = %d" % t_auto)
+    check("a drag (times only) -> 200 and the task keeps its deal, company, type and text",
+          status == 200 and row and row[0][:3] == [str(deal1), str(company_id), str(task_type_id)] and row[0][3].endswith("renamed"),
+          (status, message_of((status, body)), row))
+    check("... moved: the bot reminds again (the 'reminded' mark is removed)",
+          count("SELECT count(*) FROM bot_reminder WHERE task_id = %d" % t_auto) == 0)
+    # an older client sends everything, the company first
+    status, body = http("PATCH", "/tasks/%d" % t_auto, {
+        "label": "%s-task-auto" % P, "type_id": task_type_id, "assign_to": {"target": "agent", "id": admin_id},
+        "link_to": {"target": "company", "id": company_id},
+        "start_time": iso(now + 48 * hour), "end_time": iso(now + 49 * hour), "allDay": False})
+    check("an old client's full PATCH with the deal's company -> the deal stays linked (it used to be dropped)",
+          status == 200 and scalar("SELECT deal_id FROM task WHERE id = %d" % t_auto) == str(deal1), (status, message_of((status, body))))
+    status, body = http("PATCH", "/tasks/%d" % t_auto, {"link_to": {"target": "deal", "id": deal2}})
+    check("a new link really moves the task (deal 2)",
+          status == 200 and scalar("SELECT deal_id FROM task WHERE id = %d" % t_auto) == str(deal2), (status, message_of((status, body))))
+
+    # TASK-11: a day without a time is an all-day task of that local day, not a task at 05:00
+    today = now.strftime("%Y-%m-%d")
+    status, t_day, body = new_task("%s-task-day" % P, {"target": "deal", "id": deal1}, start_time=today, end_time=today, type_id=task_type_id)
+    row = sql("SELECT \"allDay\", to_char(start_time, 'YYYY-MM-DD HH24:MI'), to_char(end_time, 'YYYY-MM-DD HH24:MI') FROM task WHERE id = %d" % (t_day or 0))
+    check("POST /tasks with a plain date -> an all-day task 00:00-23:59 of that day (was 05:00 = UTC midnight)",
+          row == [["t", today + " 00:00", today + " 23:59"]], (status, message_of((status, body)), row))
+    client_scheduler = client_file(os.path.join("components", "common", "EventSchedulerSingle.vue"))
+    check("client: the task form posts 'allDay' (the forms read allDay; 'all_day' was never saved)",
+          'name="allDay"' in client_scheduler and 'name="all_day"' not in client_scheduler)
+
+    # TASK-9: "Мои", every status, the client's tasks
+    status, t_agent, body = new_task("%s-task-of-agent" % P, {"target": "deal", "id": deal1}, assignee=agent["id"], type_id=task_type_id)
+    status, body = http("GET", "/tasks?mine=true&limit=1000", token=agent["token"])
+    mine = [t["id"] for t in (body or {}).get("data", [])] if status == 200 else None
+    check("GET /tasks?mine=true -> the caller's tasks only", mine is not None and t_agent in mine and t_notype not in mine, mine)
+    status, body = http("PATCH", "/tasks/%d/close" % t_agent, {"result": "done"}, token=agent["token"])
+    check("the agent closes their task -> 200", status == 200, "%s %s" % (status, message_of((status, body))))
+    status, body = http("GET", "/tasks?deal_id=%d&limit=1000" % deal1)
+    open_ids = [t["id"] for t in (body or {}).get("data", [])] if status == 200 else []
+    status, body = http("GET", "/tasks?deal_id=%d&type=all&limit=1000" % deal1)
+    all_ids = [t["id"] for t in (body or {}).get("data", [])] if status == 200 else []
+    check("without a status: open tasks; type=all: closed ones too ('Все статусы' showed only open ones)",
+          t_agent not in open_ids and t_agent in all_ids and t_notype in open_ids, (open_ids, all_ids))
+    status, body = http("GET", "/tasks?company_id=%d&type=all&limit=1000" % company_id)
+    of_company = [t["id"] for t in (body or {}).get("data", [])] if status == 200 else []
+    check("GET /tasks?company_id -> tasks of the company and of its deals", status == 200 and t_notype in of_company and t_agent in of_company,
+          (status, of_company))
+    # the closed task of the agent would change the agent's desktop numbers below
+    if t_agent:
+        sql("DELETE FROM event WHERE task_id = %d; DELETE FROM task WHERE id = %d" % (t_agent, t_agent))
+    status, body = http("GET", "/tasks?sort[end_time]=1&limit=5")
+    check("the list sorts by the deadline (sort[end_time]) -> 200", status == 200, "%s %s" % (status, message_of((status, body))))
+
+    # TASK-3: an agent with "own" rights does not read or link other people's deals through tasks
+    own = {"view": 1, "create": 3, "update": 1, "delete": 1, "export": 0}
+    agent2 = {"email": "audit-mod-agent2-%s@example.test" % RUN, "password": secrets.token_urlsafe(12)}
+    status, body = http("POST", "/users", {
+        "email": agent2["email"], "password": agent2["password"], "username": "%s-agent2" % P, "role": "agent", "group_id": group_id,
+        "permissions": {"deal": own, "contact": own, "company": own, "task": {"update": 1, "delete": 1}, "mail": False, "file": False},
+    })
+    if status != 201 or not isinstance(body, dict):
+        raise SystemExit("cannot create the second test agent: %s %s" % (status, body))
+    agent2["id"] = body["id"]
+    agent2["token"] = login(agent2["email"], agent2["password"])
+    status, _ = http("GET", "/tasks/%d" % t_notype, token=agent2["token"])
+    check("own rights: GET /tasks/:id of a task on someone else's deal -> 404", status == 404, status)
+    status, body = http("GET", "/tasks?deal_id=%d&limit=1000" % deal1, token=agent2["token"])
+    check("own rights: GET /tasks does not list the tasks of someone else's deal (label, budget, requisites)",
+          status == 200 and body.get("count") == 0, (status, (body or {}).get("count")))
+    status, _, body = new_task("%s-task-foreign" % P, {"target": "deal", "id": deal1}, assignee=agent2["id"], token=agent2["token"], type_id=task_type_id)
+    check("own rights: POST /tasks on someone else's deal -> 404 (it went into that deal's history)", status == 404, status)
+    deal_own2 = new_deal("%s-deal-agent2" % P, agent_id=str(agent2["id"]))
+    status, t_own2, body = new_task("%s-task-own2" % P, {"target": "deal", "id": deal_own2}, assignee=agent2["id"], token=agent2["token"], type_id=task_type_id)
+    status_get, _ = http("GET", "/tasks/%d" % (t_own2 or 0), token=agent2["token"])
+    check("own rights: a task on the agent's own deal -> 201 and readable", t_own2 and status_get == 200, (status, message_of((status, body)), status_get))
+
+    # TASK-10: linkables find Cyrillic names, not deleted records, within the rights
+    status, body = http("GET", "/linkables?name=Иванов")
+    found = [(l.get("type"), l.get("id")) for l in (body or [])] if status == 200 and isinstance(body, list) else []
+    check("GET /linkables?name=<Cyrillic> finds the contact", ("user", contact_id) in found, (status, found))
+    status, body = http("GET", "/linkables?name=%s-contact" % P)
+    found = [l.get("id") for l in (body or [])] if status == 200 and isinstance(body, list) else []
+    check("... deleted contacts are not offered", contact_id in found and contact_deleted not in found, found)
+    status, body = http("GET", "/linkables?name=%s-deal" % P, token=agent2["token"])
+    found = [l.get("id") for l in (body or []) if l.get("type") == "deal"] if status == 200 and isinstance(body, list) else []
+    check("... an agent with own rights is offered only own deals", deal_own2 in found and deal1 not in found and deal2 not in found, found)
+    task_modal = client_file(os.path.join("components", "task", "TaskModal.vue"))
+    check("client: the task window does not encode the search twice", "encodeURIComponent" not in task_modal)
+
+    # deleting a task type moves its tasks to another type (a typeless task broke the board)
+    status, body = http("POST", "/task-types", {"name": "%s-type" % P})
+    type_tmp = body.get("id") if status == 201 and isinstance(body, dict) else None
+    if type_tmp:
+        sql("UPDATE task SET type_id = %d WHERE id = %d" % (type_tmp, t_notype))
+        status, body = http("DELETE", "/task-types/%d" % type_tmp)
+        check("DELETE /task-types/:id -> its tasks get another type, not none",
+              status == 200 and scalar("SELECT type_id FROM task WHERE id = %d" % t_notype) not in (None, "", str(type_tmp)),
+              "%s %s" % (status, message_of((status, body))))
+    else:
+        check("POST /task-types -> 201", False, "%s %s" % (status, message_of((status, body))))
 
     # ================================================================= desktop
     section("Desktop counters (GET /desktop)")
@@ -498,8 +890,25 @@ def main():
     stats = (body or {}).get("task_stats", {}) if status == 200 else {}
     check("tasks_overdue = 1 (open, deadline passed) — was counting future deadlines", str(stats.get("tasks_overdue")) == "1", stats)
     check("active_tasks = 1 (open, deadline ahead) — was counting closed tasks", str(stats.get("active_tasks")) == "1", stats)
-    check("tasks_closed = 1", str(stats.get("tasks_closed")) == "1", stats)
+    # "my" numbers count the tasks of the agent and of their group (wave 1, group tasks are visible to the group):
+    # the closed task above plus whatever the agent's real group closed in the period
+    group_closed = count(
+        "SELECT count(*) FROM task WHERE closed_at IS NOT NULL AND group_id = %d AND agent_id IS DISTINCT FROM %d "
+        "AND closed_at >= '%s' AND closed_at < '%s'"
+        % (group_id, agent["id"], (now - 7 * day).strftime("%Y-%m-%d"), (now + 8 * day).strftime("%Y-%m-%d")))
+    check("tasks_closed = 1 + the group's closed tasks of the period", str(stats.get("tasks_closed")) == str(1 + group_closed), (stats, group_closed))
     check("deals_without_tasks = 1 (the agent's open deal of the period)", str(stats.get("deals_without_tasks")) == "1", stats)
+    today_only = "from_date=%s&till_date=%s" % (now.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d"))
+    status, body = http("GET", "/desktop?%s&my_stats=true" % today_only, token=agent["token"])
+    stats = (body or {}).get("task_stats", {}) if status == 200 else {}
+    check("'Сегодня': tasks_overdue counts a task overdue since yesterday (overdue is a state, not a period)",
+          str(stats.get("tasks_overdue")) == "1", stats)
+    status, body = http("GET", "/desktop?%s&my_stats=false&user_ids[]=%d" % (period, agent["id"]))
+    stats = (body or {}).get("task_stats", {}) if status == 200 else {}
+    total = (body or {}).get("total_manager_stats") or {} if status == 200 else {}
+    check("admin, the agent picked (user_ids[]): the agent's numbers, not the company's",
+          status == 200 and str(stats.get("tasks_overdue")) == "1" and str(stats.get("active_tasks")) == "1"
+          and str(total.get("deal_count")) == "1", (status, stats, total))
 
     status, body = http("GET", "/desktop?%s&my_stats=false" % period, token=agent["token"])
     check("agent: company-wide numbers -> 403", status == 403, status)
@@ -520,8 +929,8 @@ def main():
     status, body = http("GET", "/deals?limit=1000&skip=0")
     check("GET /deals?limit=1000 (the kanban request) -> 200", status == 200, "%s %s" % (status, message_of((status, body))))
     deals_vue = client_file(os.path.join("pages", "deals", "index.vue"))
-    check("client: the kanban asks for all deals, the list keeps its page size",
-          "kanban.value ? 1000 : perPage.value" in deals_vue and "watch(kanban, fetchDeals)" in deals_vue)
+    check("client: the kanban loads GET /deals/board column by column, the list keeps its page size",
+          "GET /deals/board" in deals_vue and "if (kanban.value) return fetchBoard(" in deals_vue)
     company_feed_vue = client_file(os.path.join("components", "company", "CompanyFeed.vue"))
     on_intersect = company_feed_vue[company_feed_vue.index("async function onIntersect()"):]
     on_intersect = on_intersect[:on_intersect.index("}\n")]

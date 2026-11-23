@@ -11,13 +11,16 @@
                 </h2>
             </div>
         </template>
+        <!-- an automatic task names the deal and its company: the deal first, the company after it -->
         <NuxtLink :href="link" class="text-sm text-blue-600 underline dark:text-blue-400" v-if="task">
-            <template v-if="task.deal">Сделка: {{ task?.deal.label }}</template>
-            <template v-if="task.ctr_agent">Контакт: {{ task?.ctr_agent.username }}</template>
-            <template v-if="task.company">Компания: {{ task?.company.name }}</template>
+            {{ [
+                task.deal ? `Сделка: ${task.deal.label}` : '',
+                task.ctr_agent ? `Контакт: ${task.ctr_agent.username}` : '',
+                task.company ? `Компания: ${task.company.name}` : '',
+            ].filter(Boolean).join(' · ') }}
         </NuxtLink>
         <button @click="() => taskModal.open(task)" class="text-[15px] py-0.5 px-1.5 rounded-sm bg-primary-600/10 text-slate-900 block mt-1 dark:text-white dark:bg-primary-400" v-if="task">
-            <span>{{ new Date(task.start).toLocaleString('ru') }}</span>
+            <span>{{ task.allDay ? new Date(task.start).toLocaleDateString('ru') : new Date(task.start).toLocaleString('ru') }}</span>
             <span class="ml-2">для {{ task.agent?.username || task.group?.name }}</span>
             <strong class="ml-2">{{ task.type?.name }} </strong>&nbsp;&minus;&nbsp;<span>{{ task.label }}</span>
         </button>

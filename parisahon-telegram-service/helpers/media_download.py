@@ -20,9 +20,14 @@ KIND_RU = {
     "video_note": "Видеосообщение",
     "document": "Файл",
     "voice": "Голосовое сообщение",
+    "audio": "Аудио",
+    "animation": "GIF",
     "photo": "Фото",
     "sticker": "Стикер",
 }
+
+# the extension of a nameless file by its kind (the browser's download needs one)
+KIND_EXT = {"video": "mp4", "video_note": "mp4", "voice": "ogg", "audio": "mp3", "animation": "mp4", "photo": "jpg", "sticker": "webp"}
 
 
 class MediaDownload:
@@ -36,7 +41,7 @@ class MediaDownload:
 
 def media_of(message):
     """(kind, media object) of a message, or (None, None)."""
-    for kind in ("voice", "document", "video", "video_note", "photo", "sticker"):
+    for kind in ("voice", "audio", "animation", "document", "video", "video_note", "photo", "sticker"):
         media = getattr(message, kind, None)
         if media is not None:
             return kind, media
@@ -44,7 +49,11 @@ def media_of(message):
 
 
 def media_name(kind: str, media) -> str:
-    return getattr(media, "file_name", None) or KIND_RU.get(kind, "Файл")
+    name = getattr(media, "file_name", None)
+    if name:
+        return name
+    ext = KIND_EXT.get(kind)
+    return f"{KIND_RU.get(kind, 'Файл')}.{ext}" if ext else KIND_RU.get(kind, "Файл")
 
 
 async def fetch_message(client, chat_id: int, message_id: int):

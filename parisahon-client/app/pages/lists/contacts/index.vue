@@ -11,6 +11,14 @@
         <div class="flex flex-wrap gap-5 justify-between">
             <div class="flex items-center gap-4 flex-1">
                 <PerPageSelect v-model="perPage" />
+                <!-- contacts from Telegram, WhatsApp and calls have no company: they are listed too -->
+                <BaseListbox
+                    v-model="scope"
+                    class="max-w-[12rem] w-full"
+                    :items="scopes"
+                    :properties="{ value: 'id', label: 'label' }"
+                    name="scope"
+                />
                 <TairoPopover
                     fixed
                     size="2md"
@@ -214,6 +222,7 @@
             </Can>
         </div>
         <div>
+            <!-- one box: the name, the phone (any format) or the e-mail, without choosing a field first -->
             <Search
                 v-model="searchQ"
                 :debounce="600"
@@ -299,12 +308,24 @@ const overdueTaskType = {
     label: "Просроченные"
 };
 
+// «Закрыте» sent tasks=closed, which the API does not know (400)
 const taskTypes = [
     {
-        id: "closed",
-        label: "Закрыте"
+        id: "no_task",
+        label: "Без задач"
     },
     overdueTaskType,
+];
+
+enum Scope {
+    All = "all",
+    WithCompany = "with",
+    WithoutCompany = "without",
+}
+const scopes = [
+    { id: Scope.All, label: "Все контакты" },
+    { id: Scope.WithCompany, label: "С компанией" },
+    { id: Scope.WithoutCompany, label: "Без компании" },
 ];
 
 type Filters = {
@@ -329,7 +350,8 @@ const app = useAppConfig();
 const contactsService = useService("contacts", {auth: true});
 const stageService = useService("stages", {auth: true});
 const userService = useService("users", {auth: true});
-const searchQ = ref({});
+const searchQ = ref<Record<string, any>>({});
+const scope = ref(scopes[0]);
 const filters = reactive<Filters>({...initialFilters});
 const perPage = ref(app.pagination.defaultPageSize);
 const currentPage = ref(route.query.page ? parseInt(route.query.page as string) : 1);
@@ -345,6 +367,7 @@ const { data: contacts, run: runContacts, isLoading: contactsLoading } = useAsyn
     page_size: perPage.value
 });
 
+// the staff only (GET /users/staff): GET /users?limit=1000 mixed them with the contacts
 const { run: runUsers, data: users } = useAsync<PaginatedResponse<User>>({
     count: 0,
     data: [],
@@ -367,11 +390,13 @@ const presetDates = ref([
     { label: "За этот год", value: [moment().startOf("year"), moment().endOf("year")] },
 ]);
 
+// the API gives phones[] and emails[] (the «Почта» column read `email` and was always empty)
 const columns = ref<Column[]>([
     {
         label: "Имя",
         name: "name",
         resizable: true,
+        sortable: true,
         headerStyle: {
             minWidth: "200px",
         },
@@ -382,46 +407,55 @@ const columns = ref<Column[]>([
         }
     },
     {
-        label: "Тип",
-        name: "type",
-        resizable: true,
+        label: "Телефон",
+        name: "phone",
+        sortable: true,
+        phone: true,
         headerStyle: {
-            minWidth: "200px",
+            minWidth: "160px",
         },
-        link(value) {
-            if (value.type === "ctr_agent") return {name: "lists-contacts-id", params: {id: value.id}};
-            if (value.type === "company") return {name: "lists-companies-id", params: {id: value.id}};
-            return "";
-        },
-        field: (value) => {
-            if (value.type === "ctr_agent") return "Контагент";
-            if (value.type === "company") return "Компания";
-        }
-    },
-    {
-        label: "Компания",
-        name: "company",
-        resizable: true,
-        headerStyle: {
-            minWidth: "200px",
-        },
-        field: (value) => {
-            return value.company?.name;
-        },
-        link(value) {
-            return {name: "lists-companies-id", params: {id: value.company?.id}};
-        }
+        field: (value) => value.phones?.[0] ?? "",
     },
     {
         label: "Почта",
         name: "email",
         resizable: true,
+        sortable: true,
+        headerStyle: {
+            minWidth: "200px",
+        },
+        field: (value) => value.emails?.[0] ?? "",
+    },
+    {
+        label: "Компания",
+        name: "company",
+        resizable: true,
+        sortable: true,
         headerStyle: {
             minWidth: "200px",
         },
         field: (value) => {
-            return value.email;
+            return value.company?.name ?? "";
+        },
+        link(value) {
+            return value.company?.id ? {name: "lists-companies-id", params: {id: value.company.id}} : "";
         }
+    },
+    {
+        label: "Ответственный",
+        name: "agent",
+        headerStyle: {
+            minWidth: "160px",
+        },
+        field: (value) => value.agent?.username ?? "",
+    },
+    {
+        label: "Последнее касание",
+        name: "last_activity_at",
+        dateFormat: "DD.MM.YYYY, HH:mm",
+        headerStyle: {
+            minWidth: "160px",
+        },
     },
     {
         label: "",
@@ -432,23 +466,16 @@ const columns = ref<Column[]>([
     }
 ]);
 
+// one field: the box needs no «Поиск по…» (it searched nothing until a field was chosen)
 const fields: {key: string, label: string}[] = [
     {
-        label: "Имя",
-        key: "name",
+        label: "Имя, телефон или почта",
+        key: "q",
     },
-    {
-        label: "Номер телефона",
-        key: "phone"
-    },
-    {
-        label: "Почта",
-        key: "email"
-    }
 ];
 
 const employees = computed(() => {
-    return users.value.data.filter((u) => u.role !== UserRole.CtrAgent);
+    return (users.value.data ?? []).filter((u) => u.role !== UserRole.CtrAgent);
 });
 
 function onPresetSelect(close: Function, e: Event) {
@@ -470,13 +497,21 @@ function onPresetSelect(close: Function, e: Event) {
     close();
 }
 
+// The search, the filters, the page and the sorting go in one request: the search used to be a request
+// of its own, and a page change dropped it. Contacts only (role=ctr_agent), with or without a company.
 function fetchContacts() {
     const query: Record<string, any> = {
         skip: (currentPage.value - 1) * perPage.value,
         limit: perPage.value,
         sort: sortBy.value,
-        employees: true
+        role: UserRole.CtrAgent,
     };
+
+    const text = String(searchQ.value?.q ?? "").trim();
+    if (text) query.q = text;
+
+    if (scope.value?.id === Scope.WithCompany) query.employees = true;
+    else if (scope.value?.id === Scope.WithoutCompany) query.employees = false;
 
     if (filters.stages.length) {
         query.stages = filters.stages.map((s) => s.id);
@@ -503,8 +538,10 @@ function fetchContacts() {
     runContacts(contactsService.find(query).exec());
 }
 
-watch(searchQ, (query) => {
-    runContacts(contactsService.find(query).exec());
+// a new search or scope starts from the first page
+watch([searchQ, scope], () => {
+    if (currentPage.value !== 1) currentPage.value = 1;
+    else fetchContacts();
 });
 
 watch([currentPage, sortBy, perPage, dateFilter], fetchContacts);
@@ -512,6 +549,6 @@ watch([currentPage, sortBy, perPage, dateFilter], fetchContacts);
 onMounted(() => {
     runStages(stageService.find().exec());
     fetchContacts();
-    runUsers(userService.find({limit: 1000}).exec());
+    runUsers(userService.get("staff").exec());
 });
 </script>

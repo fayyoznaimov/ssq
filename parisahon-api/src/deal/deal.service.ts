@@ -29,6 +29,7 @@ import { Request } from 'express';
 import {
   FillerDto,
   getTaskDateRange,
+  SearchDealBoardDto,
   SearchDealDto,
   TaskTypes,
   TaskTypesToWeights,
@@ -65,6 +66,23 @@ const DealListRelations = [
   // the "повторный" badge of the deals list and kanban
   'repeat_of',
 ];
+
+/** A column of GET /deals/board: counted by the database over all deals of the stage */
+export type DealBoardColumn = {
+  stage_id: number | null;
+  count: number;
+  budget: string;
+  closing: boolean;
+};
+
+export type DealBoard = {
+  stages: DealBoardColumn[];
+  data: Deal[];
+  per_stage: number;
+  /** the closing columns show the deals closed since then (null: all of them) */
+  closed_since: Date | null;
+  closing_stage_ids: number[];
+};
 
 /**
  * Collects query parameters under unique names (:p0, :p1, ...).
@@ -120,10 +138,130 @@ export class DealService {
       qb.andWhere(visible.sql, visible.params);
     }
 
-    return this.helperService.withPagination(
-      this.helperService.withRelations(qb, DealListRelations, 't0'),
-      query,
-    );
+    const listQb = this.helperService.withRelations(qb, DealListRelations, 't0');
+    this.applyListOrder(listQb, query);
+
+    // the order is set above: withPagination must not replace it
+    return this.helperService.withPagination(listQb, query, 't0', null, false, true);
+  }
+
+  /**
+   * ORDER BY of the deals list. sort[<column>]=1|-1 as before (the column is checked by
+   * HelperService), but sort[stage] follows the pipeline (the position of the stage, not its id),
+   * and the id of the deal is always the last key: with many equal values (budget 0, one stage)
+   * the pages of skip / take overlapped or skipped deals. Without sort: the newest first.
+   */
+  private applyListOrder(qb: SelectQueryBuilder<Deal>, query: SearchDealDto): void {
+    const requested = query.sort
+      ? this.helperService.parseSortOptions(
+          query.sort,
+          't0',
+          this.helperService.getSortableColumns(qb, 't0'),
+        )
+      : {};
+    // the alias withRelations gave to the "stage" join
+    const stageAlias = qb.expressionMap.joinAttributes.find(
+      (join) => join.entityOrProperty === 't0.stage',
+    )?.alias?.name;
+
+    const order: Record<string, 'ASC' | 'DESC'> = {};
+    let direction: 'ASC' | 'DESC' = 'DESC';
+    for (const [key, value] of Object.entries(requested)) {
+      direction = value;
+      if (key === 't0.stage' && stageAlias) {
+        order[`${stageAlias}.order`] = value;
+        order[`${stageAlias}.id`] = value;
+      } else {
+        order[key] = value;
+      }
+    }
+    if (!order['t0.id']) {
+      order['t0.id'] = direction;
+    }
+
+    qb.orderBy(order);
+  }
+
+  /**
+   * GET /deals/board: the kanban, column by column.
+   *
+   * The totals of a column (deals, budget) are counted by the database over every deal the
+   * user may see with the filters (GROUP BY stage), not over the cards that are loaded. The
+   * cards come `per_stage` per column, newest first; `before_id` gives the next ones of a
+   * column («Показать ещё»). The closing columns show the deals closed in the last
+   * `closed_days` days unless the filter sets the closing dates itself: the board used to load
+   * 1000 deals of all time, won and lost ones filled them and older open deals silently
+   * dropped off the board.
+   */
+  async fetchBoard(query: SearchDealBoardDto, user?: AuthUser): Promise<DealBoard> {
+    const perStage = query.per_stage ?? 50;
+    const closedDays = query.closed_days ?? 30;
+    const closingIds = await this.dealStageService.closingStageIds();
+    const closedSince =
+      closedDays > 0 && closingIds.length > 0 && !query.closed_after && !query.closed_before
+        ? new Date(Date.now() - closedDays * 24 * 60 * 60 * 1000)
+        : null;
+
+    const scoped = (): SelectQueryBuilder<Deal> => {
+      const qb = this.applyFiltersToQb(
+        this.dealRepository.createQueryBuilder('t0'),
+        query,
+      );
+      if (user) {
+        const visible = new Access(user).dealSql('t0', 'view');
+        qb.andWhere(visible.sql, visible.params);
+      }
+      if (closedSince) {
+        qb.andWhere(
+          '(t0.stage_id IS NULL OR t0.stage_id NOT IN (:...board_closing) ' +
+            'OR COALESCE(t0.closed_at, t0.last_stage_change, t0.created_at) >= :board_since)',
+          { board_closing: closingIds, board_since: closedSince },
+        );
+      }
+      return qb;
+    };
+
+    const totals = await scoped()
+      .select('t0.stage_id', 'stage_id')
+      .addSelect('COUNT(*)', 'count')
+      .addSelect('COALESCE(SUM(t0.budget), 0)', 'budget')
+      .groupBy('t0.stage_id')
+      .getRawMany<{ stage_id: number | null; count: string; budget: string }>();
+
+    let data: Deal[] = [];
+    if (perStage > 0) {
+      const idsQb = scoped().select('t0.id', 'id').addSelect('t0.stage_id', 'stage_id');
+      if (query.before_id) {
+        idsQb.andWhere('t0.id < :board_before', { board_before: query.before_id });
+      }
+      const [sql, params] = idsQb.getQueryAndParameters();
+      const rows: { id: number }[] = await this.dataSource.query(
+        `SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY stage_id ORDER BY id DESC) AS rn ` +
+          `FROM (${sql}) board) ranked WHERE rn <= $${params.length + 1}`,
+        [...params, perStage],
+      );
+      const ids = rows.map((row) => Number(row.id));
+      if (ids.length > 0) {
+        data = await this.helperService
+          .withRelations(this.dealRepository.createQueryBuilder('t0'), DealListRelations, 't0')
+          .where('t0.id IN (:...board_ids)', { board_ids: ids })
+          .orderBy('t0.id', 'DESC')
+          .getMany();
+      }
+    }
+
+    return {
+      stages: totals.map((row) => ({
+        stage_id: row.stage_id === null || row.stage_id === undefined ? null : Number(row.stage_id),
+        count: Number(row.count),
+        budget: String(row.budget ?? '0'),
+        closing: closingIds.includes(Number(row.stage_id)),
+      })),
+      data,
+      per_stage: perStage,
+      closed_since: closedSince,
+      closing_stage_ids: closingIds,
+    };
   }
 
   /**
@@ -147,6 +285,14 @@ export class DealService {
 
     if (query.display_id) {
       where.push(`t0.display_id = ${params.add(query.display_id)}`);
+    }
+
+    if (query.q?.trim()) {
+      where.push(this.searchCondition(query.q.trim(), params));
+    }
+
+    if (query.ids && query.ids.length > 0) {
+      where.push(`t0.id IN (${params.addList(query.ids)})`);
     }
 
     where.push(
@@ -265,6 +411,50 @@ export class DealService {
   }
 
   /**
+   * The search box (`q`): one of
+   *  - the number of the deal: "125", "#125", "№125";
+   *  - the name of the deal;
+   *  - a client of the deal: name, e-mail, phone, the client's company;
+   *  - the company of the deal: name, e-mail, phone.
+   * Phones are compared by digits ("+998 90 123-45-67" finds "998901234567").
+   * Messenger deals are named "name · phone · company" once, when they are made:
+   * the client's current data is found here even after it changed.
+   */
+  private searchCondition(text: string, params: QueryParams): string {
+    const like = params.add(`%${DealService.likeText(text)}%`);
+    const digits = text.replace(/\D/g, '');
+    const phone =
+      digits.length >= 3 && /^[\d\s()+\-.]+$/.test(text)
+        ? params.add(`%${digits}%`)
+        : null;
+    const phoneMatches = (column: string): string =>
+      `regexp_replace(COALESCE(${column}, ''), '[^0-9]', '', 'g') LIKE ${phone}`;
+
+    const alternatives = [`t0.label ILIKE ${like}`];
+    const number = text.match(/^(?:#|№)?\s*(\d{1,9})$/);
+    if (number) {
+      alternatives.push(`t0.display_id = ${params.add(Number(number[1]))}`);
+    }
+
+    const contact = [`cu.username ILIKE ${like}`, `cu.email ILIKE ${like}`, `cc.name ILIKE ${like}`];
+    const company = [`co.name ILIKE ${like}`, `co.email ILIKE ${like}`];
+    if (phone) {
+      contact.push(phoneMatches('cu.phone'));
+      company.push(phoneMatches('co.phone'));
+    }
+
+    alternatives.push(
+      `EXISTS (SELECT 1 FROM deal_user du INNER JOIN "user" cu ON cu.id = du."userId" ` +
+        `LEFT JOIN company cc ON cc.id = cu.company_id AND cc.deleted_at IS NULL ` +
+        `WHERE du."dealId" = t0.id AND cu.deleted_at IS NULL AND (${contact.join(' OR ')}))`,
+      `EXISTS (SELECT 1 FROM company co WHERE co.id = t0.company_id AND co.deleted_at IS NULL ` +
+        `AND (${company.join(' OR ')}))`,
+    );
+
+    return `(${alternatives.join(' OR ')})`;
+  }
+
+  /**
    * "before" given as a date without time (2025-04-30, that is what the date
    * picker sends) includes the whole day.
    */
@@ -370,10 +560,11 @@ export class DealService {
     const overlaps = (start: Date, end: Date): string =>
       `(tk.start_time, tk.end_time) OVERLAPS (${params.add(start)}, ${params.add(end)})`;
 
-    // Deals with no tasks
+    // "Сделки без задач": an open deal without an open task, i.e. without a next step (as on the
+    // desktop and in the autopilot); closed tasks and closed deals do not count
     if (tasks.includes(TaskTypes.NO_TASK)) {
       alternatives.push(
-        `NOT EXISTS (SELECT 1 FROM task tk WHERE tk.deal_id = t0.id)`,
+        `(t0.closed_at IS NULL AND NOT EXISTS (SELECT 1 FROM task tk WHERE tk.deal_id = t0.id AND tk.closed_at IS NULL))`,
       );
     }
 
@@ -485,8 +676,8 @@ export class DealService {
     const finalQuery = `
     WITH main_query AS (${sql})
     SELECT
-      (SELECT COUNT(h1.id) FROM task h1 WHERE h1.deal_id IN (SELECT "id" FROM main_query) AND DATE_TRUNC('day', h1.created_at) = CURRENT_DATE) AS task_count_for_today,
-      (SELECT COUNT(h2.id) FROM deal h2 WHERE NOT EXISTS(SELECT h3.id FROM task h3 WHERE h3.deal_id = h2.id) AND h2.id IN (SELECT "id" FROM main_query)) AS deals_without_tasks,
+      (SELECT COUNT(h1.id) FROM task h1 WHERE h1.deal_id IN (SELECT "id" FROM main_query) AND h1.closed_at IS NULL AND h1.end_time >= CURRENT_DATE AND h1.end_time < CURRENT_DATE + INTERVAL '1 day') AS task_count_for_today,
+      (SELECT COUNT(h2.id) FROM deal h2 WHERE h2.closed_at IS NULL AND NOT EXISTS(SELECT h3.id FROM task h3 WHERE h3.deal_id = h2.id AND h3.closed_at IS NULL) AND h2.id IN (SELECT "id" FROM main_query)) AS deals_without_tasks,
       (SELECT COUNT(DISTINCT h4.deal_id) FROM task h4 WHERE h4.deal_id IN (SELECT "id" FROM main_query) AND h4.closed_at IS NULL AND h4.end_time < ${now}) AS deals_with_overdue_tasks,
       (SELECT COUNT(h5.id) FROM deal h5 WHERE DATE_TRUNC('day', h5.created_at) = CURRENT_DATE AND h5.id IN (SELECT "id" FROM main_query)) AS new_deals_from_today,
       (SELECT COUNT(h6.id) FROM deal h6 WHERE DATE_TRUNC('day', h6.created_at) >= CURRENT_DATE - INTERVAL '1 day' AND DATE_TRUNC('day', h6.created_at) < CURRENT_DATE AND h6.id IN (SELECT "id" FROM main_query)) AS new_deals_from_yesterday
@@ -514,8 +705,9 @@ export class DealService {
    * The only place where the stage of an existing deal changes.
    * Used by PATCH /deals/:id/stage and by PATCH /deals/:id (deal_stage_id).
    *
-   * Side effects: deal.last_stage_change, deal.closed_at (closing stages),
-   * stage history record, triggers of the new stage, NEW_DEAL_STAGE event.
+   * Side effects: deal.last_stage_change, deal.closed_at (set in a closing
+   * stage, cleared in any other one), stage history record, triggers of the
+   * new stage, NEW_DEAL_STAGE event.
    * Does nothing at all when the deal is already in the requested stage.
    *
    * @param deal deal loaded with its `stage` relation
@@ -536,11 +728,13 @@ export class DealService {
     ]);
     const oldStage = deal.stage ?? null;
 
-    const closedStageNames = this.dealStageService.getClosedStageNames();
-
-    // Add closed_at if the new stage is closed
-    if (closedStageNames.includes(stage.name)) {
+    // closed_at = when the deal was closed. A deal taken back to work is open again: messages,
+    // calls and letters of the client go into it, triggers, the autopilot, «клиент ждёт» and the
+    // reports see it (they all read closed_at IS NULL as open). It was never cleared before.
+    if (this.dealStageService.isClosingStage(stage)) {
       deal.closed_at = new Date();
+    } else if (deal.closed_at) {
+      deal.closed_at = null;
     }
 
     deal.stage = stage;
@@ -654,6 +848,11 @@ export class DealService {
       );
     } else {
       newDeal.stage = await this.dealStageService.getDefaultStage();
+    }
+    // made right in «успешно реализовано» / «закрыто и не реализовано»: closed from the start
+    if (this.dealStageService.isClosingStage(newDeal.stage)) {
+      newDeal.closed_at = new Date();
+      newDeal.last_stage_change = newDeal.closed_at;
     }
     newDeal.company = company;
 
@@ -784,10 +983,13 @@ export class DealService {
     const userMap = this.helperService.createHashMap<User>(users);
     DealService.assertDealPeople(userMap, data.agent_id, data.ctr_agent_ids);
 
+    // company_id: null takes the company off the deal (the form's company field was cleared)
     const company =
-      data.company_id !== undefined
-        ? await this.findCompanyForDeal(data.company_id, id)
-        : undefined;
+      data.company_id === null
+        ? null
+        : data.company_id !== undefined
+          ? await this.findCompanyForDeal(data.company_id, id)
+          : undefined;
 
     // Data that will be fed to event emitter
     const eventData: FieldValueEventDto = {
@@ -988,6 +1190,7 @@ export class DealService {
               'quantity',
               requestedData.quantity.toString(),
               existingRelation.quantity.toString(),
+              existingRelation.product?.name ?? null,
             ),
           );
         }
@@ -999,6 +1202,7 @@ export class DealService {
               'price',
               requestedData.price.toString(),
               existingRelation.price.toString(),
+              existingRelation.product?.name ?? null,
             ),
           );
         }
@@ -1059,6 +1263,26 @@ export class DealService {
       })
       .where('id = :id AND deleted_at IS NULL', { id })
       .execute();
+  }
+
+  /**
+   * «Удалён файл» in the history of the deal: who took a file off the deal in the files tab
+   * (the file itself stays while a message of the history still shows it).
+   */
+  async noteFileRemoved(
+    dealId: number,
+    fileName: string,
+    request: Request,
+  ): Promise<void> {
+    const deal = await this.getByIdOrFail(dealId);
+    const eventData: FieldValueEventDto = {
+      originated_by: await this.helperService.extractUserFromRequest(request),
+      deal,
+      fields: [new Field('Удалён файл', fileName || 'без имени', null)],
+      fields_of: FieldsOf.DEAL,
+    };
+
+    this.eventEmitter.emit(EventTypes.NEW_FIELD_VALUE.toString(), eventData);
   }
 
   async deleteDealFiller(id: number): Promise<void> {

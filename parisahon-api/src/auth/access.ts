@@ -14,21 +14,44 @@ import { AuthUser } from './auth.guard';
 import { RoleEnum } from '../user/user.entity';
 
 /**
- * Who may see and change what — enforced by the API, the same rules the client shows
- * (utils/casl.ts) and the bot uses (bot/bot-access.ts).
+ * Who may see and change what. The one rule of the CRM: the API enforces it here, the bot
+ * (bot/bot-access.ts) and the deal trash (deal/deal-access.ts) are built on this class, and the
+ * web client gets it from GET /auth/access (describe()) to build its menu and buttons (utils/casl.ts).
  *
  * The user card stores a level per entity and action (user.permissions):
  * 0 nothing, 1 records where the user is responsible, 2 records of the user's group, 3 everything.
- * Admin and manager: everything. A level that is not stored: an agent may see and change
- * their own deals and every company and contact (the bot's defaults).
+ * Admin and manager: everything (the matrix of the card does not apply to them; settings stay
+ * admin-only through @Roles). A level that is not stored: an agent may see and change their own
+ * deals and every company and contact (the bot's defaults).
  *
  * "Own" deal: the user is responsible (deal.agent_id). "Group": the responsible user is in the
  * same group. Companies and contacts at "own"/"group": created by the user (or the group), or
- * linked to a deal the user may see at that level.
+ * linked to a deal the user may see at that level; a contact also when its company is in reach by
+ * that rule (contactSql).
+ *
+ * The switches "Доступ к почте" / "Доступ к файлам" (permissions.mail / .file): admin and manager
+ * always; an agent unless the switch is off. A missing key counts as on, as the mail and file
+ * guards have always read it (the user card always stores both).
  */
 export type Scope = 'none' | 'own' | 'group' | 'all';
 export type Entity = 'deal' | 'company' | 'contact' | 'task';
 export type Action = 'view' | 'create' | 'update' | 'delete';
+
+/** GET /auth/access: the rules of the signed-in user as the client needs them. */
+export interface AccessSummary {
+  user_id: number;
+  role: RoleEnum;
+  group_id: number | null;
+  /** admin: settings, users, groups and the rest of the admin pages */
+  admin: boolean;
+  /** admin or manager: every record, analytics, the action log */
+  manager: boolean;
+  scopes: Record<'deal' | 'company' | 'contact', Record<Action, Scope>> & {
+    task: Record<'view' | 'create' | 'update' | 'delete', Scope>;
+  };
+  mail: boolean;
+  file: boolean;
+}
 
 const LEVEL_TO_SCOPE: Record<number, Scope> = { 0: 'none', 1: 'own', 2: 'group', 3: 'all' };
 
@@ -66,9 +89,46 @@ export class Access {
     return this.scope(entity, action) !== 'none';
   }
 
-  /** E-mail bodies in deal history: the "mail" switch of the user card (admin and manager always). */
+  /** A switch of the user card: admin and manager always, an agent unless it is off (see the top). */
+  private switchedOn(name: 'mail' | 'file'): boolean {
+    return this.isManager || (this.user.permissions as any)?.[name] !== false;
+  }
+
+  /** Mail: the mailbox pages (MailAccessGuard) and e-mail bodies in the deal history. */
   get canReadMail(): boolean {
-    return this.isManager || (this.user.permissions as any)?.mail === true;
+    return this.switchedOn('mail');
+  }
+
+  /** The list of files (Списки → Файлы, FileAccessGuard). */
+  get canUseFiles(): boolean {
+    return this.switchedOn('file');
+  }
+
+  /** Everything the client mirrors (GET /auth/access): the scope of every action and the switches. */
+  describe(): AccessSummary {
+    const actions = (entity: Entity): Record<Action, Scope> => ({
+      view: this.scope(entity, 'view'),
+      create: this.scope(entity, 'create'),
+      update: this.scope(entity, 'update'),
+      delete: this.scope(entity, 'delete'),
+    });
+    return {
+      user_id: this.id,
+      role: this.user.role,
+      group_id: this.user.group_id ?? null,
+      admin: this.user.role === RoleEnum.ADMIN,
+      manager: this.isManager,
+      scopes: {
+        deal: actions('deal'),
+        company: actions('company'),
+        contact: actions('contact'),
+        // tasks: every staff user has the section and sets tasks; which tasks the list holds the API
+        // decides per task (task/task-access.ts); changing and deleting follow allowsTask()
+        task: { view: 'all', create: 'all', update: this.scope('task', 'update'), delete: this.scope('task', 'delete') },
+      },
+      mail: this.canReadMail,
+      file: this.canUseFiles,
+    };
   }
 
   /** May the user see / change a deal whose responsible user is `agentId` (in group `agentGroupId`)? */
@@ -112,6 +172,29 @@ export class Access {
     return {
       sql: `(${creator.sql} OR EXISTS (SELECT 1 FROM deal acx WHERE acx.company_id = ${alias}.id AND acx.deleted_at IS NULL AND ${deals.sql}))`,
       params: { ...creator.params, ...deals.params },
+    };
+  }
+
+  /**
+   * Contacts (ctr_agent rows of `alias`) at the contact scope: created by the user (group), linked to a
+   * deal of the user (group), or of a company that is the user's (group's) by companySql()'s rule — the
+   * company card shows its contacts. The lists (GET /contacts, /users) and RecordAccess('contact') use it.
+   */
+  contactSql(alias: string, action: Action = 'view'): { sql: string; params: Record<string, any> } {
+    const scope = this.scope('contact', action);
+    if (scope === 'all' || scope === 'none') return this.scopedSql(scope, '');
+    const creator = this.scopedSql(scope, `${alias}.created_by`);
+    const deals = this.scopedSql(scope, 'acu.agent_id');
+    const companyCreator = this.scopedSql(scope, 'acco.created_by');
+    const companyDeals = this.scopedSql(scope, 'acud.agent_id');
+    return {
+      sql: `(${creator.sql}
+        OR EXISTS (SELECT 1 FROM deal_user acdu JOIN deal acu ON acu.id = acdu."dealId"
+                    WHERE acdu."userId" = ${alias}.id AND acu.deleted_at IS NULL AND ${deals.sql})
+        OR EXISTS (SELECT 1 FROM company acco WHERE acco.id = ${alias}.company_id AND acco.deleted_at IS NULL
+                    AND (${companyCreator.sql} OR EXISTS (SELECT 1 FROM deal acud WHERE acud.company_id = acco.id
+                         AND acud.deleted_at IS NULL AND ${companyDeals.sql}))))`,
+      params: { ...creator.params, ...deals.params, ...companyCreator.params, ...companyDeals.params },
     };
   }
 
@@ -231,10 +314,15 @@ export class RecordAccessGuard implements CanActivate {
       }
       case 'contact':
         return this.contact(access, id, action);
-      case 'staffData':
+      case 'staffData': {
+        // the same routes serve the contact card (GET /users/:id/deals, /events): a contact needs the
+        // right to view it, not "only your own data" (agents got 403 and an empty card)
+        const target = (await this.dataSource.query(`SELECT role FROM "user" WHERE id = $1 AND deleted_at IS NULL`, [id]))[0];
+        if (target?.role === RoleEnum.CTR_AGENT) return this.contact(access, id, 'view');
         // a colleague's deals, history, files and call recordings: the user's own, or admin / manager
         if (id !== access.id) throw new ForbiddenException('Only your own data');
         return true;
+      }
       case 'task': {
         const row = (
           await this.dataSource.query(`SELECT agent_id, group_id, "createdById" AS created_by FROM task WHERE id = $1`, [id])
@@ -289,22 +377,15 @@ export class RecordAccessGuard implements CanActivate {
   }
 
   private async contactMatches(access: Access, id: number, action: Action): Promise<boolean> {
-    // "own" contact: created by the user (group) or on a deal of the user (group)
-    const deals = access.dealSql('acd', 'view');
-    const scope = access.scope('contact', action);
-    const creator = scope === 'group' && access.user.group_id != null
-      ? `(u.created_by = :acc_c_me OR u.created_by IN (SELECT g.id FROM "user" g WHERE g.group_id = :acc_c_group))`
-      : `u.created_by = :acc_c_me`;
+    // "own" contact at the level of this action (Access.contactSql). The deal part used the deal VIEW
+    // scope before, so "see all deals" made every contact of a live deal "own" for update and delete.
+    const cond = access.contactSql('u', action);
     const row = await this.dataSource
       .createQueryBuilder()
       .select('1', 'ok')
       .from('user', 'u')
       .where('u.id = :contact_id', { contact_id: id })
-      .andWhere(
-        `(${creator} OR EXISTS (SELECT 1 FROM deal_user du JOIN deal acd ON acd.id = du."dealId"
-           WHERE du."userId" = u.id AND acd.deleted_at IS NULL AND ${deals.sql}))`,
-        { ...deals.params, acc_c_me: access.id, acc_c_group: access.user.group_id },
-      )
+      .andWhere(cond.sql, cond.params)
       .getRawOne();
     return !!row;
   }

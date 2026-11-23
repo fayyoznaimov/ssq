@@ -49,9 +49,11 @@ export class IncomingChatDto {
 }
 
 export class IncomingFileDto {
+  // a phone video often has no file name: null / '' is accepted, the CRM names it by its kind
+  @IsOptional()
   @IsString()
   @MaxLength(255)
-  name: string;
+  name?: string | null;
 
   // file name inside parisahon-api/public/uploads (the service saves it there); '' for a remote file
   @IsString()
@@ -125,4 +127,14 @@ export class IncomingMessageDto {
   @IsOptional()
   @IsObject()
   location?: Record<string, any>;
+
+  // true: the message was edited in Telegram; the recorded text is replaced (nothing new is created)
+  @IsOptional()
+  @IsBoolean()
+  edited?: boolean;
+
+  // the deal a message from the CRM was written from (the service echoes it when it records a late send)
+  @IsOptional()
+  @IsInt()
+  deal_id?: number;
 }

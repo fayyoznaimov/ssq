@@ -92,6 +92,9 @@ class RouteTest(unittest.TestCase):
         import app as service  # starts a multiprocessing manager, nothing else
         cls.service = service
         cls.client = service.app.test_client()
+        # the CRM API sends the shared token on every request (TG-15)
+        service.config.HTTP_API_TOKEN = "test-service-token"
+        cls.client.environ_base["HTTP_X_TELEGRAM_SERVICE_TOKEN"] = "test-service-token"
 
     def post(self, body, answer=None, sessions=({"user_id": 7, "name": "Manager"},)):
         results, items = {}, []

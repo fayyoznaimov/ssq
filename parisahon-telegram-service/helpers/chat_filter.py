@@ -10,7 +10,7 @@ from typing import Optional, Tuple
 # "Telegram Notifications" (42777), anonymous group admin and channel senders.
 SERVICE_IDS = {777000, 42777, 1087968824, 136817688, 333000, 4244000}
 
-ACCEPTED_MEDIA = ("contact", "location", "voice", "document", "video", "video_note", "photo", "sticker")
+ACCEPTED_MEDIA = ("contact", "location", "voice", "audio", "document", "video", "animation", "video_note", "photo", "sticker")
 
 # chat.photo of the payload: left out when the CRM already has the client's current photo
 # (helpers/profile_photo.py decides); otherwise a file name in the uploads folder, or None (no photo)
@@ -33,7 +33,7 @@ def peer_of(message, me_id: int):
 
 
 def has_content(message) -> bool:
-    if getattr(message, "text", None):
+    if getattr(message, "text", None) or getattr(message, "caption", None):
         return True
     return any(getattr(message, media, None) is not None for media in ACCEPTED_MEDIA)
 
@@ -84,9 +84,10 @@ def iso_date(date) -> Optional[str]:
     return date.isoformat()
 
 
-def message_payload(message, me_id: int, agent_id: int, files: list, photo=PHOTO_UNCHANGED) -> Tuple[dict, dict]:
+def message_payload(message, me_id: int, agent_id: int, files: list, photo=PHOTO_UNCHANGED, edited: bool = False) -> Tuple[dict, dict]:
     """(payload for POST /telegram/incoming, the peer as a dict).
-    `photo`: the client's profile photo for chat.photo (a file name or None); PHOTO_UNCHANGED leaves it out."""
+    `photo`: the client's profile photo for chat.photo (a file name or None); PHOTO_UNCHANGED leaves it out.
+    `edited`: the message was edited in Telegram (the CRM replaces the recorded text)."""
     peer = peer_of(message, me_id)
     chat = peer_fields(peer)
     if photo is not PHOTO_UNCHANGED:
@@ -103,6 +104,8 @@ def message_payload(message, me_id: int, agent_id: int, files: list, photo=PHOTO
         "contact": None,
         "location": None,
     }
+    if edited:
+        payload["edited"] = True
     contact = getattr(message, "contact", None)
     if contact:
         payload["contact"] = {

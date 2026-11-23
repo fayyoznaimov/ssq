@@ -22,6 +22,14 @@ export class ContactDto {
   emails: string[];
 
   type: ContactTypes;
+
+  // the responsible manager of the latest deal of the contact (company)
+  agent?: { id: number; username: string } | null;
+
+  // «Последнее касание»: the latest event of the contact (company) or of its deals
+  last_activity_at?: Date | string | null;
+
+  created_at?: Date;
 }
 
 export class ContactRowDto {

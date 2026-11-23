@@ -116,14 +116,14 @@
                         :style="columnStyle(column)"
                         :light="true"
                         class="p-4"
-                        @click="
-                            column.link
-                                ? $router.push(column.link(item))
-                                : column.click
-                                    ? column.click(item)
-                                    : null
-                        "
+                        @click="onCellClick($event, item, column)"
                     >
+                        <!-- a cell that leads to a page is a real link: it opens in a new tab and its address can be copied -->
+                        <component
+                            :is="isAnchor(item, column) ? NuxtLink : 'div'"
+                            v-bind="isAnchor(item, column) ? { to: cellLink(item, column) } : {}"
+                            :class="isAnchor(item, column) ? 'block overflow-hidden text-ellipsis text-inherit' : 'contents'"
+                        >
                         <slot
                             :name="column.name"
                             :item="item"
@@ -153,6 +153,7 @@
                                 class="text-muted-400 dark:text-muted-600 text-sm"
                             >{{ column.subtitle(item) }}</div>
                         </slot>
+                        </component>
                     </TairoTableCell>
                     <slot
                         :item="item"
@@ -166,6 +167,9 @@
 
 <script lang="ts" setup>
 import { conformToMask } from "text-mask-core";
+import type { RouteLocationRaw } from "vue-router";
+
+import { NuxtLink } from "#components";
 
 import Money from "~/components/common/Money.vue";
 import Phone from "~/components/common/Phone.vue";
@@ -186,6 +190,8 @@ interface Props {
     selector?: (t: any) => any;
     shimmerSlots?: number;
     id?: string;
+    // the page of a row: a click anywhere in the row opens it (with Ctrl, Cmd or Shift — in a new tab)
+    rowLink?: (item: any) => RouteLocationRaw;
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -236,6 +242,34 @@ function setSelected(item: any, val: boolean) {
     }
 }
 
+const router = useRouter();
+
+/** Where a cell leads: the column's own link, otherwise the page of the row (not for actions or a cell with its own click) */
+function cellLink(item: any, column: Column) {
+    if (column.link) return column.link(item);
+    if (props.rowLink && column.name !== "actions" && !column.click) return props.rowLink(item);
+}
+
+/** The cell is rendered as a link: a column with its own link or one marked `rowAnchor` (a phone keeps its tel: link) */
+function isAnchor(item: any, column: Column) {
+    if (column.phone || column.name === "actions" || (!column.link && !column.rowAnchor)) return false;
+    return !!cellLink(item, column);
+}
+
+/** Clicks on links, buttons and fields inside the cell keep their own action; selecting text does not open the row */
+function onCellClick(e: MouseEvent, item: any, column: Column) {
+    const target = e.target as HTMLElement | null;
+    if (target?.closest("a, button, input, label, select, textarea")) return;
+    if (column.click) return column.click(item);
+    const link = cellLink(item, column);
+    if (!link || window.getSelection()?.toString()) return;
+    if (e.ctrlKey || e.metaKey || e.shiftKey) {
+        window.open(router.resolve(link).href, "_blank", "noopener");
+        return;
+    }
+    router.push(link);
+}
+
 function setOrdering(column: string) {
     const order = props.sortBy[column] || 1;
     emit("update:sortBy", { [column]: order === 1 ? -1 : 1 });
@@ -266,7 +300,7 @@ function getValue(item: any, column: Column<any>) {
 
 function columnClass(item: any, column: Column) {
     return [
-        { "cursor-pointer": column.link || column.click },
+        { "cursor-pointer": column.link || column.click || (props.rowLink && column.name !== "actions") },
         column.classes?.(item),
     ];
 }

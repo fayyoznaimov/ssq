@@ -1,35 +1,45 @@
 <template>
     <div>
         <div class="border">
-            <ul class="grid grid-cols-7 p-3">
+            <ul class="grid grid-cols-6 p-3">
                 <li
                     v-for="(title, index) in titles"
-                    class="col-span-1 col-start-{{ index + 1 }} text-[12px] font-semibold"
+                    class="col-span-1 text-[12px] font-semibold"
                     :key="index"
                 >{{ title }}</li>
             </ul>
             <div
                 v-for="(p, actionKey) in ps"
-                class="grid grid-cols-7 p-2 border border-b-0"
+                class="grid grid-cols-6 p-2 border border-b-0"
             >
                 <div class="flex items-center col-span-1 col-start-1">
                     <h5 class="text-sm font-semibold">
                         {{ permissionMap[actionKey] }}
                     </h5>
                 </div>
+                <!-- tasks have no levels to create or view: every employee sets them and sees their own, their
+                     group's and those of the deals, companies and contacts open to them (API: task/task-access.ts) -->
                 <div
-                    v-for="(value, key, index) in p"
-                    :class="getStartCol(index, key)"
+                    v-if="actionKey === 'task'"
+                    class="col-span-2 col-start-2 flex items-center pe-2 text-[12px] text-muted-500"
                 >
-                    <Level
-                        :key="key"
-                        :level="value"
-                        :actionKey="actionKey"
-                        :permission="key"
-                        @update:value="updateValue(key, $event, actionKey)"
-                    />
+                    Ставят все; видят свои, группы и по доступным сделкам и клиентам
                 </div>
-                <div class="flex flex-col gap-1 col-span-1 col-start-7">
+                <!-- "export" stays in the stored rights, but there is no export to allow or forbid -->
+                <template v-for="(value, key, index) in p" :key="key">
+                    <div
+                        v-if="key !== 'export'"
+                        :class="getStartCol(index, key)"
+                    >
+                        <Level
+                            :level="value"
+                            :actionKey="actionKey"
+                            :permission="key"
+                            @update:value="updateValue(key, $event, actionKey)"
+                        />
+                    </div>
+                </template>
+                <div class="flex flex-col gap-1 col-span-1 col-start-6">
                     <p
                         class="text-[12px] truncate"
                         v-for="level in Object.values(levelsMap)"
@@ -110,7 +120,6 @@ const colOrders = {
     view: 3,
     update: 4,
     delete: 5,
-    export: 6,
 };
 
 const permissionMap = {
@@ -138,7 +147,6 @@ const titles = [
     'Просмотр',
     'Правка',
     'Удаление',
-    'Экспорт',
     'Уровни доступа',
 ];
 
@@ -149,25 +157,23 @@ function updateValue(key: any, value: number, actionKey: any) {
     emit('update:permissions', ps.value);
 }
 
-onUpdated(() => {
-    if (props.permissions) {
-        for (const actionKey in props.permissions) {
-            for (const key in props.permissions[actionKey]) {
-                ps.value[actionKey][key] = props.permissions[actionKey][key];
-            }
+// Only the levels the matrix has: "mail" / "file" and a stray task.view of old cards stay out of it
+// (a stray key got its own selector on top of the task note)
+function copyLevels() {
+    if (!props.permissions) return;
+    const levels = ps.value as Record<string, Record<string, number>>;
+    for (const actionKey in levels) {
+        const stored = (props.permissions as any)[actionKey];
+        if (!stored || typeof stored !== 'object') continue;
+        for (const key in levels[actionKey]) {
+            if (typeof stored[key] === 'number') levels[actionKey][key] = stored[key];
         }
     }
-});
+}
 
-onMounted(() => {
-    if (props.permissions) {
-        for (const actionKey in props.permissions) {
-            for (const key in props.permissions[actionKey]) {
-                ps.value[actionKey][key] = props.permissions[actionKey][key];
-            }
-        }
-    }
-});
+onUpdated(copyLevels);
+
+onMounted(copyLevels);
 
 </script>
 <style scoped>

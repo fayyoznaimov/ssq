@@ -52,12 +52,14 @@ const { run, data: users, isLoading } = useAsync<PaginatedResponse<User>>({
     current_page: 0,
 });
 
+// the live staff accounts, by name (GET /users/staff): GET /users?limit=1000 mixed them with the
+// contacts that Telegram, WhatsApp and calls keep adding, so new employees dropped out of the list
 const employees = computed(() => {
-    return users.value.data.filter((u) => u.role !== UserRole.CtrAgent);
+    return (users.value.data ?? []).filter((u) => u.role !== UserRole.CtrAgent);
 });
 
 onMounted(() => {
-    run(userService.find({limit: 1000}).exec());
+    run(userService.get('staff').exec());
 });
 
 function save() {

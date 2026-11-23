@@ -2,7 +2,8 @@
     <div class="flex flex-col gap-8">
         <div>
             <h1 class="text-xl">Файлы</h1>
-            <h2 class="text-sm text-gray-500">Список файлов</h2>
+            <!-- the API lists an agent's files only: of the deals they may see, their own uploads, mail attachments with the mail switch -->
+            <h2 class="text-sm text-gray-500">{{ limited ? 'Файлы доступных вам сделок и ваши загрузки' : 'Список файлов' }}</h2>
         </div>
         <div class="flex flex-wrap gap-5 justify-between">
             <div class="flex items-center gap-4">
@@ -167,6 +168,8 @@ const initialFilters: Filters = {
 };
 
 const route = useRoute();
+const currentUser = useState<User>('user');
+const limited = computed(() => currentUser.value?.role === UserRole.Agent);
 const app = useAppConfig();
 const isDarkMode = useDarkMode();
 const fileService = useService('files', {auth: true});
@@ -295,7 +298,7 @@ const columns: Column[] = [
 ];
 
 const employees = computed(() => {
-    return users.value.data.filter((u) => u.role !== UserRole.CtrAgent);
+    return (users.value.data ?? []).filter((u) => u.role !== UserRole.CtrAgent);
 });
 
 function fetchFiles() {
@@ -351,7 +354,8 @@ watch(searchQ, reload);
 watch([currentPage, sortBy, perPage], fetchFiles);
 onMounted(() => {
     fetchFiles();
-    runUsers(userService.find({limit: 1000}).exec());
+    // the staff only, by name (GET /users/staff): the first 1000 users mixed them with the contacts
+    runUsers(userService.get("staff").exec());
 });
 </script>
 

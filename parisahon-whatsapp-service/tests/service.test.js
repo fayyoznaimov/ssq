@@ -15,7 +15,10 @@ const FFMPEG = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..
 
 test('token: everything but /health needs X-WhatsApp-Service-Token', async (t) => {
   const h = await harness(t)
-  assert.deepEqual(await h.api('GET', '/health', undefined, null), { status: 200, body: { ok: true, sessions: 0, outbox: 0 } })
+  assert.deepEqual(await h.api('GET', '/health', undefined, null), {
+    status: 200,
+    body: { ok: true, sessions: 0, connected: 0, states: {}, problems: [], inbox: 0, outbox: 0, outbox_oldest_sec: 0, rejected: 0 },
+  })
   for (const [m, u] of [['GET', '/sessions'], ['GET', '/sessions/1'], ['POST', '/sessions/1/start'], ['DELETE', '/sessions/1'], ['POST', '/send'], ['GET', '/nope']]) {
     assert.equal((await h.api(m, u, undefined, null)).status, 401, `${m} ${u} without token`)
     assert.equal((await h.api(m, u, undefined, 'wrong-token')).status, 401, `${m} ${u} wrong token`)
@@ -98,7 +101,9 @@ test('unlinked on the phone (401) -> logged_out, session deleted; reconnect on o
   h.wa.last.emit('connection.update', { connection: 'open' })
   assert.equal((await h.api('GET', '/sessions/5')).body.status, 'connected')
   h.wa.last.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 401 } } } })
-  assert.deepEqual((await h.api('GET', '/sessions/5')).body, { status: 'logged_out', phone: '+998901234567', name: 'Manager One' })
+  const out = (await h.api('GET', '/sessions/5')).body
+  assert.ok(Date.parse(out.since) > 0)
+  assert.deepEqual({ ...out, since: undefined }, { status: 'logged_out', phone: '+998901234567', name: 'Manager One', since: undefined })
   await waitFor(() => !fsSync.existsSync(sessionFile(h.config.sessionsDir, 5)))
   // a new start makes a new QR session
   const pending = h.api('POST', '/sessions/5/start')

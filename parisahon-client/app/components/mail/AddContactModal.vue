@@ -7,7 +7,8 @@ import { promiseResult } from '~/utils/result';
 import { debounce } from '~/utils/search';
 
 /**
- * Creates CRM contacts (ctr_agent) from the senders of the selected emails.
+ * Creates CRM contacts (ctr_agent) from the senders of the selected emails; the stored letters
+ * from those addresses then point to the new contacts (POST /emails/contacts).
  *
  * The server requires the custom fields marked "Обязательное" (today
  * "Должность" for a contact, "Страна" and "Код Клиента" for a company), so the
@@ -39,6 +40,7 @@ const userService = useService('users', { auth: true });
 const companyService = useService('companies', { auth: true });
 const contactService = useService('contacts', { auth: true });
 const fillersService = useService('fillers', { auth: true });
+const mailService = useService('emails', { auth: true });
 const { run: runFillers, data: fillers, isLoading: fillersLoading } = useAsync<FillersResponse>({ user: [], company: [] });
 const { run: runCompanies, data: companies, isLoading: companiesLoading } = useAsync<{ data: Contact[], count: number }>({ data: [], count: 0 });
 
@@ -154,6 +156,11 @@ async function onSubmit() {
         if (!user.ok) return toast.show({ message: user.error.message, type: 'error', timeout: 4000 });
         created.push(user.value);
     }
+
+    // the stored letters from these addresses now point to the contacts (MAIL-16); a failure here
+    // does not undo the contacts, it is only told
+    const linked = await promiseResult(mailService.post('contacts', { user_ids: created.map((user) => user.id) }).exec());
+    if (!linked.ok) toast.show({ message: `Контакты созданы, но письма к ним не привязаны: ${linked.error.message}`, type: 'error', timeout: 5000 });
 
     toast.show({ message: created.length === 1 ? 'Контакт создан' : `Создано контактов: ${created.length}`, type: 'success', timeout: 3000 });
     emits('saved', created);

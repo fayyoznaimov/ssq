@@ -64,6 +64,10 @@ watch([withExtensions, whichFiles, from, to, unit], () => {
 </script>
 <template>
     <section class="px-3 pb-3 flex flex-col gap-3 pr-[3.25rem]">
+        <p class="text-xs leading-snug text-rose-600 dark:text-rose-400">
+            Файлы удаляются без корзины: из сделки и её истории, а если больше нигде не используются — и с сервера.
+            Какие файлы удалены, видно в истории сделки и в «Истории запусков» триггера. Без условий по источнику, типу или размеру ничего не удаляется.
+        </p>
         <BaseListbox 
             v-model="whichFiles"
             :items="whichFilesOptions"

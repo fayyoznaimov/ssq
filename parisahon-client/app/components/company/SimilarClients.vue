@@ -29,6 +29,8 @@ interface SimilarMatch {
     reasons: string[];
     agent_name: string | null;
     last_deal_at: string | null;
+    // false: another manager's client the user may not open — shown without a link
+    visible?: boolean;
 }
 
 const similarService = useService('companies/similar', { auth: true });
@@ -105,9 +107,12 @@ function since(date: string | null) {
             <ul class="flex flex-col gap-3">
                 <li v-for="m of [...sure, ...maybe]" :key="`${m.kind}-${m.id}`" class="flex flex-col gap-1 rounded-md bg-muted-100 p-3 dark:bg-muted-900">
                     <div class="flex flex-wrap items-baseline justify-between gap-2">
-                        <NuxtLink :to="linkOf(m)" target="_blank" class="font-medium text-primary-600 hover:underline dark:text-primary-400">
+                        <NuxtLink v-if="m.visible !== false" :to="linkOf(m)" target="_blank" class="font-medium text-primary-600 hover:underline dark:text-primary-400">
                             {{ m.name }}
                         </NuxtLink>
+                        <span v-else class="font-medium text-muted-800 dark:text-muted-100" title="Клиент другого менеджера: карточка вам не доступна">
+                            {{ m.name }}
+                        </span>
                         <span class="text-xs font-semibold" :class="m.level === 'same' ? 'text-orange-500' : 'text-muted-500'">
                             {{ m.level === 'same' ? 'почти наверняка тот же' : 'возможно, другой' }}
                         </span>

@@ -1,15 +1,19 @@
 import { PaginationRequestDto } from '../../helper/dto/pagination.dto';
 import {
   IsArray,
+  IsBooleanString,
   IsDateString,
   IsEnum,
   IsNumberString,
   IsOptional,
 } from 'class-validator';
 
+/** Status filter of GET /tasks. Without it: open tasks (what the deal page and older clients expect). */
 export enum TaskType {
+  OPEN = 'open',
   CLOSED = 'closed',
   OVERDUE = 'overdue',
+  ALL = 'all',
 }
 
 export default class SearchTaskDto extends PaginationRequestDto {
@@ -25,6 +29,16 @@ export default class SearchTaskDto extends PaginationRequestDto {
   @IsNumberString()
   deal_id: number;
 
+  /** Tasks of a client company: linked to it, to one of its deals or to one of its contacts. */
+  @IsOptional()
+  @IsNumberString()
+  company_id: number;
+
+  /** Tasks of a contact: linked to the contact or to a deal of the contact. */
+  @IsOptional()
+  @IsNumberString()
+  ctr_agent_id: number;
+
   @IsOptional()
   @IsArray()
   assigned_to: number[];
@@ -32,6 +46,11 @@ export default class SearchTaskDto extends PaginationRequestDto {
   @IsOptional()
   @IsArray()
   created_by: number[];
+
+  /** "Мои": assigned to the current user or to the current user's group. */
+  @IsOptional()
+  @IsBooleanString()
+  mine: string;
 
   @IsOptional()
   @IsEnum(TaskType)

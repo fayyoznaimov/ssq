@@ -1,8 +1,10 @@
 import { ClientHistoryService } from '../deal/client-history.service';
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
+  ForbiddenException,
   Get,
   Param,
   ParseIntPipe,
@@ -11,15 +13,15 @@ import {
   Query,
   Req,
 } from '@nestjs/common';
-import { RecordAccess } from '../auth/access';
+import { Access, RecordAccess } from '../auth/access';
 import { Request } from 'express';
 import { UserService } from './user.service';
 import { CreateUserDto } from './dto/create.user.dto';
 import { AuthGuard, AuthUser } from '../auth/auth.guard';
 import { Roles } from '../auth/decorator/roles.decorator';
 import { instanceToPlain } from 'class-transformer';
-import { ChangeOwnPasswordDto, UpdateUserDto } from './dto/update.user.dto';
-import { SearchUserQueryDto } from './dto/search.user.query.dto';
+import { ChangeOwnPasswordDto, UpdateOwnProfileDto, UpdateUserDto } from './dto/update.user.dto';
+import { SearchUserQueryDto, StaffQueryDto } from './dto/search.user.query.dto';
 import { PaginationRequestDto } from '../helper/dto/pagination.dto';
 import { EventsService } from 'src/events/events.service';
 import { SearchEventDto } from 'src/events/dto/search.event.dto';
@@ -49,7 +51,28 @@ export class UserController {
     return instanceToPlain(this.userService.getManagerStatistics(query));
   }
 
+  /**
+   * The staff accounts only (admin, manager, agent), by name and without a page limit: the pickers
+   * and filters of the responsible user and the assignee. Declared before ':id'.
+   */
+  @Get('staff')
+  async fetchStaff(
+    @Query() query: StaffQueryDto,
+    @Req() request: Request,
+  ): Promise<Record<string, any>> {
+    const requester: AuthUser = request['user'];
+    const response = instanceToPlain(await this.userService.fetchStaff(query), {
+      groups: [requester.role],
+    });
+    response.data = (response.data ?? []).map((user: Record<string, any>) =>
+      this.hideStaffDetails(user, requester),
+    );
+    return response;
+  }
+
+  // a contact: within the contact view right (a staff account: as before, hideStaffDetails)
   @Get(':id')
+  @RecordAccess('contact', 'view')
   async fetchUser(
     @Param('id', ParseIntPipe) id: number,
     @Req() request: Request,
@@ -64,20 +87,29 @@ export class UserController {
     );
   }
 
-  /** Every deal a contact is linked to (tab "Сделки" of the contact card). */
+  /**
+   * Every deal a contact is linked to (tab "Сделки" of the contact card). The deals of a contact the user may see (an agent got 403 for every contact before: the rule
+   * of a colleague's data applied); of a staff account: their own, or admin / manager.
+   */
   @Get(':id/deals')
-  @RecordAccess('staffData', 'view')
-  async fetchUserDeals(@Param('id', ParseIntPipe) id: number) {
-    return this.clientHistory.forContact(id);
+  @RecordAccess('contact', 'view')
+  async fetchUserDeals(@Param('id', ParseIntPipe) id: number, @Req() request: Request) {
+    const access = new Access(request['user']);
+    await this.eventService.assertUserFeedAccess(id, access);
+    return this.clientHistory.forContact(id, access);
   }
 
+  /** The feed of a contact (the events of their deals the user may see) or of one's own account. */
   @Get(':id/events')
-  @RecordAccess('staffData', 'view')
+  @RecordAccess('contact', 'view')
   async fetchUserEvents(
     @Param('id', ParseIntPipe) id: number,
     @Query() query: SearchEventDto,
+    @Req() request: Request,
   ): Promise<Record<string, any>> {
-    return instanceToPlain(await this.eventService.fetchUserEvents(id, query));
+    return instanceToPlain(
+      await this.eventService.fetchUserEvents(id, query, new Access(request['user'])),
+    );
   }
 
   /**
@@ -91,7 +123,8 @@ export class UserController {
     @Req() request: Request,
   ): Promise<Record<string, any>> {
     const requester: AuthUser = request['user'];
-    const response = instanceToPlain(await this.userService.fetchAll(query));
+    // contacts only within the contact view right; staff accounts for everyone (the pickers)
+    const response = instanceToPlain(await this.userService.fetchAll(query, requester));
 
     if (Array.isArray(response?.data)) {
       response.data = response.data.map((user: Record<string, any>) =>
@@ -125,6 +158,10 @@ export class UserController {
     @Body() data: CreateUserDto,
     @Req() request: Request,
   ): Promise<Record<string, any>> {
+    // "Создание контактов" of the user card (was not checked anywhere)
+    if (data.role === RoleEnum.CTR_AGENT && !new Access(request['user']).can('contact', 'create')) {
+      throw new ForbiddenException('No right to create contacts');
+    }
     return instanceToPlain(
       await this.userService.createUser(request['user'].role, data, request),
     );
@@ -143,6 +180,15 @@ export class UserController {
     return this.userService.changeOwnPassword(request['user'].sub, data);
   }
 
+  /** Own name and phone, any staff user (PATCH /users/:id of a staff account is admin only). */
+  @Patch('me')
+  async updateOwnProfile(
+    @Body() data: UpdateOwnProfileDto,
+    @Req() request: Request,
+  ): Promise<{ id: number; username: string; phone: string | null }> {
+    return this.userService.updateOwnProfile(request['user'].sub, data);
+  }
+
   @Patch(':id')
   @RecordAccess('contact', 'update')
   async update(
@@ -153,13 +199,22 @@ export class UserController {
     return this.userService.updateUser(id, request, data);
   }
 
+  /**
+   * successor_id (a staff account, admin): the colleague who takes over the open deals and tasks.
+   * Answers how many were moved.
+   */
   @Delete(':id')
   @RecordAccess('contact', 'delete')
   async delete(
     @Param('id', ParseIntPipe) id: number,
+    @Query('successor_id') successorId: string | undefined,
     @Req() request: Request,
-  ): Promise<void> {
-    return this.userService.deleteUser(id, request['user']?.sub);
+  ): Promise<{ deals: number; tasks: number }> {
+    const successor = successorId === undefined || successorId === '' ? undefined : Number(successorId);
+    if (successor !== undefined && (!Number.isInteger(successor) || successor < 1)) {
+      throw new BadRequestException('successor_id must be a user id');
+    }
+    return this.userService.deleteUser(id, request['user']?.sub, successor);
   }
 
   /**

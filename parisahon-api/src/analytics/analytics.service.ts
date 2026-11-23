@@ -16,6 +16,8 @@ import {
 import { Company } from 'src/company/company.entity';
 import { Task } from 'src/task/task.entity';
 import { periodBounds } from './period';
+import { ControlService } from './control.service';
+import { PeriodQueryDto } from './dto/period.query.dto';
 
 /** Staff roles: the people the reports are about (clients' contacts are not) */
 const STAFF_ROLES = [RoleEnum.ADMIN, RoleEnum.MANAGER, RoleEnum.AGENT];
@@ -41,9 +43,20 @@ export class AnalyticsService {
     @InjectRepository(Task)
     private taskRepository: Repository<Task>,
     private helperService: HelperService,
+    private controlService: ControlService,
   ) {}
 
+  /** A period of a report when both ends are given (plain end dates include the whole day), else null. */
+  private static periodOf(query: { from_date?: string | Date; till_date?: string | Date }) {
+    return query?.from_date && query?.till_date ? periodBounds({ from_date: query.from_date, till_date: query.till_date }) : null;
+  }
+
+  /**
+   * «Анализ продаж»: deals by stage of the active pipeline. With a period (from_date / till_date):
+   * only the deals created in it, like the other reports with a period.
+   */
   async dealAnalytics(query: DealAnalyticsQuery): Promise<Record<string, any>> {
+    const period = AnalyticsService.periodOf(query);
     let stageStatsQb = this.dealStageRecordRepository
       .createQueryBuilder('t0')
       .select('COUNT(t0.deal_id)', 'deal_count')
@@ -60,19 +73,25 @@ export class AnalyticsService {
     } else if (query.is_active === 'false') {
       stageStatsQb = stageStatsQb.andWhere('t3.closed_at IS NOT NULl');
     }
+    if (period) {
+      stageStatsQb = stageStatsQb.andWhere('t3.created_at >= :from_date AND t3.created_at <= :till_date', period);
+    }
 
     const stageStats = await stageStatsQb.groupBy('t1.id').getRawMany();
 
     const stageStatsMap = this.helperService.createHashMap(stageStats);
 
-    const dealStats = await this.dealRepository
+    const dealStatsQb = this.dealRepository
       .createQueryBuilder('t0')
       .select(
         'AVG(EXTRACT(EPOCH FROM (t0.closed_at - t0.created_at)) / 60)',
         'average_deal_duration_in_minutes',
       )
-      .addSelect('COUNT(t0.*)', 'total_deal_count')
-      .getRawOne();
+      .addSelect('COUNT(t0.*)', 'total_deal_count');
+    if (period) {
+      dealStatsQb.where('t0.created_at >= :from_date AND t0.created_at <= :till_date', period);
+    }
+    const dealStats = await dealStatsQb.getRawOne();
 
     const stages = await this.dealStageRepository
       .createQueryBuilder('t0')
@@ -104,13 +123,16 @@ export class AnalyticsService {
   }
 
   /**
-   * Calls per employee. `recording.duration` is stored in milliseconds by the
-   * recorder; every duration here is returned in minutes (one decimal), which
-   * is how the page labels them.
+   * Calls per employee: the call recordings (`recording`, one row per call — the same calls
+   * «Контроль» and «По менеджерам» count), of the period when from_date / till_date are given
+   * (by the time of the call), else of all time. `recording.duration` is stored in milliseconds
+   * by the recorder; every duration here is returned in minutes (one decimal), which is how the
+   * page labels them.
    */
-  async callAnalytics(): Promise<Record<string, any>> {
+  async callAnalytics(query: PeriodQueryDto = {}): Promise<Record<string, any>> {
     const ms = MS_PER_MINUTE;
-    const query = `
+    const period = AnalyticsService.periodOf(query);
+    const sql = `
     SELECT
       u.id AS user_id,
       u.username AS user_name,
@@ -125,13 +147,14 @@ export class AnalyticsService {
         recording r
     JOIN
         public.user u ON r.user_id = u.id
+    ${period ? 'WHERE r.created_at >= $1 AND r.created_at <= $2' : ''}
     GROUP BY
         u.id, u.username
     ORDER BY
         u.username;
   `;
 
-    const rows = await this.recordingRepository.query(query);
+    const rows = await this.recordingRepository.query(sql, period ? [period.from_date, period.till_date] : []);
 
     return rows.map((row) => ({
       user_id: +row.user_id,
@@ -145,6 +168,94 @@ export class AnalyticsService {
       total_call_duration: +row.total_call_duration,
       duration_unit: 'minutes',
     }));
+  }
+
+  /**
+   * «По менеджерам»: one row per staff member — admin, manager and agent (the salespeople are
+   * agents) — for the period, counted the way every other report counts:
+   *  - new deals: deals the employee is responsible for (agent_id), created in the period;
+   *  - won: those in the successful stage (DEAL_STAGE_CLOSED) closed in the period (by closed_at),
+   *    as the consolidated report and the goals count them;
+   *  - new clients: companies the employee created in the period (not marked old);
+   *  - calls: the call recordings of the period, as «Звонки» and «Контроль» count them; minutes;
+   *  - answers: «Контроль» (ControlService) — medians in working hours of the first answer to a new
+   *    client and of any answer, the share answered within the norm.
+   * An account that was deleted is listed only when it has numbers in the period.
+   * Before (GET /users/manager-statistics, kept for older clients) it was role "manager" only, all
+   * time, deals by creator, raw milliseconds counted once per linked deal, calendar seconds.
+   */
+  async managerAnalytics(from: Date, till: Date): Promise<Record<string, any>> {
+    const rows: any[] = await this.userRepository.query(
+      `SELECT u.id, u.username, u.email, u.phone, u.role, g.name AS group_name, (u.deleted_at IS NOT NULL) AS deleted,
+              nd.count AS deal_count, nd.budget AS deal_budget, nd.average AS average_budget,
+              wd.count AS won_count, wd.budget AS won_budget,
+              (SELECT COUNT(*) FROM company c WHERE c.created_by = u.id AND c.deleted_at IS NULL AND c.is_old = false
+                  AND c.created_at >= $1 AND c.created_at <= $2) AS new_client_count,
+              rc.count AS call_count, rc.outgoing AS outgoing_call_count, rc.duration AS total_call_duration
+         FROM "user" u
+         LEFT JOIN "group" g ON g.id = u.group_id
+         LEFT JOIN LATERAL (
+           SELECT COUNT(*) AS count, COALESCE(SUM(d.budget), 0) AS budget, COALESCE(AVG(d.budget), 0) AS average
+             FROM deal d WHERE d.agent_id = u.id AND d.deleted_at IS NULL AND d.created_at >= $1 AND d.created_at <= $2
+         ) nd ON TRUE
+         LEFT JOIN LATERAL (
+           SELECT COUNT(*) AS count, COALESCE(SUM(d.budget), 0) AS budget
+             FROM deal d JOIN deal_stage s ON s.id = d.stage_id
+            WHERE d.agent_id = u.id AND d.deleted_at IS NULL AND d.closed_at IS NOT NULL
+              AND d.closed_at >= $1 AND d.closed_at <= $2 AND s.name = $3
+         ) wd ON TRUE
+         LEFT JOIN LATERAL (
+           SELECT COUNT(*) AS count, COUNT(*) FILTER (WHERE r.outgoing) AS outgoing, COALESCE(SUM(r.duration), 0) AS duration
+             FROM recording r WHERE r.user_id = u.id AND r.created_at >= $1 AND r.created_at <= $2
+         ) rc ON TRUE
+        WHERE u.role IN ('admin', 'manager', 'agent')
+        ORDER BY u.username`,
+      [from, till, process.env.DEAL_STAGE_CLOSED ?? ''],
+    );
+    const control = await this.controlService.report({
+      from,
+      till,
+      slaMinutes: Number(process.env.CONTROL_SLA_MINUTES || 15),
+      waitingHours: 2,
+    });
+    const answersOf = new Map<number, any>((control.agents ?? []).map((a: any) => [Number(a.id), a]));
+
+    const data = rows
+      .map((row) => {
+        const answers = answersOf.get(Number(row.id));
+        const calls = +row.call_count;
+        return {
+          id: +row.id,
+          username: row.username,
+          email: row.email,
+          phone: row.phone,
+          role: row.role,
+          group_name: row.group_name ?? null,
+          deleted: row.deleted === true,
+          deal_count: +row.deal_count,
+          deal_budget: +row.deal_budget,
+          average_budget: Math.round(+row.average_budget),
+          won_count: +row.won_count,
+          won_budget: +row.won_budget,
+          new_client_count: +row.new_client_count,
+          call_count: calls,
+          outgoing_call_count: +row.outgoing_call_count,
+          incoming_call_count: calls - +row.outgoing_call_count,
+          // milliseconds as stored; call_minutes is what the page shows
+          total_call_duration: +row.total_call_duration,
+          call_minutes: Math.round((+row.total_call_duration / MS_PER_MINUTE) * 10) / 10,
+          turns: answers?.turns ?? 0,
+          answered: answers?.answered ?? 0,
+          late: answers?.late ?? 0,
+          unanswered: answers?.unanswered ?? 0,
+          first_response_median_sec: answers?.first_response_median_sec ?? null,
+          response_median_sec: answers?.response_median_sec ?? null,
+          in_sla_share: answers?.in_sla_share ?? null,
+        };
+      })
+      .filter((row) => !row.deleted || row.deal_count || row.won_count || row.new_client_count || row.call_count || row.turns);
+
+    return { period: { from, till }, norm: control.norm, data };
   }
 
   /**

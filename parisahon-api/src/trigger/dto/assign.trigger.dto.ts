@@ -47,11 +47,18 @@ export class CreateTaskContents {
   @Type(() => TaskResponsible)
   responsible: TaskResponsible;
 
+  // minutes from the event; a whole number of days means the end of that working day
+  // (see TriggerActionsService.taskDeadline), 0 = at the moment of the event
   @IsNumber()
   end_time_in_minutes: number;
 
   @IsBoolean()
   all_day: boolean;
+
+  // «Конец дня»: the end of today's working day (CONTROL_WORK_HOURS), end_time_in_minutes is ignored
+  @IsOptional()
+  @IsIn(['end_of_working_day'])
+  deadline?: 'end_of_working_day';
 }
 
 // endregion
@@ -177,6 +184,11 @@ export class DealFilter {
 
   @IsBoolean()
   is_filler: boolean;
+
+  // a custom field is kept by its id too (filled in by the API), so renaming the field keeps the trigger
+  @IsOptional()
+  @IsNumber()
+  filler_id?: number;
 }
 
 export enum ApplyTriggerWhenEnum {
@@ -188,6 +200,7 @@ export enum ApplyTriggerWhenEnum {
   EVERY_YEAR = 'every_year',
   EMAIL_RECEIVED = 'email_received',
   TG_MESSAGE_RECEIVED = 'tg_message_received',
+  WA_MESSAGE_RECEIVED = 'wa_message_received',
   CALL_RECORDED = 'call_recorded',
 }
 
@@ -239,6 +252,7 @@ export class ApplyWhenDto {
   )
   day: number;
 
+  // «сотрудник»: only events of this employee (the sender, the manager of the chat or the call)
   @IsOptional()
   @IsNumber()
   @IsPositive()
@@ -246,20 +260,38 @@ export class ApplyWhenDto {
     [
       ApplyTriggerWhenEnum.EMAIL_RECEIVED,
       ApplyTriggerWhenEnum.TG_MESSAGE_RECEIVED,
+      ApplyTriggerWhenEnum.WA_MESSAGE_RECEIVED,
       ApplyTriggerWhenEnum.CALL_RECORDED,
     ].includes(o.when),
   )
   from_user_id: number;
 
+  // the direction of the message or call; not set = any
   @IsOptional()
   @IsBoolean()
   @ValidateIf((o) =>
     [
       ApplyTriggerWhenEnum.EMAIL_RECEIVED,
       ApplyTriggerWhenEnum.TG_MESSAGE_RECEIVED,
+      ApplyTriggerWhenEnum.WA_MESSAGE_RECEIVED,
+      ApplyTriggerWhenEnum.CALL_RECORDED,
     ].includes(o.when),
   )
   outgoing: boolean;
+
+  // repeats for one deal (not for the recurring ones, they follow their schedule):
+  // only once for a deal, ever; not set = only "create deal" (TriggerService.repeatRule)
+  @IsOptional()
+  @IsBoolean()
+  once_per_deal?: boolean;
+
+  // not again for the same deal within this many minutes; 0 = every time;
+  // not set = a day for "send email", else 0 (TriggerService.repeatRule)
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(525600)
+  cooldown_minutes?: number;
 }
 
 export class AssignTriggerDto {

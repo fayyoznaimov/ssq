@@ -191,6 +191,25 @@ export class FillerService {
     return;
   }
 
+  /**
+   * GET /fillers/:id/usage: how many companies, contacts, deals and products have a value of the field.
+   * Deleting a field deletes all of its values (ON DELETE CASCADE): the web asks for this number first.
+   */
+  async usage(id: number): Promise<{ id: number; field: string; target: string; values: number }> {
+    const filler = await this.fillerRepository.findOneBy({ id });
+    if (!filler) {
+      throw new NotFoundException();
+    }
+    const rows: { total: string }[] = await this.fillerRepository.query(
+      `SELECT (SELECT count(*) FROM company_filler WHERE filler_id = $1)
+            + (SELECT count(*) FROM user_filler WHERE filler_id = $1)
+            + (SELECT count(*) FROM deal_filler WHERE filler_id = $1)
+            + (SELECT count(*) FROM product_filler WHERE filler_id = $1) AS total`,
+      [id],
+    );
+    return { id: filler.id, field: filler.field, target: filler.target, values: Number(rows[0]?.total ?? 0) };
+  }
+
   async delete(id: number): Promise<void> {
     const result = await this.fillerRepository.delete(id);
 

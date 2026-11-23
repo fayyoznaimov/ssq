@@ -23,6 +23,15 @@ export class FillerController {
     return this.fillerService.fetchAll();
   }
 
+  /** How many records have a value of the field: the web shows it before the field is deleted. */
+  @Roles(AuthGuard.ADMIN_LEVEL)
+  @Get(':id/usage')
+  async usage(
+    @Param('id', ParseIntPipe) id: number,
+  ): Promise<{ id: number; field: string; target: string; values: number }> {
+    return this.fillerService.usage(id);
+  }
+
   @Roles(AuthGuard.ADMIN_LEVEL)
   @Post()
   async create(@Body() data: UpdateFillerDto): Promise<Filler> {

@@ -1,5 +1,8 @@
 import { Injectable } from '@nestjs/common';
 import { DataSource } from 'typeorm';
+import { Access } from '../auth/access';
+import { AuthUser } from '../auth/auth.guard';
+import { phoneKey } from '../helper/phone';
 
 /**
  * "Похоже, такой клиент уже есть": companies and contacts that look like the one being typed.
@@ -30,6 +33,17 @@ export interface SimilarMatch {
   reasons: string[];
   agent_name: string | null;
   last_deal_at: string | null;
+  // false: the user may not open this record (another manager's client): shown without a link
+  visible: boolean;
+}
+
+/** A condition with named parameters (Access) put into raw SQL with $n parameters. */
+function bindNamed(sql: string, named: Record<string, any>, params: unknown[]): string {
+  return sql.replace(/:(\w+)/g, (match, name: string) => {
+    if (!(name in named)) return match;
+    params.push(named[name]);
+    return `$${params.length}`;
+  });
 }
 
 const LEGAL = [
@@ -133,8 +147,14 @@ export function emailHint(value: string | undefined): string | null {
 export class SimilarService {
   constructor(private dataSource: DataSource) {}
 
-  async find(q: SimilarQuery) {
-    const phone = digits(q.phone).slice(-9);
+  /**
+   * `exclude_company_id`: the company being edited and its own contacts are not "similar" (its phone
+   * is often its primary contact's, so the card warned about itself). The responsible manager and the
+   * last deal are read for the found records only (it was two subqueries for every row of the CRM).
+   * `requester`: a match the user may not open is marked `visible: false`.
+   */
+  async find(q: SimilarQuery, requester?: AuthUser) {
+    const phone = phoneKey(q.phone) ?? '';
     const inn = digits(q.inn);
     const email = String(q.email ?? '').trim().toLowerCase();
     const domain = email.includes('@') ? email.split('@').pop() ?? '' : '';
@@ -142,22 +162,15 @@ export class SimilarService {
     const name = String(q.name ?? '').trim();
 
     const companies: any[] = await this.dataSource.query(
-      `SELECT c.id, c.name, c.email, c.phone, c.inn,
-              (SELECT u.username FROM deal d JOIN "user" u ON u.id = d.agent_id
-                WHERE d.company_id = c.id AND d.deleted_at IS NULL ORDER BY d.created_at DESC LIMIT 1) AS agent_name,
-              (SELECT MAX(d.created_at) FROM deal d WHERE d.company_id = c.id AND d.deleted_at IS NULL) AS last_deal_at
-         FROM company c WHERE c.deleted_at IS NULL AND c.id <> $1`,
+      `SELECT c.id, c.name, c.email, c.phone, c.inn FROM company c WHERE c.deleted_at IS NULL AND c.id <> $1`,
       [q.exclude_company_id ?? 0],
     );
     const contacts: any[] = await this.dataSource.query(
-      `SELECT u.id, u.username AS name, u.email, u.phone, u.company_id, c.name AS company_name,
-              (SELECT a.username FROM deal_user du JOIN deal d ON d.id = du."dealId" JOIN "user" a ON a.id = d.agent_id
-                WHERE du."userId" = u.id AND d.deleted_at IS NULL ORDER BY d.created_at DESC LIMIT 1) AS agent_name,
-              (SELECT MAX(d.created_at) FROM deal_user du JOIN deal d ON d.id = du."dealId"
-                WHERE du."userId" = u.id AND d.deleted_at IS NULL) AS last_deal_at
-         FROM "user" u LEFT JOIN company c ON c.id = u.company_id
-        WHERE u.role = 'ctr_agent' AND u.deleted_at IS NULL AND u.id <> $1`,
-      [q.exclude_contact_id ?? 0],
+      `SELECT u.id, u.username AS name, u.email, u.phone, u.company_id, c.name AS company_name
+         FROM "user" u LEFT JOIN company c ON c.id = u.company_id AND c.deleted_at IS NULL
+        WHERE u.role = 'ctr_agent' AND u.deleted_at IS NULL AND u.id <> $1
+          AND (u.company_id IS NULL OR u.company_id <> $2)`,
+      [q.exclude_contact_id ?? 0, q.exclude_company_id ?? 0],
     );
 
     const matches: SimilarMatch[] = [];
@@ -180,16 +193,74 @@ export class SimilarService {
         kind, id: r.id, name: r.name, company_id: kind === 'company' ? r.id : r.company_id ?? null,
         company_name: kind === 'company' ? r.name : r.company_name ?? null,
         level: strong > 0 ? 'same' : 'possible', reasons,
-        agent_name: r.agent_name ?? null, last_deal_at: r.last_deal_at ?? null,
+        agent_name: null, last_deal_at: null, visible: true,
       });
     };
     companies.forEach((r) => judge('company', r));
     contacts.forEach((r) => judge('contact', r));
     matches.sort((a, b) => (a.level === b.level ? b.reasons.length - a.reasons.length : a.level === 'same' ? -1 : 1));
+    const top = matches.slice(0, 10);
+    await this.describe(top, requester);
 
     return {
-      matches: matches.slice(0, 10),
+      matches: top,
       hints: { phone: phoneHint(q.phone), email: emailHint(q.email), inn: q.inn && /\s/.test(q.inn) ? `Пробелы уберём сами, сохраним как ${inn}` : null },
     };
+  }
+
+  /** Who leads the found clients (the manager of the latest deal), when the last deal was, and may the user open them. */
+  private async describe(matches: SimilarMatch[], requester?: AuthUser): Promise<void> {
+    const companyIds = matches.filter((m) => m.kind === 'company').map((m) => m.id);
+    const contactIds = matches.filter((m) => m.kind === 'contact').map((m) => m.id);
+    const info = new Map<string, { agent_name: string | null; last_deal_at: string | null }>();
+    if (companyIds.length) {
+      const rows: any[] = await this.dataSource.query(
+        `SELECT d.company_id AS id, MAX(d.created_at) AS last_deal_at,
+                (array_agg(a.username ORDER BY d.created_at DESC) FILTER (WHERE a.username IS NOT NULL))[1] AS agent_name
+           FROM deal d LEFT JOIN "user" a ON a.id = d.agent_id
+          WHERE d.deleted_at IS NULL AND d.company_id = ANY($1)
+          GROUP BY d.company_id`,
+        [companyIds],
+      );
+      rows.forEach((r) => info.set(`company-${r.id}`, r));
+    }
+    if (contactIds.length) {
+      const rows: any[] = await this.dataSource.query(
+        `SELECT du."userId" AS id, MAX(d.created_at) AS last_deal_at,
+                (array_agg(a.username ORDER BY d.created_at DESC) FILTER (WHERE a.username IS NOT NULL))[1] AS agent_name
+           FROM deal_user du JOIN deal d ON d.id = du."dealId" LEFT JOIN "user" a ON a.id = d.agent_id
+          WHERE d.deleted_at IS NULL AND du."userId" = ANY($1)
+          GROUP BY du."userId"`,
+        [contactIds],
+      );
+      rows.forEach((r) => info.set(`contact-${r.id}`, r));
+    }
+    for (const match of matches) {
+      const found = info.get(`${match.kind}-${match.id}`);
+      match.agent_name = found?.agent_name ?? null;
+      match.last_deal_at = found?.last_deal_at ?? null;
+    }
+
+    if (!requester) return;
+    const access = new Access(requester);
+    const visible = new Set<string>();
+    for (const [kind, ids, alias, cond] of [
+      ['company', companyIds, 'c', access.companySql('c', 'view')],
+      ['contact', contactIds, 'u', access.contactSql('u', 'view')],
+    ] as const) {
+      if (!ids.length) continue;
+      if (cond.sql === 'TRUE') {
+        ids.forEach((id) => visible.add(`${kind}-${id}`));
+        continue;
+      }
+      const params: unknown[] = [ids];
+      const table = kind === 'company' ? 'company' : '"user"';
+      const rows: { id: number }[] = await this.dataSource.query(
+        `SELECT ${alias}.id FROM ${table} ${alias} WHERE ${alias}.id = ANY($1) AND ${bindNamed(cond.sql, cond.params, params)}`,
+        params,
+      );
+      rows.forEach((r) => visible.add(`${kind}-${r.id}`));
+    }
+    for (const match of matches) match.visible = visible.has(`${match.kind}-${match.id}`);
   }
 }

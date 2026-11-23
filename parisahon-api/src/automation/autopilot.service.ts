@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnApplicationBootstrap, OnApplicationShutdown } from '@nestjs/common';
 import { DataSource } from 'typeorm';
-import { CHAT_TYPES, WorkSchedule } from '../analytics/control.service';
+import { ANSWER_TYPES, CHAT_TYPES, WorkSchedule, answerSql, clientMessageSql } from '../analytics/control.service';
 import { AUTO_NEXT_STEP, AUTO_REPLY, AutoTaskService } from './auto-task.service';
 
 /**
@@ -11,7 +11,8 @@ import { AUTO_NEXT_STEP, AUTO_REPLY, AutoTaskService } from './auto-task.service
  *     only deals with activity in the last 60 days (AUTOPILOT_ACTIVE_DAYS), and not while the client
  *     waits for an answer (that is the other process).
  *  2. A task «Авто: ответьте клиенту» (made by the «клиент ждёт ответа» process when the manager has
- *     no bot) closes itself as soon as the client gets an answer in the deal.
+ *     no bot) closes itself as soon as the client gets an answer in the deal: a message, a letter or
+ *     an outgoing call (answerSql, the same rule as «Контроль менеджеров»).
  * AUTOPILOT=0 turns everything off, AUTOPILOT_NEXT_STEP=0 only rule 1. Period: AUTOPILOT_SEC (600).
  */
 @Injectable()
@@ -51,14 +52,22 @@ export class AutopilotService implements OnApplicationBootstrap, OnApplicationSh
     }
   }
 
-  /** «Авто: ответьте клиенту» is done once somebody answered in the deal after the task appeared. */
+  /**
+   * «Авто: ответьте клиенту» is done once somebody answered in the deal after the task appeared, or
+   * after the client message it was made for: a call is dated by the call, and its recording comes from
+   * the phone later than the task (the manager called back at 10:05, the task appeared at 10:15).
+   */
   private async closeAnswered(): Promise<number> {
     const result = await this.dataSource.query(
       `UPDATE task t SET closed_at = now(), result = 'Клиенту ответили'
         WHERE t.closed_at IS NULL AND t.label LIKE $2
           AND EXISTS (SELECT 1 FROM event o
-                       WHERE o.deal_id = t.deal_id AND o.outgoing AND o.type = ANY($1) AND o.created_at > t.created_at)`,
-      [CHAT_TYPES, `${AUTO_REPLY}%`],
+                       WHERE o.deal_id = t.deal_id AND ${answerSql('o', '$1')}
+                         AND (o.created_at > t.created_at
+                              OR o.created_at > (SELECT MAX(c.created_at) FROM event c
+                                                  WHERE c.deal_id = t.deal_id AND ${clientMessageSql('c', '$3')}
+                                                    AND c.created_at <= t.created_at)))`,
+      [ANSWER_TYPES, `${AUTO_REPLY}%`, CHAT_TYPES],
     );
     return Array.isArray(result) ? Number(result[1] ?? 0) : 0;
   }
@@ -84,11 +93,11 @@ export class AutopilotService implements OnApplicationBootstrap, OnApplicationSh
                OR EXISTS (SELECT 1 FROM event a WHERE a.deal_id = d.id AND a.created_at > now() - make_interval(days => $4::int)))
           -- the client wrote last: the next step is the answer, «клиент ждёт ответа» takes care of it
           AND NOT EXISTS (SELECT 1 FROM event c
-                           WHERE c.deal_id = d.id AND c.type = ANY($3) AND NOT c.outgoing AND c.created_at > now() - interval '3 days'
+                           WHERE c.deal_id = d.id AND ${clientMessageSql('c', '$3')} AND c.created_at > now() - interval '3 days'
                              AND NOT EXISTS (SELECT 1 FROM event o
-                                              WHERE o.deal_id = d.id AND o.type = ANY($3) AND o.outgoing AND o.created_at > c.created_at))
+                                              WHERE o.deal_id = d.id AND ${answerSql('o', '$5')} AND o.created_at > c.created_at))
         ORDER BY d.id LIMIT 50`,
-      [AUTO_NEXT_STEP, closedNames, CHAT_TYPES, Math.max(1, Number(process.env.AUTOPILOT_ACTIVE_DAYS || 60))],
+      [AUTO_NEXT_STEP, closedNames, CHAT_TYPES, Math.max(1, Number(process.env.AUTOPILOT_ACTIVE_DAYS || 60)), ANSWER_TYPES],
     );
 
     let created = 0;

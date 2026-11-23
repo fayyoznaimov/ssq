@@ -88,13 +88,16 @@ test('network error: queued like a 5xx', async (t) => {
   t.after(() => {})
 })
 
-test('4xx: logged and dropped, never queued; a refused queued message does not block the others', async (t) => {
+test('4xx: kept aside in rejected (never queued, never lost); a refused queued message does not block the others', async (t) => {
   const s = await setup()
   t.after(() => s.crm.close())
   s.crm.status = 400
   const box = s.make()
   assert.equal(await box.deliver(payload('BAD')), null)
   assert.equal(box.size, 0)
+  assert.equal(box.rejectedCount, 1)
+  assert.equal(box.rejected[0].status, 400)
+  assert.equal(box.rejected[0].payload.wa_message_id, 'BAD')
 
   s.crm.status = 500
   await box.deliver(payload('Q1'))
@@ -104,6 +107,37 @@ test('4xx: logged and dropped, never queued; a refused queued message does not b
   assert.equal(await box.flush(), 1)
   assert.equal(box.size, 0)
   assert.deepEqual(s.results, [['Q2', 'saved']])
+  assert.equal(box.rejectedCount, 2)
+  // the rejected list survives a restart (the watchdog counts it)
+  const again = s.make()
+  await again.load()
+  assert.equal(again.rejectedCount, 2)
+})
+
+test('401 (a changed token) waits in the outbox; a message that keeps failing with 500 does not hold up the others and is set aside', async (t) => {
+  const s = await setup()
+  t.after(() => s.crm.close())
+  s.crm.status = 401
+  const box = s.make()
+  assert.equal(await box.deliver(payload('T1')), null)
+  assert.equal(box.size, 1)
+  assert.equal(box.rejectedCount, 0)
+
+  // the API fails on P1 only (500); P2 behind it goes through
+  s.crm.status = (n) => (s.crm.requests[n - 1].body.wa_message_id === 'P1' ? 500 : 201)
+  s.tick(60_000)
+  assert.equal(await box.flush(), 1) // T1
+  assert.equal(await box.deliver(payload('P1')), null) // 500: queued with its own pause
+  assert.equal(await box.deliver(payload('P2')), null) // queued behind it, flushed at once
+  assert.deepEqual(s.results.map((r) => r[0]), ['T1', 'P2'])
+  assert.equal(box.size, 1)
+  for (let i = 0; i < 12 && box.size; i += 1) {
+    s.tick(3_600_000)
+    await box.flush()
+  }
+  assert.equal(box.size, 0)
+  assert.equal(box.rejectedCount, 1)
+  assert.equal(box.rejected[0].payload.wa_message_id, 'P1')
 })
 
 test('a wrong key: the outbox file is moved aside, the service goes on', async (t) => {

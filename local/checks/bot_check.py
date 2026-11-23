@@ -258,6 +258,10 @@ def main():
         deal_b = int(psql(f"insert into deal (label, display_id, budget, stage_id, agent_id, company_id) values ('{TAG} сделка B', {random.randint(10**8, 2 * 10**9)}, 7000000, {stage}, {B['id']}, {company_id}) returning id").split("\n")[0])
         for deal, text in ((deal_a, "msg-A"), (deal_b, "msg-B")):
             psql(f"""insert into event (type, outgoing, deal_id, after_state) values (12, false, {deal}, '{{"message": "{TAG} {text}", "outgoing": false}}')""")
+        # A's deal also has a WhatsApp message with a file and a client's e-mail (the bot's history used to skip
+        # WhatsApp, and told the e-mail text to people without the "mail" right)
+        psql(f"""insert into event (type, outgoing, deal_id, after_state) values (16, false, {deal_a}, '{{"message": "{TAG} wa-A", "outgoing": false, "files": [{{"name": "price.pdf", "type": "document"}}]}}')""")
+        psql(f"""insert into event (type, outgoing, deal_id, after_state) values (9, false, {deal_a}, '{{"data": {{"subject": "{TAG} mail-subject", "body": "{TAG} mail-secret-body"}}}}')""")
 
         # tasks of A: one starts in 5 minutes (reminder), one is overdue (digest, /tasks)
         now = datetime.now(timezone.utc)
@@ -366,6 +370,18 @@ def main():
         e = ask(A["chat"], f'[[tool client_history {{"company_id": {company_id}}}]]')
         hist = json.dumps(tool_result(e, "client_history"), ensure_ascii=False)
         check("rights: A's client history has the message of A's deal, not of B's", "msg-A" in hist and "msg-B" not in hist, hist)
+        check("client history has the WhatsApp message with its direction and file (was left out)",
+              f"WhatsApp, входящее: {TAG} wa-A" in hist and "price.pdf" in hist, hist)
+        check("A (with the mail right) sees the e-mail subject and text", "mail-secret-body" in hist, hist)
+        # without the "mail" switch the web hides e-mail texts in the history; so does the bot (it reads the rights from the database)
+        psql(f"""update "user" set permissions = permissions || '{{"mail": false}}'::jsonb where id = {A['id']}""")
+        try:
+            e = ask(A["chat"], f'[[tool client_history {{"company_id": {company_id}}}]]')
+            hist = json.dumps(tool_result(e, "client_history"), ensure_ascii=False)
+            check("without the mail right the bot says 'Письмо (текст скрыт…)': no subject, no text",
+                  "текст скрыт" in hist and "mail-secret-body" not in hist and "mail-subject" not in hist and "wa-A" in hist, hist)
+        finally:
+            psql(f"""update "user" set permissions = permissions || '{{"mail": true}}'::jsonb where id = {A['id']}""")
         e = ask(A["chat"], f'[[tool get_client {{"company_id": {company_id}}}]]')
         card = tool_result(e, "get_client")
         check("get_client: requisites, deals of A, CRM link", isinstance(card, dict) and card["requisites"]["inn"] and [d["id"] for d in card["deals"]] == [deal_a]
@@ -390,9 +406,9 @@ def main():
         check("B cannot confirm A's action", ans and ans["text"] == "Это действие устарело" and psql(f"select count(*) from task where label = '{label}'") == "0", ans)
         press(A["chat"], ok_data, prepared["message_id"])
         edit = tg_wait(lambda e: e["method"] == "editMessageText" and "Задача создана" in e["text"], 15)
-        row = psql(f"select agent_id, company_id, to_char(start_time, 'HH24:MI') from task where label = '{label}'")
-        check("confirm creates the task for A, linked to the company, at 15:00 local",
-              edit is not None and row == f"{A['id']}|{company_id}|15:00", row)
+        row = psql(f"select agent_id, deal_id, to_char(start_time, 'HH24:MI') from task where label = '{label}'")
+        check("confirm creates the task for A at 15:00 local, on the client's only open deal A sees (not on the company alone)",
+              edit is not None and row == f"{A['id']}|{deal_a}|15:00", row)
         press(A["chat"], ok_data, prepared["message_id"])
         ans = tg_wait(lambda e: e["method"] == "answerCallbackQuery", 15)
         check("a second press does not create a duplicate", psql(f"select count(*) from task where label = '{label}'") == "1", ans)
@@ -405,15 +421,63 @@ def main():
 
         e = ask(A["chat"], f'[[tool prepare_task {{"title": "{label} 3", "date": "{day}", "deal_id": {deal_b}}}]]')
         check("A cannot attach a task to B's deal", e and "не найдена или нет доступа" in e["text"], e)
+
+        # two open deals of the client: the bot asks which one instead of putting the task on the company
+        deal_a2 = int(psql(f"insert into deal (label, display_id, budget, stage_id, agent_id, company_id) values ('{TAG} сделка A2', {random.randint(10**8, 2 * 10**9)}, 1000, {stage}, {A['id']}, {company_id}) returning id").split("\n")[0])
+        e = ask(A["chat"], f'[[tool prepare_task {{"title": "{label} 4", "date": "{day}", "company_id": {company_id}}}]]')
+        res = tool_result(e, "prepare_task")
+        check("several open deals: prepare_task answers choose_deal with A's deals and saves nothing",
+              isinstance(res, dict) and res.get("status") == "choose_deal" and sorted(d["id"] for d in res.get("deals", [])) == sorted([deal_a, deal_a2])
+              and psql(f"select count(*) from task where label = '{label} 4'") == "0", res)
+        e = ask(A["chat"], f'[[tool prepare_task {{"title": "{label} 5", "date": "{day}", "company_id": {company_id}, "company_only": true}}]]')
+        prepared = confirm_message(A["chat"])
+        check("company_only: true prepares a task of the company itself", prepared is not None and "клиент" in prepared["text"], prepared)
+        if prepared:
+            press(A["chat"], button(prepared, "no:"), prepared["message_id"])
+            tg_wait(lambda e: e["method"] == "editMessageText" and "Отменено" in e["text"], 15)
+        psql(f"update deal set closed_at = now() where id = {deal_a2}")
+
+        print("== reminders: a task of a group, a task moved after its reminder")
+        tg_mark()
+        soon = datetime.now(timezone.utc) + timedelta(minutes=5)
+        status, gtask = api("POST", "/tasks", {"label": f"{TAG} group-task", "type_id": type_id,
+                                               "assign_to": {"target": "group", "id": groups[0]},
+                                               "link_to": {"target": "deal", "id": deal_a},
+                                               "start_time": iso(soon), "end_time": iso(soon + timedelta(minutes=30)), "allDay": False}, admin)
+        status2, mtask = api("POST", "/tasks", {"label": f"{TAG} moved-task", "type_id": type_id,
+                                                "assign_to": {"target": "agent", "id": A["id"]},
+                                                "link_to": {"target": "deal", "id": deal_a},
+                                                "start_time": iso(soon), "end_time": iso(soon + timedelta(minutes=30)), "allDay": False}, A["token"])
+        check("tasks for the reminders created", status == 201 and status2 == 201, (status, gtask, status2, mtask))
+        r = tg_wait(lambda e: e["method"] == "sendMessage" and e["chat_id"] == str(A["chat"]) and f"{TAG} group-task" in e["text"], 40)
+        check("a task of A's group is reminded to A (it used to be reminded to nobody)",
+              r is not None and r["text"].startswith("⏰") and "Задача группы" in r["text"] and button(r, "done:"), r)
+        r = tg_wait(lambda e: e["method"] == "sendMessage" and e["chat_id"] == str(A["chat"]) and f"{TAG} moved-task" in e["text"], 40)
+        check("A's task is reminded", r is not None, r)
+        if isinstance(mtask, dict) and mtask.get("id"):
+            later = datetime.now(timezone.utc) + timedelta(minutes=8)
+            tg_mark()
+            # moved with the times only, as a drag in the calendar sends it
+            status, _ = api("PATCH", f"/tasks/{mtask['id']}", {"start_time": iso(later), "end_time": iso(later + timedelta(minutes=30)), "allDay": False}, A["token"])
+            r = tg_wait(lambda e: e["method"] == "sendMessage" and e["chat_id"] == str(A["chat"]) and f"{TAG} moved-task" in e["text"], 40)
+            check("moved to a new time -> reminded again before the new time (the 'reminded' mark stayed for good)",
+                  status == 200 and r is not None, (status, r))
+            check("... and the moved task is still on its deal", psql(f"select deal_id from task where id = {mtask['id']}") == str(deal_a))
         e = ask(C["chat"], f'[[tool prepare_company {{"name": "{TAG} Новая"}}]]')
         check("C (no right to create companies) cannot prepare one", e and "нет права создавать" in e["text"], e)
 
         print("== card photo")
         psql(f"delete from \"user\" where company_id in (select id from company where name = '{CARD_NAME}'); delete from company where name = '{CARD_NAME}'")
-        send_photo(A["chat"], b"\xff\xd8\xff\xe0" + os.urandom(800))
+        # the card gets an ИНН of its own (local/fake-claude reads "AUDIT-INN:<digits>" from the file): a stand
+        # with real data may already have a company with the canned ИНН 305123456, and the bot then rightly
+        # answers "already in the CRM" instead of offering a new company
+        card_inn = next(inn for inn in (f"39{random.randint(0, 10**7 - 1):07d}" for _ in range(50))
+                        if psql(f"select count(*) from company where inn = '{inn}'") == "0")
+        card = lambda: b"\xff\xd8\xff\xe0" + os.urandom(400) + f"AUDIT-INN:{card_inn}".encode() + os.urandom(400)
+        send_photo(A["chat"], card())
         card_msg = reply(A["chat"], "Прочитал карточку", timeout=40)
         check("photo: bot shows the recognized company with buttons",
-              card_msg and "ИНН: 305123456" in card_msg["text"] and "Аудитова Анна" in card_msg["text"] and button(card_msg, "ok:"), card_msg)
+              card_msg and f"ИНН: {card_inn}" in card_msg["text"] and "Аудитова Анна" in card_msg["text"] and button(card_msg, "ok:"), card_msg)
         check("photo: warnings are shown (unclear ОКЭД)", card_msg and "⚠️" in card_msg["text"], card_msg)
         # the CRM has required custom fields a card cannot fill ("Страна", "Код Клиента"): the bot
         # warns about them and still creates the company (the web form would insist on them)
@@ -421,12 +485,14 @@ def main():
         check("photo: the required CRM fields that are missing are named in the warning",
               not required_fields or (card_msg and "Обязательные поля не заполнены" in card_msg["text"]
                                       and all(f in card_msg["text"] for f in required_fields.split(","))), (required_fields, card_msg))
-        press(A["chat"], button(card_msg, "ok:"), card_msg["message_id"])
-        edit = tg_wait(lambda e: e["method"] == "editMessageText" and "Компания создана" in e["text"], 20)
+        edit = None
+        if card_msg and button(card_msg, "ok:"):  # without the card message the next checks fail instead of a crash
+            press(A["chat"], button(card_msg, "ok:"), card_msg["message_id"])
+            edit = tg_wait(lambda e: e["method"] == "editMessageText" and "Компания создана" in e["text"], 20)
         row = psql(f"select c.inn, c.created_by, u.username, u.email from company c join \"user\" u on u.company_id = c.id where c.name = '{CARD_NAME}'")
         check("confirm creates the company with requisites and the contact, created by A",
-              edit is not None and row.startswith(f"305123456|{A['id']}|Аудитова Анна|"), row)
-        send_photo(A["chat"], b"\xff\xd8\xff\xe0" + os.urandom(800))
+              edit is not None and row.startswith(f"{card_inn}|{A['id']}|Аудитова Анна|"), row)
+        send_photo(A["chat"], card())
         e = reply(A["chat"], "уже есть в CRM", timeout=40)
         check("the same card again: 'already in the CRM', no buttons", e is not None and not e.get("keyboard"), e)
         send_photo(C["chat"], b"\xff\xd8\xff\xe0" + os.urandom(800))
@@ -499,6 +565,27 @@ def main():
         check("after /unlink the bot does not know B", ask(B["chat"], "/deals", contains="не подключён") is not None)
         status, st = api("DELETE", "/bot/link", token=A["token"])
         check("DELETE /bot/link from the profile unlinks", status == 200 and st["linked"] is False, st)
+
+        print("== linked again in another chat: the previous chat is told (it used to be dropped silently)")
+        other = 7_950_000_000 + random.randint(1, 10**6)
+        status, link = api("POST", "/bot/link", token=C["token"])
+        e = ask(other, "/start " + link["url"].split("start=")[1], contains="вы вошли как") if status == 201 else None
+        told = reply(C["chat"], "подключил бота CRM в другом чате")
+        check("C links the bot in another chat: the new chat is linked, the previous one is told and unlinked",
+              e is not None and told is not None and psql(f"select chat_id from bot_account where user_id = {C['id']}") == str(other),
+              (status, e, told))
+        status, link = api("POST", "/bot/link", token=C["token"])
+        e = ask(C["chat"], "/start " + link["url"].split("start=")[1], contains="вы вошли как") if status == 201 else None
+        check("... and back in the first chat", e is not None and psql(f"select chat_id from bot_account where user_id = {C['id']}") == str(C["chat"]), e)
+
+        print("== signed out everywhere: the bot goes too (src/auth/sign-out.ts)")
+        tg_mark()
+        status, _ = api("POST", f"/auth/logout/{C['id']}", {}, admin)
+        told = reply(C["chat"], "выход на всех устройствах")
+        check("the admin ends every session of C -> 204, the chat is told why and unlinked",
+              status == 204 and told is not None and psql(f"select count(*) from bot_account where user_id = {C['id']}") == "0",
+              (status, told))
+        check("after it the bot does not know C", ask(C["chat"], "/deals", contains="не подключён") is not None)
     finally:
         cleanup()
 

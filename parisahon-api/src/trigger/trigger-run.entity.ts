@@ -12,9 +12,12 @@ import { Deal } from '../deal/deal.entity';
 
 export enum TriggerRunStatus {
   PENDING = 'pending',
+  // taken by one execution (a tick of the scheduler or an event): nobody else executes it
+  RUNNING = 'running',
   DONE = 'done',
   FAILED = 'failed',
-  // not executed on purpose; the reason is in `error` (the deal left the stage, missed by more than a day, ...)
+  // not executed on purpose; the reason is in `error` (the deal left the stage, the deal does not
+  // fit the conditions, the trigger already fired for the deal, missed by more than a day, ...)
   SKIPPED = 'skipped',
 }
 
@@ -27,15 +30,18 @@ export enum TriggerRunStatus {
  *  - a recurring trigger ("ежедневно в 10:00") gets a row for its next
  *    occurrence while the deal stays in the stage;
  *  - immediate triggers get a row too (done / failed), so the history is complete;
- *  - the scheduler executes the rows whose time has come and records the
- *    result, so a restart of the API loses nothing and an error of one
- *    trigger is a `failed` row, not a crash.
+ *  - the scheduler takes a due row (pending -> running, one UPDATE: two ticks
+ *    never execute the same row) and records the result, so a restart of the
+ *    API loses nothing and an error of one trigger is a `failed` row, not a crash.
  * Rows of a deal that leaves the stage are skipped with that reason.
+ * At most one pending row per trigger and deal (unique partial index, migration 1795280000000).
  */
 @Index('IDX_trigger_run_deal', ['deal'])
 @Entity('trigger_run')
 @Index('IDX_trigger_run_due', ['status', 'run_at'])
 @Index('IDX_trigger_run_trigger_deal', ['trigger', 'deal'])
+// created by migration 1795280000000-trigger-guards (partial unique index): TypeORM must leave it alone
+@Index('IDX_trigger_run_pending', { synchronize: false })
 export class TriggerRun {
   @PrimaryGeneratedColumn()
   id: number;
@@ -59,6 +65,10 @@ export class TriggerRun {
 
   @Column({ type: 'text', nullable: true, default: null })
   error: string;
+
+  // what a done run did ("создана задача «…»", "удалено файлов: 2 (a.pdf, b.pdf)")
+  @Column({ type: 'text', nullable: true, default: null })
+  note: string;
 
   @CreateDateColumn()
   created_at: Date;

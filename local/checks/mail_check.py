@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Regression checks for the mail module (block 6): access rights, outgoing emails in deal
-history, batched sync, UIDVALIDITY changes.
+history, batched sync, UIDVALIDITY changes; the findings of the review of 2026-11 (review_wave:
+threads and names, signature, mailboxes only one's own and checked, a broken letter, a returning
+client, the company address, deals and contacts made from letters, Trash instead of EXPUNGE).
 
     py local/checks/mail_check.py
 
@@ -179,6 +181,30 @@ async function byMessageId(folder, messageId) {
     return found;
   } finally { lock.release(); }
 }
+async function headersOf(folder, messageId) {
+  step = 'headersOf ' + folder;
+  const lock = await c.getMailboxLock(folder);
+  try {
+    const uids = (await c.search({ header: { 'message-id': messageId } }, { uid: true })) || [];
+    if (!uids.length) return null;
+    const m = await c.fetchOne(String(uids[0]), { headers: ['from', 'in-reply-to', 'references', 'reply-to'] }, { uid: true });
+    return m && m.headers ? m.headers.toString() : '';
+  } finally { lock.release(); }
+}
+async function moveTo(from, to, messageId) {
+  step = 'moveTo ' + to;
+  const lock = await c.getMailboxLock(from);
+  try {
+    const uids = (await c.search({ header: { 'message-id': messageId } }, { uid: true })) || [];
+    if (uids.length) await c.messageMove(uids, to, { uid: true });
+    return uids.length;
+  } finally { lock.release(); }
+}
+async function acceptsLogin(user, pass) {
+  step = 'acceptsLogin';
+  const probe = nodemailer.createTransport({ host, port: Number(process.env.EMAIL_SMTP_PORT || 465), secure: true, auth: { user, pass }, tls });
+  try { await probe.verify(); return true; } catch (e) { return false; } finally { probe.close(); }
+}
 async function purge() {
   step = 'purge';
   const have = new Set((await c.list()).map((m) => m.path));
@@ -315,7 +341,8 @@ CLEANUP_SQL = r"""
 CREATE TEMP TABLE _u AS SELECT id FROM "user" WHERE username LIKE 'AUDITML-%' OR email LIKE 'auditml-%@example.test';
 CREATE TEMP TABLE _c AS SELECT id FROM company WHERE name LIKE 'AUDITML-%';
 CREATE TEMP TABLE _d AS SELECT id FROM deal WHERE label LIKE 'AUDITML-%';
-CREATE TEMP TABLE _e AS SELECT id FROM email WHERE subject LIKE 'AUDITML-%' OR sent_by_id IN (SELECT id FROM _u);
+CREATE TEMP TABLE _e AS SELECT id FROM email WHERE subject LIKE '%AUDITML-%' OR sent_by_id IN (SELECT id FROM _u)
+   OR user_id IN (SELECT id FROM _u);
 
 DELETE FROM event WHERE deal_id IN (SELECT id FROM _d) OR user_id IN (SELECT id FROM _u)
    OR target_user_id IN (SELECT id FROM _u) OR after_state::text LIKE '%AUDITML-%';
@@ -332,6 +359,8 @@ DELETE FROM task WHERE deal_id IN (SELECT id FROM _d) OR label LIKE 'AUDITML-%';
 DELETE FROM deal_stage_record WHERE deal_id IN (SELECT id FROM _d);
 DELETE FROM deal_user WHERE "dealId" IN (SELECT id FROM _d) OR "userId" IN (SELECT id FROM _u);
 DELETE FROM deal_product WHERE deal_id IN (SELECT id FROM _d);
+DELETE FROM deal_filler WHERE deal_id IN (SELECT id FROM _d);
+UPDATE deal SET repeat_of_id = NULL WHERE repeat_of_id IN (SELECT id FROM _d);
 DELETE FROM deal_file WHERE "dealId" IN (SELECT id FROM _d);
 DELETE FROM deal WHERE id IN (SELECT id FROM _d);
 DELETE FROM user_filler WHERE user_id IN (SELECT id FROM _u);
@@ -343,7 +372,7 @@ DELETE FROM company WHERE id IN (SELECT id FROM _c);
 """
 
 LEFTOVERS_SQL = r"""
-SELECT 'email', count(*) FROM email WHERE subject LIKE 'AUDITML-%'
+SELECT 'email', count(*) FROM email WHERE subject LIKE '%AUDITML-%'
 UNION ALL SELECT 'deal', count(*) FROM deal WHERE label LIKE 'AUDITML-%'
 UNION ALL SELECT 'company', count(*) FROM company WHERE name LIKE 'AUDITML-%'
 UNION ALL SELECT 'user', count(*) FROM "user" WHERE username LIKE 'AUDITML-%' OR email LIKE 'auditml-%@example.test'
@@ -451,6 +480,12 @@ def main():
           events_for(deal_client, s_in1, wait=10) == 1,
           (events_for(deal_client, s_in1), sql("SELECT id, user_id FROM email WHERE subject = %s" % q(s_in1)), sql("SELECT id, type FROM event WHERE deal_id = %d" % deal_client)))
     check("… and not in the deal without contacts", events_for(deal_other, s_in1) == 0)
+    # the column the control of answers, «клиент ждёт ответа» and the autopilot read (it kept the default true, MAIL-2)
+    check("… stored as incoming (event.outgoing = false), the person in it by name only",
+          sql("SELECT outgoing::text, (after_state->'data'->'from_user'->'permissions') IS NULL FROM event WHERE type = %d AND deal_id = %d AND after_state->'data'->>'subject' = %s"
+              % (EVENT_NEW_EMAIL, deal_client, q(s_in1))) == [["false", "t"]],
+          sql("SELECT outgoing, after_state->'data'->'from_user' FROM event WHERE type = %d AND deal_id = %d AND after_state->'data'->>'subject' = %s"
+              % (EVENT_NEW_EMAIL, deal_client, q(s_in1))))
     status, _ = sync()
     check("second sync: still one row per email and one history entry",
           status == 200 and all(count("SELECT count(*) FROM email WHERE subject = %s" % q(s)) == 1 for s in rows)
@@ -504,10 +539,31 @@ def main():
     status, body = http("GET", "/emails?is_spam=true&limit=200&sort[id]=-1", token=agent_a["token"])
     check("agent A: the spam list shows it", status == 200 and in2 in ids_of(body), "%s %s" % (status, sorted(ids_of(body))))
 
+    # MAIL-10 (audit 2026-11): not a no-op on the server any more but no EXPUNGE either: moved to Trash
+    status, body = http("PATCH", "/emails/%d/not-spam" % in2, {}, token=agent_a["token"])
+    row = email_row(s_in2)
+    out = node("out.inbox = await byMessageId(F.inbox, %s); out.spam = await byMessageId(F.spam, %s);" % (json.dumps(row[2]), json.dumps(row[2])))
+    check("MAIL-10: agent A takes it out of spam («Не спам») -> 200, back in INBOX on the server and in the list",
+          status in (200, 201) and row[6] == "f" and row[4] == "INBOX" and out["inbox"] and not out["spam"], "%s %s %s" % (status, row, out))
+
     status, body = http("DELETE", "/emails/%d" % in3, token=agent_b["token"])
-    out = node("out.left = await byMessageId(F.inbox, %s);" % json.dumps(rows[s_in3][2]))
-    check("agent B deletes their own email -> 200, removed from the server, soft-deleted locally",
+    out = node("out.left = await byMessageId(F.inbox, %s); out.trash = await byMessageId(F.trash, %s);" % (json.dumps(rows[s_in3][2]), json.dumps(rows[s_in3][2])))
+    check("agent B deletes their own email -> 200, gone from INBOX, soft-deleted locally",
           status in (200, 201) and email_row(s_in3)[8] == "t" and out["left"] == [], "%s %s %s" % (status, email_row(s_in3), out))
+    check("MAIL-10: … moved to the Trash mailbox (was: erased on the server for good), the row records who deleted it",
+          # two columns, not 'a' || '|' || 'b': sql() splits the rows of psql at '|'
+          out["trash"] and sql("SELECT coalesce(deleted_by_id::text, ''), from_mailbox FROM email WHERE id = %d" % in3) == [[str(agent_b["id"]), "INBOX.Trash"]],
+          (out, sql("SELECT deleted_by_id, from_mailbox, email_id FROM email WHERE id = %d" % in3)))
+    status, body = http("GET", "/emails?deleted=true&limit=200&sort[id]=-1", token=agent_b["token"])
+    check("MAIL-10: «Удалённые» lists it for B", status == 200 and in3 in ids_of(body), "%s %s" % (status, sorted(ids_of(body))))
+    status, body = http("PATCH", "/emails/%d/restore" % in3, {}, token=agent_b["token"])
+    out = node("out.inbox = await byMessageId(F.inbox, %s);" % json.dumps(rows[s_in3][2]))
+    check("MAIL-10: «Восстановить» -> 200, back in INBOX on the server and shown again",
+          status in (200, 201) and email_row(s_in3)[8] == "f" and email_row(s_in3)[4] == "INBOX" and out["inbox"],
+          "%s %s %s %s" % (status, message_of((status, body)), email_row(s_in3), out))
+    status, _ = sync()
+    check("MAIL-10: … the next sync does not save it a second time", status == 200 and count("SELECT count(*) FROM email WHERE subject = %s" % q(s_in3)) == 1,
+          sql("SELECT id, from_mailbox, email_id, deleted_at FROM email WHERE subject = %s" % q(s_in3)))
 
     status, body = http("GET", "/emails?limit=5", token=no_mail["token"])
     status2, _ = sync(token=no_mail["token"])
@@ -551,6 +607,8 @@ def main():
           events_for(deal_client, s_out1, wait=10) == 1, events_for(deal_client, s_out1))
     check("… marked outgoing there", scalar("SELECT after_state->'data'->>'outgoing' FROM event WHERE type = %d AND deal_id = %d AND after_state->'data'->>'subject' = %s"
                                              % (EVENT_NEW_EMAIL, deal_client, q(s_out1))) == "true")
+    check("… and in the column event.outgoing", scalar("SELECT outgoing::text FROM event WHERE type = %d AND deal_id = %d AND after_state->'data'->>'subject' = %s"
+                                                     % (EVENT_NEW_EMAIL, deal_client, q(s_out1))) == "true")
     check("… and not in the deal without contacts", events_for(deal_other, s_out1) == 0)
 
     s_out2 = P + "-out-with-deal"
@@ -659,6 +717,12 @@ def main():
     status, _ = sync()
     check("a further sync changes nothing", status == 200 and all(count("SELECT count(*) FROM email WHERE subject = %s" % q(subj[k])) == 1 for k in mids))
 
+    review_wave({
+        "admin_id": admin_id, "shared": shared, "stage_id": stage_id, "agent_a": agent_a, "agent_b": agent_b,
+        "no_mail": no_mail, "client_email": client_email, "contact_id": contact_id, "company_id": company_id,
+        "deal_client": deal_client, "in1": in1, "s_in1": s_in1, "s_out3": s_out3, "events_for": events_for,
+    })
+
     # ================================================================= client
     section("Client")
     modal = read_file(CLIENT, os.path.join("components", "mail", "AddContactModal.vue"))
@@ -670,9 +734,265 @@ def main():
           "Need email name contact" not in modal and "Ответственный" not in modal)
     single = read_file(CLIENT, os.path.join("pages", "mails", "index", "[id].vue"))
     check("reply form: the deal picked in 'Привязать сделку' is sent as deal_id", "formData.append('deal_id'" in single and 'v-model="selectedDeal"' in single)
+    reply_form = read_file(CLIENT, os.path.join("components", "mail", "EmailReplyForm.vue"))
+    check("MAIL-1: the reply form of the deal card sends the deal (deal_id): the letter is in its history whatever the address",
+          "formData.append('deal_id'" in reply_form)
+    new_form = read_file(CLIENT, os.path.join("pages", "mails", "new.vue"))
+    check("MAIL-15: the three mail forms let the server add the signature (with_signature), none puts it into the editor",
+          all("with_signature" in text and "SignaturePreview" in text for text in (reply_form, single, new_form))
+          and "+ sign" not in reply_form and "+ sign" not in single)
+    check("MAIL-11 / MAIL-12: the letter page replies in the thread (reply_to_email_id), shows HTML only cleaned (letterView) and folds the quote",
+          "reply_to_email_id" in single and "letterView(" in single and "Показать цитату" in single)
+    check("MAIL-13: the assistant is in the mail forms and translates to Russian and Uzbek",
+          "MailAssistant" in single and "MailAssistant" in new_form
+          and "'russian'" in read_file(CLIENT, os.path.join("components", "mail", "MailAssistant.vue")))
+    assist = read_file(API_SRC, os.path.join("email", "mail-assist.service.ts"))
+    check("MAIL-13: the assistant reads the e-mails of the deal (after_state.data: body and direction)",
+          "after_state->'data'->>'body'" in assist and "after_state->'data'->>'outgoing'" in assist)
+    deal_modal = read_file(CLIENT, os.path.join("components", "mail", "AddDealModal.vue"))
+    check("MAIL-16 / DEAL-8: «доб.сделку» goes through POST /emails/deals (the client and the letters), not an empty POST /deals",
+          "mailService.post('deals'" in deal_modal and "dealService" not in deal_modal)
+    check("MAIL-16: «доб.контакты» links the stored letters to the new contacts", "post('contacts'" in modal)
     controller = read_file(API_SRC, os.path.join("email", "email.controller.ts"))
     check("API: the mail routes are behind MailAccessGuard and pass the user to open/delete/spam", "MailAccessGuard" in controller
           and controller.count("extractUserFromRequest(request)") >= 4)
+
+
+def review_wave(x):
+    """The mail findings of the review of 2026-11 (MAIL-1 … MAIL-18, DEAL-8), against the API and the mail server."""
+    admin_id, shared, agent_a, agent_b = x["admin_id"], x["shared"], x["agent_a"], x["agent_b"]
+    client_email, contact_id, deal_client, in1, s_in1 = x["client_email"], x["contact_id"], x["deal_client"], x["in1"], x["s_in1"]
+    events_for = x["events_for"]
+
+    def new_deal(label, agent, company, closed=False):
+        return int(scalar(
+            "INSERT INTO deal (label, display_id, budget, stage_id, agent_id, created_by, company_id, closed_at) "
+            "VALUES (%s, %d, 100, %d, %d, %d, %s, %s) RETURNING id"
+            % (q(label), 900000000 + secrets.randbelow(90000000), x["stage_id"], agent, admin_id,
+               "NULL" if company is None else int(company), "now() - interval '1 day'" if closed else "NULL")))
+
+    def wait_for(fn, wait=15):
+        deadline = time.time() + wait
+        while True:
+            value = fn()
+            if value or time.time() >= deadline:
+                return value
+            time.sleep(1)
+
+    # ----------------------------------------------------------------- list and letter
+    section("Review 2026-11: the client and the deals of a letter (MAIL-12)")
+    status, body = http("GET", "/emails/%d" % in1)
+    deals = [d.get("id") for d in (body or {}).get("deals", [])] if isinstance(body, dict) else []
+    check("GET /emails/:id: the deals whose history the letter is in, its contact and whom to reply",
+          status == 200 and deal_client in deals and ((body.get("client") or {}).get("contact") or {}).get("id") == contact_id
+          and client_email in ((body.get("reply") or {}).get("to") or []), "%s %s" % (status, {k: body.get(k) for k in ("deals", "client", "reply")} if isinstance(body, dict) else body))
+    status, body = http("GET", "/emails?limit=200&sort[id]=-1")
+    item = next((e for e in (body or {}).get("data", []) if e.get("id") == in1), None) if isinstance(body, dict) else None
+    check("GET /emails: the list row carries the deals and the client too",
+          item is not None and deal_client in [d.get("id") for d in item.get("deals", [])] and (item.get("client") or {}).get("contact"), item)
+
+    # ----------------------------------------------------------------- reply in the thread
+    section("Review 2026-11: a reply keeps the thread, has a name and a quote (MAIL-11)")
+    s_re = "Re: %s-reply" % P
+    status, body = http("POST", "/emails", {"subject": s_re, "body": "<p>our answer</p>", "to": [client_email], "reply_to_email_id": str(in1)})
+    row = email_row(s_re)
+    in1_mid = scalar("SELECT message_id FROM email WHERE id = %d" % in1)
+    check("POST /emails with reply_to_email_id -> 201, the row answers the letter (In-Reply-To)",
+          status in (200, 201) and row and scalar("SELECT in_reply_to FROM email WHERE id = %s" % row[0]) == in1_mid,
+          "%s %s %s" % (status, message_of((status, body)), row))
+    out = node("""
+      out.h = await headersOf(F.sent, %s);
+      const { simpleParser } = await import('mailparser');
+      const parsed = await simpleParser((out.h || '') + '\\r\\n');
+      out.name = parsed.from?.value?.[0]?.name || '';
+      out.inReplyTo = parsed.inReplyTo || '';
+      out.references = [].concat(parsed.references || []).join(' ');
+    """ % json.dumps(row[2] if row else "<none>"))
+    check("… the copy on the server: In-Reply-To / References of the letter answered, From with a name",
+          in1_mid and out.get("inReplyTo") == in1_mid and in1_mid in out.get("references", "") and "Parisa Home" in out.get("name", ""), out)
+    check("… the letter quotes the original, the deal history keeps only the answer",
+          row and "crm-quote" in (scalar("SELECT body FROM email WHERE id = %s" % row[0]) or "")
+          and events_for(deal_client, s_re, wait=10) == 1
+          and "crm-quote" not in (scalar("SELECT after_state->'data'->>'body' FROM event WHERE type = %d AND deal_id = %d AND after_state->'data'->>'subject' = %s"
+                                         % (EVENT_NEW_EMAIL, deal_client, q(s_re))) or "x crm-quote"),
+          events_for(deal_client, s_re))
+
+    # ----------------------------------------------------------------- signature
+    section("Review 2026-11: the signature is added by the server with its formatting (MAIL-15)")
+    sign = '<table><tr><td style="color:#0a7">%s sign</td></tr></table>' % P
+    status, _ = http("PATCH", "/emails/signs", {"user_id": agent_a["id"], "sign": sign}, token=agent_a["token"])
+    s_sig, s_nosig = P + "-signed", P + "-unsigned"
+    http("POST", "/emails", {"subject": s_sig, "body": "<p>text</p>", "to": ["auditml-ext9@example.test"], "with_signature": "true"}, token=agent_a["token"])
+    http("POST", "/emails", {"subject": s_nosig, "body": "<p>text</p>", "to": ["auditml-ext9@example.test"]}, token=agent_a["token"])
+    signed = scalar("SELECT body FROM email WHERE subject = %s" % q(s_sig)) or ""
+    unsigned = scalar("SELECT body FROM email WHERE subject = %s" % q(s_nosig)) or ""
+    check("with_signature=true: the signature under the text with its table and colours; without it (the old web client) none",
+          status in (200, 201) and "crm-signature" in signed and "<table" in signed and "color:#0a7" in signed and "crm-signature" not in unsigned,
+          (status, signed[:300], unsigned[:200]))
+    http("DELETE", "/emails/signs/%d" % agent_a["id"])
+
+    # ----------------------------------------------------------------- addresses, errors
+    section("Review 2026-11: addresses and errors of sending (MAIL-14)")
+    status, body = http("POST", "/emails", {"subject": P + "-bad-address", "body": "x", "to": ["not-an-address"]})
+    check("a wrong address -> 400 in words (the field and the address), nothing saved",
+          status == 400 and "Кому" in message_of((status, body)) and email_row(P + "-bad-address") is None, "%s %s" % (status, message_of((status, body))))
+    s_two = P + "-two"
+    status, body = http("POST", "/emails", {"subject": s_two, "body": "x", "to": "auditml-ext7@example.test, auditml-ext8@example.test"})
+    row = email_row(s_two)
+    check("several addresses in one field are split -> 201 with two recipients",
+          status in (200, 201) and row and count("SELECT count(*) FROM email_to WHERE email_id = %s" % row[0]) == 2, "%s %s" % (status, message_of((status, body))))
+
+    # ----------------------------------------------------------------- MAIL-6 mailboxes
+    section("Review 2026-11: a mailbox only for one's own address, only with a password the server accepts (MAIL-6)")
+    pw = secrets.token_urlsafe(10)
+    status, body = http("POST", "/emails/transporters", {"email": agent_b["email"], "password": pw}, token=agent_a["token"])
+    status2, _ = http("POST", "/emails/transporters", {"email": shared, "password": pw}, token=agent_a["token"])
+    check("agent A adds B's address or the shared mailbox -> 403, nothing saved (was: read and deleted their mail)",
+          status == 403 and status2 == 403 and count("SELECT count(*) FROM email_transporter WHERE user_id = %d" % agent_a["id"]) == 0,
+          "%s %s %s" % (status, status2, message_of((status, body))))
+    probe = node("out.any = await acceptsLogin(%s, %s); out.own = await acceptsLogin(%s, %s);"
+                 % (json.dumps(agent_a["email"]), json.dumps("wrong-" + pw), json.dumps(agent_a["email"]), json.dumps(pw)))
+    if not probe.get("any"):
+        status, body = http("POST", "/emails/transporters", {"email": agent_a["email"], "password": "wrong-" + pw}, token=agent_a["token"])
+        check("agent A adds their own address with a wrong password -> 400, nothing saved",
+              status == 400 and count("SELECT count(*) FROM email_transporter WHERE user_id = %d" % agent_a["id"]) == 0, "%s %s" % (status, message_of((status, body))))
+    else:
+        print("SKIP  wrong password -> 400: the stand's mail server accepts any password", flush=True)
+    if probe.get("own"):
+        status, body = http("POST", "/emails/transporters", {"email": agent_a["email"], "password": pw}, token=agent_a["token"])
+        check("agent A adds their own address, the server accepts it -> 201, checked (verified_at), no password in the answer",
+              status in (200, 201) and isinstance(body, dict) and "password" not in body
+              and count("SELECT count(*) FROM email_transporter WHERE user_id = %d AND verified_at IS NOT NULL" % agent_a["id"]) == 1,
+              "%s %s" % (status, message_of((status, body))))
+        status, body = http("GET", "/emails/transporters?all=true")
+        mine = [t for t in body if (t.get("created_by") or {}).get("id") == agent_a["id"]] if isinstance(body, list) else []
+        status2, body2 = http("GET", "/emails/transporters?all=true", token=agent_b["token"])
+        check("the admin sees every employee's mailbox with its owner; agent B only their own (none)",
+              status == 200 and len(mine) == 1 and status2 == 200 and body2 == [], (status, mine, status2, body2))
+    else:
+        print("SKIP  own mailbox -> 201: the stand's mail server does not know agent A's mailbox", flush=True)
+
+    # ----------------------------------------------------------------- MAIL-18
+    section("Review 2026-11: the agent sees the client's answer to their letter (MAIL-18)")
+    s_ans = P + "-answer-to-a"
+    a_mid = scalar("SELECT message_id FROM email WHERE subject = %s" % q(x["s_out3"]))
+    node("await smtp({ from: 'Ext <auditml-ext9@example.test>', to: %s, subject: %s, text: 'answer', inReplyTo: %s, references: %s });"
+         % (json.dumps(shared), json.dumps(s_ans), json.dumps(a_mid), json.dumps(a_mid)))
+    sync()
+    row = email_row(s_ans)
+    status, body = http("GET", "/emails?limit=200&sort[id]=-1", token=agent_a["token"])
+    status2, _ = http("GET", "/emails/%s" % (row[0] if row else 0), token=agent_a["token"])
+    status3, _ = http("GET", "/emails/%s" % (row[0] if row else 0), token=agent_b["token"])
+    check("an answer (In-Reply-To) to A's letter, sent to the shared mailbox: A lists and opens it, B does not",
+          row and status == 200 and int(row[0]) in ids_of(body) and status2 == 200 and status3 == 403, (row, status, status2, status3))
+
+    # ----------------------------------------------------------------- MAIL-5
+    section("Review 2026-11: a letter sent from a mail program (the Sent mailbox) goes into the deal (MAIL-5)")
+    s_ext = P + "-sent-elsewhere"
+    node("await append(F.sent, %s);" % json.dumps({"from": "Parisa <%s>" % shared, "to": client_email, "subject": s_ext,
+                                                    "date": time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime()),
+                                                    "messageId": "<auditml-ext-%s@%s>" % (RUN, DOMAIN), "text": "answer from Outlook"}))
+    sync()
+    row = email_row(s_ext)
+    check("saved as outgoing from the Sent mailbox and put into the client's deal (marked outgoing)",
+          row and row[5] == "t" and row[4] == "INBOX.Sent" and events_for(deal_client, s_ext, wait=10) == 1
+          and scalar("SELECT outgoing::text FROM event WHERE type = %d AND deal_id = %d AND after_state->'data'->>'subject' = %s"
+                     % (EVENT_NEW_EMAIL, deal_client, q(s_ext))) == "true", (row, events_for(deal_client, s_ext)))
+
+    # ----------------------------------------------------------------- MAIL-4
+    section("Review 2026-11: a returning client, the company address (MAIL-4)")
+    back_email = "auditml-back-%s@%s" % (RUN, DOMAIN)
+    back_id = int(scalar("INSERT INTO \"user\" (username, email, role, company_id) VALUES (%s, %s, 'ctr_agent', %d) RETURNING id"
+                         % (q(P + "-back"), q(back_email), x["company_id"])))
+    closed = new_deal(P + "-closed", agent_a["id"], x["company_id"], closed=True)
+    sql('INSERT INTO deal_user ("dealId", "userId") VALUES (%d, %d)' % (closed, back_id))
+    co2_email = "auditml-co2-%s@%s" % (RUN, DOMAIN)
+    co2 = int(scalar("INSERT INTO company (name, email, is_old, created_by) VALUES (%s, %s, false, %d) RETURNING id" % (q(P + "-co2"), q(co2_email), admin_id)))
+    co2_deal = new_deal(P + "-co2-deal", admin_id, co2)
+    s_back, s_co2 = P + "-returning", P + "-company-address"
+    node("await smtp({ from: %s, to: %s, subject: %s, text: 'again' }); await smtp({ from: %s, to: %s, subject: %s, text: 'from the office' });"
+         % (json.dumps(back_email), json.dumps(shared), json.dumps(s_back), json.dumps(co2_email), json.dumps(shared), json.dumps(s_co2)))
+    sync()
+    check("a contact whose deals are all closed is still recognised (was: the letter had no client)",
+          scalar("SELECT user_id FROM email WHERE subject = %s" % q(s_back)) == str(back_id), sql("SELECT id, user_id FROM email WHERE subject = %s" % q(s_back)))
+    repeat = wait_for(lambda: scalar("SELECT id FROM deal WHERE repeat_of_id = %d AND deleted_at IS NULL" % closed))
+    check("… a repeat deal is opened for them (as for Telegram / WhatsApp), with the letter in its history",
+          repeat and events_for(int(repeat), s_back, wait=10) == 1,
+          (repeat, sql("SELECT id, label, agent_id FROM deal WHERE repeat_of_id = %d" % closed)))
+    check("a letter from the company's general address goes into the company's open deal",
+          events_for(co2_deal, s_co2, wait=10) == 1, events_for(co2_deal, s_co2))
+
+    # ----------------------------------------------------------------- MAIL-3
+    section("Review 2026-11: one broken letter does not stop the mail (MAIL-3)")
+    s_bad, s_after = P + "-long-name", P + "-after-long-name"
+    out = node("""
+      const longName = 'AUDITML-' + 'x'.repeat(300) + '.txt';
+      const letter = ['From: Long <auditml-long@example.test>', 'To: ' + %(shared)s, 'Subject: ' + %(bad)s,
+        'Date: ' + new Date().toUTCString(), 'Message-ID: <auditml-long-%(run)s@example.test>', 'MIME-Version: 1.0',
+        'Content-Type: multipart/mixed; boundary="b1"', '', '--b1', 'Content-Type: text/plain; charset=utf-8',
+        'Content-Transfer-Encoding: quoted-printable', '', 'before=00after', '--b1',
+        'Content-Type: text/plain; name="' + longName + '"', 'Content-Disposition: attachment; filename="' + longName + '"',
+        'Content-Transfer-Encoding: base64', '', Buffer.from('AUDITML attachment').toString('base64'), '--b1--', ''].join('\\r\\n');
+      await c.append(F.inbox, letter, []);  // not `raw`: the prelude declares function raw()
+      await smtp({ from: 'After <auditml-after@example.test>', to: %(shared)s, subject: %(after)s, text: 'after' });
+    """ % {"shared": json.dumps(shared), "bad": json.dumps(s_bad), "after": json.dumps(s_after), "run": RUN})
+    status, body = sync(query="limit=1")
+    check("a letter with a NUL character and a 300-character attachment name: saved (name cut to 255, NUL gone), the next letter too",
+          status == 200 and email_row(s_bad) and email_row(s_after)
+          and count("SELECT count(*) FROM file f JOIN email e ON e.id = f.email_id WHERE e.subject = %s AND length(f.name) <= 255 AND f.name LIKE '%%.txt'" % q(s_bad)) == 1
+          and "\x00" not in (scalar("SELECT body FROM email WHERE subject = %s" % q(s_bad)) or "\x00"),
+          (status, email_row(s_bad), email_row(s_after), sql("SELECT length(name) FROM file f JOIN email e ON e.id = f.email_id WHERE e.subject = %s" % q(s_bad))))
+    status, body = http("GET", "/emails/sync-status")
+    check("GET /emails/sync-status -> 200: last successful run, failing mailboxes and letters; GET /emails/sync carries it as `sync`",
+          status == 200 and isinstance(body, dict) and {"ok", "last_success_at", "errors", "failing", "skipped"} <= set(body), (status, body))
+
+    # ----------------------------------------------------------------- MAIL-16 / DEAL-8 / MAIL-17
+    section("Review 2026-11: «доб.сделку» makes a deal with the client and the letter (MAIL-16, DEAL-8, MAIL-17)")
+    s_new, new_addr = P + "-new-client", "auditml-new-%s@%s" % (RUN, DOMAIN)
+    node("""await smtp({ from: { name: %s, address: %s }, to: %s, subject: %s, text: 'please quote',
+                       attachments: [{ filename: 'spec.txt', content: 'AUDITML spec' }] });"""
+         % (json.dumps(P + " Newbie"), json.dumps(new_addr), json.dumps(shared), json.dumps(s_new)))
+    sync()
+    row = email_row(s_new)
+    letter = int(row[0]) if row else 0
+    status, _ = http("POST", "/emails/deals", {"email_ids": [letter], "agent_id": agent_a["id"]}, token=agent_b["token"])
+    status2, _ = http("POST", "/emails/deals", {"email_ids": [letter], "agent_id": agent_a["id"]}, token=x["no_mail"]["token"])
+    check("B (the letter is not theirs) and an agent without mail -> 403", status == 403 and status2 == 403, (status, status2))
+    status, body = http("POST", "/emails/deals", {"email_ids": [letter], "agent_id": agent_a["id"]})
+    made = body[0] if isinstance(body, list) and body else {}
+    deal_id = (made.get("deal") or {}).get("id")
+    contact = (made.get("contact") or {}).get("id")
+    check("admin POST /emails/deals -> the deal named after the subject, A responsible, a new contact named from the letter",
+          status in (200, 201) and deal_id and made.get("created_contact") and (made.get("contact") or {}).get("username") == P + " Newbie"
+          and sql("SELECT label, agent_id FROM deal WHERE id = %d" % deal_id) == [[s_new, str(agent_a["id"])]]
+          and count('SELECT count(*) FROM deal_user WHERE "dealId" = %d AND "userId" = %d' % (deal_id, contact or 0)) == 1,
+          "%s %s" % (status, body))
+    check("… the letter is in its history and points to the contact (was: an empty deal «#N»)",
+          deal_id and events_for(deal_id, s_new, wait=10) == 1 and scalar("SELECT user_id FROM email WHERE id = %d" % letter) == str(contact),
+          (deal_id and events_for(deal_id, s_new), scalar("SELECT user_id FROM email WHERE id = %d" % letter)))
+    check("MAIL-17: … its attachment is in the deal's files",
+          deal_id and wait_for(lambda: count('SELECT count(*) FROM deal_file df JOIN file f ON f.id = df."fileId" WHERE df."dealId" = %d AND f.email_id = %d' % (deal_id, letter))) == 1,
+          sql('SELECT "fileId" FROM deal_file WHERE "dealId" = %d' % (deal_id or 0)))
+
+    section("Review 2026-11: «доб.контакты» — the stored letters point to the new contact (MAIL-16)")
+    s_later, later_addr = P + "-later", "auditml-later-%s@%s" % (RUN, DOMAIN)
+    node("await smtp({ from: %s, to: %s, subject: %s, text: 'hello' });" % (json.dumps(later_addr), json.dumps(shared), json.dumps(s_later)))
+    sync()
+    later_id = int(scalar("INSERT INTO \"user\" (username, email, role, company_id) VALUES (%s, %s, 'ctr_agent', %d) RETURNING id"
+                          % (q(P + "-later"), q(later_addr), x["company_id"])))
+    status, body = http("POST", "/emails/contacts", {"user_ids": [later_id]})
+    check("POST /emails/contacts -> 200, the letter points to the contact",
+          status == 200 and scalar("SELECT user_id FROM email WHERE subject = %s" % q(s_later)) == str(later_id), "%s %s" % (status, body))
+
+    # ----------------------------------------------------------------- MAIL-10 webmail
+    section("Review 2026-11: a letter moved to Trash in webmail is no duplicate (MAIL-10)")
+    in1_mid = scalar("SELECT message_id FROM email WHERE id = %d" % in1)
+    out = node("out.moved = await moveTo(F.inbox, F.trash, %s);" % json.dumps(in1_mid))
+    sync()
+    check("after the move: the letter is shown nowhere (both copies deleted), still once in the deal history",
+          out.get("moved") and count("SELECT count(*) FROM email WHERE subject = %s AND deleted_at IS NULL" % q(s_in1)) == 0
+          and count("SELECT count(*) FROM email WHERE subject = %s" % q(s_in1)) == 2 and events_for(deal_client, s_in1) == 1,
+          (out, sql("SELECT id, from_mailbox, deleted_at IS NOT NULL FROM email WHERE subject = %s" % q(s_in1)), events_for(deal_client, s_in1)))
 
 
 def run():

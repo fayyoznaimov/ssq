@@ -10,6 +10,7 @@ export interface Column<T = any> {
     field?: (item: T) => any; // if field function is provided it will use it to fill column content. You can also pass raw html here
     subtitle?: (item: T) => any; // same as field, but is displayed below the field content
     link?: (item: T) => RouteLocationRaw; // if provided content becomes a hyperlink
+    rowAnchor?: boolean; // with the rowLink of BaseTable: the cell is a real link to the row's page (opens in a new tab, its address can be copied)
     click?: (item: T) => any; // if provided this function will be called when cell is clicked
     money?: boolean; // if true it will format the number as money using Money.vue
     phone?: boolean; // if true it will format the string as phone number using Phone.vue

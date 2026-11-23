@@ -38,6 +38,18 @@
                     </li>
                 </ul>
             </nav>
+            <!-- whose tasks: mine (me or my group) by default, the ones I gave, everybody's -->
+            <BaseButtonGroup class="flex-wrap">
+                <BaseButton
+                    v-for="option in scopes"
+                    :key="option.value"
+                    color="default"
+                    :class="scope === option.value ? '!bg-muted-200 dark:!bg-muted-600' : ''"
+                    @click="scope = option.value"
+                >
+                    {{ option.label }}
+                </BaseButton>
+            </BaseButtonGroup>
             <div class="flex flex-wrap gap-2 items-center">
                 <!-- <Filter @filter="handleFilter" /> -->
                 <TairoPopover
@@ -92,12 +104,12 @@
                                     value: 'value',
                                     label: 'label',
                                 }"
-                                placeholder="Все статусы"
+                                placeholder="Открытые"
                             />
 
                             <BaseListbox
                                 v-model="filters.assignedTo"
-                                label="Менеджеры"
+                                label="Исполнители"
                                 rounded="md"
                                 :items="employees"
                                 :properties="{
@@ -105,7 +117,7 @@
                                     label: 'username',
                                 }"
                                 :loading="usersLoading"
-                                placeholder="Все менеджеры"
+                                placeholder="Все исполнители"
                                 multiple
                                 :multiple-label="(value, prop) => {
                                     if (!value.length) return;
@@ -171,6 +183,7 @@
 
 <script setup lang="ts">
 import BaseButton from "~/components/base/BaseButton.vue";
+import BaseButtonGroup from "~/components/base/BaseButtonGroup.vue";
 import TairoPopover from "~/components/tairo/TairoPopover.vue";
 import TaskTypeManageModal from "~/components/task/TaskTypeManageModal.vue";
 import type { Task, TaskFilters, TaskType } from "~/types/deal";
@@ -181,10 +194,11 @@ import { type User,UserRole } from "~/types/user";
 const commonStore = useCommonStore();
 const { notificationCount } = storeToRefs(commonStore);
 
+// "Открытые" is what the API gives without a status; "Все статусы" really is all of them now
 const statuses = [
     {
-        label: "Все статусы",
-        value: "all",
+        label: "Открытые",
+        value: "open",
     },
     {
         label: "Просроченные",
@@ -193,7 +207,18 @@ const statuses = [
     {
         label: "Закрытые",
         value: "closed",
+    },
+    {
+        label: "Все статусы",
+        value: "all",
     }
+];
+
+type Scope = "mine" | "created" | "all";
+const scopes: {label: string, value: Scope}[] = [
+    { label: "Мои", value: "mine" },
+    { label: "Поставил я", value: "created" },
+    { label: "Все", value: "all" },
 ];
 
 const allTaskTypes = {
@@ -204,15 +229,19 @@ const allTaskTypes = {
 const app = useAppConfig();
 const route = useRoute();
 
+// links from the desktop and the reports: ?status=overdue&scope=mine, ?user_id=5&username=..., ?type_id=..
+const queryUserIds = [route.query.user_id].flat().filter(Boolean).map((id) => Number(id));
+
 const initialFilters: TaskFilters = {
     stages: [],
     assignedTo: [],
     createdBy: [],
-    status: statuses[0],
+    status: statuses.find((s) => s.value === route.query.status) ?? statuses[0],
     taskType: allTaskTypes,
     perPage: app.pagination.defaultPageSize,
     currentPage: route.query.page ? parseInt(route.query.page as string) : 1,
-    sortBy: {id: -1},
+    // the nearest deadline first
+    sortBy: {end_time: 1},
     fromDate: "",
     tillDate: "",
 };
@@ -220,13 +249,19 @@ const initialFilters: TaskFilters = {
 const filters = reactive<TaskFilters>({
     ...initialFilters,
     ...(route.query.type_id && {taskType: {id: Number(route.query.type_id), name: route.query.type_name} as TaskType}),
-    ...(route.query.user_id && {assignedTo: [{id: Number(route.query.user_id), username: route.query.username} as User]}),
+    ...(queryUserIds.length && {assignedTo: queryUserIds.map((id) => ({id, username: queryUserIds.length === 1 ? route.query.username : ""}) as User)}),
 });
+
+// a link with chosen people shows their tasks; otherwise "Мои" unless the link says otherwise
+const scope = ref<Scope>(
+    scopes.some((s) => s.value === route.query.scope) ? route.query.scope as Scope : (queryUserIds.length ? "all" : "mine"),
+);
 
 const currentUser = useState<User>("user");
 const stageService = useService("stages", {auth: true});
 const taskTypeService = useService("task-types", {auth: true});
 const userService = useService("users", {auth: true});
+const staffService = useService("users/staff", {auth: true});
 const tasksService = useService("tasks", {auth: true});
 
 const { run: runStages, isLoading: stagesLoading, data: stages } = useAsync<Stage[]>([]);
@@ -254,6 +289,21 @@ const employees = computed(() => {
     return users.value.data.filter((u) => u.role !== UserRole.CtrAgent);
 });
 
+// people from a link come with ids only: their names once the staff list is there
+watch(employees, (list) => {
+    if (!filters.assignedTo.some((a) => !a.username)) return;
+    filters.assignedTo = filters.assignedTo.map((a) => a.username ? a : (list.find((e) => e.id === a.id) ?? a));
+});
+
+/** Staff accounts for the filters, former employees too (GET /users/staff); an older API: users minus contacts. */
+async function staffUsers(): Promise<PaginatedResponse<User>> {
+    try {
+        return await staffService.find<PaginatedResponse<User>>({with_deleted: true}).exec();
+    } catch (e) {
+        return await userService.find<PaginatedResponse<User>>({limit: 1000}).exec();
+    }
+}
+
 function onNewTask() {
     const end = new Date();
     const start = new Date().toISOString();
@@ -273,7 +323,15 @@ function onNewTask() {
     });
 }
 
-function fetchTasks(additional: any = {}) {
+/**
+ * The page (list, board, calendar) adds its own part of the query and it is kept for the next loads
+ * (a filter, a live update, a saved task): the calendar its dates, the board all open tasks, the list
+ * its page. Before, a changed filter dropped it and the calendar showed the first 25 tasks of all.
+ */
+let viewQuery: Record<string, any> = {};
+
+function fetchTasks(view?: Record<string, any>) {
+    if (view !== undefined) viewQuery = view;
     const query: Record<string, any> = {
         skip: (filters.currentPage - 1) * filters.perPage,
         limit: filters.perPage,
@@ -301,7 +359,8 @@ function fetchTasks(additional: any = {}) {
         query.stage_ids = filters.stages.map((s) => s.id);
     }
 
-    if (filters.status.value !== "all") {
+    // without a status the API gives the open tasks
+    if (filters.status.value !== "open") {
         query.type = filters.status.value;
     }
 
@@ -309,10 +368,17 @@ function fetchTasks(additional: any = {}) {
         query.type_id = filters.taskType.id;
     }
 
-    runTasks(tasksService.find({...query, ...additional}).exec());
+    if (scope.value === "mine") {
+        query.mine = true;
+    } else if (scope.value === "created" && currentUser.value?.id) {
+        query.created_by = [currentUser.value.id];
+    }
+
+    runTasks(tasksService.find({...query, ...viewQuery}).exec());
 }
 
-watch(filters, fetchTasks);
+watch(filters, () => fetchTasks());
+watch(scope, () => fetchTasks());
 // live: tasks created / closed by others (and by triggers) show up by themselves
 useLive((changes) => { if (liveTouches(changes, "tasks")) fetchTasks(); });
 
@@ -321,7 +387,7 @@ onMounted(() => {
         taskTypes.value.unshift(allTaskTypes);
     });
     runStages(stageService.find().exec());
-    runUsers(userService.find({limit: 1000}).exec());
+    runUsers(staffUsers());
 
     notificationCount.value = 0;
 });

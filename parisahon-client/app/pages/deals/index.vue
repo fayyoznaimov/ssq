@@ -46,7 +46,7 @@
                                     <li class="w-full">
                                         <input type="radio" name="preset" :value="Preset.Overdue" v-model="preset" :id="'preset-' + Preset.Overdue" class="apperance-none opacity-0 h-0 absolute -z-10 peer" @change="onPresetSelect(close, $event)">
                                         <label :for="'preset-' + Preset.Overdue" class="nui-button nui-button-medium nui-button-rounded nui-button-pastel dark:text-primary-200 hover:bg-primary-600/10 dark:hover:bg-primary-600/40 hover:text-primary-600 dark:peer-checked:bg-primary-600/40 dark:peer-checked:text-primary-200 peer-checked:bg-primary-600/10 peer-checked:text-primary-600 w-full justify-start">
-                                            С просреченными задачами 
+                                            С просроченными задачами 
                                         </label>
                                     </li>
                                 </ul>
@@ -145,9 +145,10 @@
                                                     />
                                                 </li>
                                                 <li class="flex gap-2 items-center">
-                                                    <BaseInput type="text" inputmode="number" placeholder="Бюджет" v-model.lazy="filters.budgetFrom" name="budget_from" />
+                                                    <!-- the budget is a number: the fields keep digits only -->
+                                                    <BaseInput type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="Бюджет от" v-model="filters.budgetFrom" name="budget_from" @input="onlyDigits('budgetFrom', $event)" />
                                                     <span>-</span>
-                                                    <BaseInput type="text" inputmode="number" name="budget_to" v-model.lazy="filters.budgetTill" />
+                                                    <BaseInput type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="до" name="budget_to" v-model="filters.budgetTill" @input="onlyDigits('budgetTill', $event)" />
                                                 </li>
                                                 <li v-for="filler in filters.dealFillers" :key="filler.id">
                                                     <BaseInput type="text" v-model="filler.value" :placeholder="filler.field" :name="'deal.fillers.' + filler.id" />
@@ -250,14 +251,25 @@
             </div>
         </div>
         <div>
+            <!-- one box: the number, the name, the client's name, phone or e-mail, the company -->
             <BaseInput
                 v-model="label"
                 icon="ph:list-magnifying-glass"
-                placeholder="Поиск"
+                placeholder="Поиск: номер, название, клиент, телефон, компания"
                 size="lg"
             />
         </div>
         <div class="relative overflow-x-auto">
+            <!-- the last request of the list failed: the deals on the screen are the previous ones -->
+            <div
+                v-if="listError"
+                role="alert"
+                class="mb-2 flex flex-wrap items-center gap-3 rounded-md border border-rose-300 bg-rose-50 px-4 py-2.5 text-sm text-rose-700 dark:border-rose-500/40 dark:bg-rose-500/10 dark:text-rose-200"
+            >
+                <Icon name="ph:warning-circle" class="size-5 shrink-0" />
+                <span class="min-w-0 flex-1">Список не обновлён: {{ listError }}. Показаны прежние данные.</span>
+                <BaseButton size="sm" @click="fetchDeals({ notify: true })">Повторить</BaseButton>
+            </div>
             <template v-if="route.query.view === 'kanban'">
                 <transition :duration="300" name="stats">
                     <ul v-if="shouldRevealStats" class="flex flex-wrap gap-x-6 gap-y-2 justify-between bg-muted-200 py-2.5 px-4 rounded-md text-muted-700 dark:bg-muted-800 dark:text-muted-400">
@@ -280,8 +292,10 @@
                     </ul>
                 </transition>
                 <div>
-                    <!-- on a phone a column is a bit narrower than the screen, so the next one peeks out -->
-                    <ul class="flex gap-4 p-3 sm:p-6 rounded-sm overflow-x-auto dark:bg-muted-900" v-dragscroll="{ excluded: ['card-deal', 'add-deal-card'] }">
+                    <BasePlaceload v-show="boardLoading" class="h-2 w-full" />
+                    <!-- on a phone a column is a bit narrower than the screen, so the next one peeks out;
+                         a column counts its deals on the server and loads its cards page by page -->
+                    <ul class="flex gap-4 p-3 sm:p-6 rounded-sm overflow-x-auto dark:bg-muted-900" v-dragscroll="{ excluded: ['card-deal', 'add-deal-card', 'board-more'] }">
                         <li
                             v-for="(stage, idx) in sortedStages"
                             :key="stage.id"
@@ -291,10 +305,15 @@
                                 :stage-name="stage.name"
                                 :stage="stage"
                                 :is-create-deal="idx === 0"
-                                :column-data="columnData[stage.id]"
+                                :column-data="board.columns[stage.id]?.deals ?? []"
+                                :total="board.columns[stage.id]?.count ?? 0"
+                                :budget="board.columns[stage.id]?.budget ?? 0"
+                                :loading-more="board.columns[stage.id]?.loading ?? false"
+                                :closed-since="stage.is_closing ? board.closedSince : null"
                                 v-model:dragging="dragging"
                                 @stage:changed="onStageChange"
                                 @deal:created="onDealCreated"
+                                @load-more="loadMore(stage)"
                             />
                         </li>
                     </ul>
@@ -326,14 +345,18 @@
                     :loading="isLoading"
                     bulk-actions
                     :selector="(item) => item"
+                    :row-link="dealRoute"
                     class="flex-auto mt-2"
                     id="deals"
                 >
+                    <template #label="{item}">
+                        <span class="font-medium text-muted-900 hover:text-primary-600 hover:underline dark:text-white">{{ item.label || 'Сделка №' + (item.display_id ?? item.id) }}</span>
+                    </template>
                     <template #client="{item}">
                         <ClientParts :deal="item" empty="—" class="block truncate text-sm" />
                     </template>
                     <template #actions="{item}">
-                        <BaseButtonIcon size="sm" :to="{name: 'deals-id', params: {id: item.id}, query: {from: '/deals'}}">
+                        <BaseButtonIcon size="sm" :to="dealRoute(item)">
                             <Icon
                                 class="w-5 h-5"
                                 name="ph:pencil-simple"
@@ -343,7 +366,7 @@
                 </BaseTable>
             </template>
             <BasePagination
-                v-if="deals.count / perPage > 1"
+                v-if="!kanban && deals.count / perPage > 1"
                 v-model:current-page="currentPage"
                 class="my-2"
                 :item-per-page="perPage"
@@ -407,8 +430,8 @@ type Filters = {
     stages: Stage[];
     tasks: TaskFilter[];
     dealDates?: string[];
-    budgetFrom?: number;
-    budgetTill?: number;
+    budgetFrom?: string;
+    budgetTill?: string;
     dealFillers: (Filler & {value: string})[];
     ctrAgent: {
         username?: string;
@@ -473,7 +496,10 @@ const filters = reactive<Filters>({
 const label = ref();
 
 const { run: runDealStats, data: dealStats, isLoading: dealStatsLoading } = useAsync<DealStats[]>([]);
-const { run, isLoading, data: deals } = useAsync<{count: number, data: Deal[] }>({count: 0, data: []});
+const { run, isLoading, data: deals, error: dealsError } = useAsync<{count: number, data: Deal[] }>({count: 0, data: []});
+// why the last request of the list failed ("" — it did not)
+const listError = ref('');
+const toast = useToast('GlobalToast');
 const { run: runStages, data: stages } = useAsync<Stage[]>([]);
 const { run: runUsers, data: users } = useAsync<PaginatedResponse<User>>({
     count: 0,
@@ -514,6 +540,7 @@ const tableColumns = ref<Column[]>([
         name: 'label',
         sortable: true,
         resizable: true,
+        rowAnchor: true,
     },
     {
         // name, phone and company of the client in their own colors, "повторный" for a repeat request
@@ -522,6 +549,7 @@ const tableColumns = ref<Column[]>([
         // the table fixes column widths by the header text; the client needs more room
         headerStyle: { width: '260px' },
         style: { value: { 'max-width': '320px' } },
+        rowAnchor: true,
     },
     {
         label: 'Этап сделки',
@@ -558,6 +586,9 @@ const tableColumns = ref<Column[]>([
         }
     }
 ]);
+
+// a row opens its deal; the name and the client are real links (a new tab, a copied address)
+const dealRoute = (deal: Deal) => ({name: 'deals-id', params: {id: deal.id}, query: {from: '/deals'}});
 
 const noTask: TaskFilter = { id: 'no_task', name: 'Нет задач' };
 const overdueTask: TaskFilter = { id: 'overdue', name: 'Просроченные' };
@@ -596,28 +627,100 @@ const totalAmount = computed(() => {
     return total;
 });
 
-const columnData = computed(() => {
-    let data: Record<number, any> = {};
-    for (let deal of deals.value?.data) {
-        if (!deal.stage) continue;
-        if (!data[deal.stage.id]) data[deal.stage.id] = [];
-        data[deal.stage.id].push(deal);
-    }
+// The kanban (GET /deals/board): every column has its totals counted by the server over all its deals
+// and the cards loaded so far, newest first. The closing columns show the deals closed lately.
+type BoardColumn = { deals: Deal[]; count: number; budget: number; loading: boolean };
+type BoardTotal = { stage_id: number | null; count: number; budget: string; closing: boolean };
+type BoardResponse = { stages: BoardTotal[]; data: Deal[]; per_stage: number; closed_since: string | null };
 
-    return data;
+const BOARD_PAGE = 50;
+const board = reactive<{ columns: Record<number, BoardColumn>; closedSince: string | null; loaded: boolean }>({
+    columns: {},
+    closedSince: null,
+    loaded: false,
 });
+const boardLoading = ref(false);
+// a full reload of the board started: answers of the older requests are dropped
+let boardSeq = 0;
+
+const newColumn = (): BoardColumn => ({ deals: [], count: 0, budget: 0, loading: false });
+const budgetOf = (deal: Deal) => Number(deal.budget) || 0;
+
+function columnOf(stageId: number): BoardColumn {
+    board.columns[stageId] ??= newColumn();
+    return board.columns[stageId];
+}
+
+// a card among the cards of its column (newest first); `complete`: the column had all its cards
+function insertCard(deal: Deal, complete = true) {
+    const stageId = deal.stage?.id;
+    if (stageId == null) return;
+    const column = columnOf(stageId);
+    if (column.deals.some((item) => item.id === deal.id)) return;
+    const last = column.deals[column.deals.length - 1];
+    // older than the last card shown: it comes with «Показать ещё»
+    if (!complete && last && deal.id < last.id) return;
+    const at = column.deals.findIndex((item) => item.id < deal.id);
+    if (at === -1) column.deals.push(deal);
+    else column.deals.splice(at, 0, deal);
+}
+
+function applyTotals(stages: BoardTotal[]) {
+    const seen = new Set<number>();
+    for (const total of stages) {
+        if (total.stage_id == null) continue;
+        seen.add(total.stage_id);
+        const column = columnOf(total.stage_id);
+        column.count = total.count;
+        column.budget = Number(total.budget) || 0;
+    }
+    for (const [id, column] of Object.entries(board.columns)) {
+        if (seen.has(Number(id))) continue;
+        column.count = 0;
+        column.budget = 0;
+        column.deals = [];
+    }
+}
+
+function applyBoard(data: BoardResponse) {
+    board.columns = {};
+    applyTotals(data.stages);
+    for (const deal of data.data) insertCard(deal);
+    board.closedSince = data.closed_since;
+    board.loaded = true;
+}
 
 const employees = computed(() => {
     return users.value.data.filter((u) => u.role !== UserRole.CtrAgent);
 });
 
+// a card dragged to another column (or back, when the server refused the move)
 function onStageChange({id, stage}: { id: number, stage: Stage}) {
-    deals.value = {...deals.value, data: deals.value.data.map((deal) => deal.id === id ? ({ ...deal, stage }) : deal)};
+    let moved: Deal | undefined;
+    for (const column of Object.values(board.columns)) {
+        const at = column.deals.findIndex((deal) => deal.id === id);
+        if (at === -1) continue;
+        moved = column.deals[at];
+        column.deals.splice(at, 1);
+        column.count = Math.max(0, column.count - 1);
+        column.budget -= budgetOf(moved);
+    }
+    if (!moved) return;
+    const card = { ...moved, stage };
+    insertCard(card);
+    const target = columnOf(stage.id);
+    target.count++;
+    target.budget += budgetOf(card);
 }
 
+// «Быстрое добавление» in the first column
 function onDealCreated(deal: Deal) {
-    deals.value.data.push(deal);
-    deals.value.count++;
+    if (!deal.stage?.id) return;
+    const column = columnOf(deal.stage.id);
+    if (column.deals.some((item) => item.id === deal.id)) return;
+    column.deals.unshift(deal);
+    column.count++;
+    column.budget += budgetOf(deal);
 }
 
 function onAdd(added) {
@@ -662,10 +765,20 @@ function onPresetSelect(close: Function, e: Event) {
     applyFilters();
 }
 
+// The budget filter takes digits only: the field drops anything else as it is typed
+function onlyDigits(key: 'budgetFrom' | 'budgetTill', e: Event) {
+    const target = e.target as HTMLInputElement;
+    const digits = target.value.replace(/\D/g, '');
+    if (digits !== target.value) target.value = digits;
+    filters[key] = digits;
+}
+
 // New filters always start from the first page
 function applyFilters() {
-    if (currentPage.value !== 1) currentPage.value = 1; // the watcher below fetches
-    else fetchDeals();
+    if (currentPage.value !== 1) {
+        notifyNext = true;
+        currentPage.value = 1; // the watcher below fetches
+    } else fetchDeals({ notify: true });
 }
 
 // Custom field filters as the API expects them: fillers[0][id]=..&fillers[0][value]=..
@@ -680,16 +793,109 @@ function fetchStages() {
     runStages(stagesService.find().exec());
 }
 
-// The kanban has no pager: it asks for all deals (the API caps a page at 1000),
-// the list keeps its page size.
+// The list is paged by the page size; the kanban asks GET /deals/board column by column.
 const kanban = computed(() => route.query.view === 'kanban');
 
-function fetchDeals() {
+// The next load was asked for by the user (a filter, a preset): if it fails, a toast says so
+let notifyNext = false;
+
+// `options` from a watcher are its values, so only `{ notify: true }` counts
+async function fetchDeals(options?: unknown) {
+    const notify = (options as { notify?: boolean } | undefined)?.notify === true || notifyNext;
+    notifyNext = false;
+    if (kanban.value) return fetchBoard({ notify });
+
     const query: Record<string, any> = {
-        limit: kanban.value ? 1000 : perPage.value,
-        skip: kanban.value ? 0 : (currentPage.value - 1) * perPage.value,
+        ...filterQuery(),
+        limit: perPage.value,
+        skip: (currentPage.value - 1) * perPage.value,
         sort: sortBy.value,
     };
+
+    dealsError.value = null;
+    await run(dealsService.find(query).exec());
+    if (dealsError.value) {
+        // the old rows stay; the banner above the list says they are old
+        listError.value = String(dealsError.value?.message || 'ошибка запроса');
+        if (notify) toast.show({message: 'Не удалось применить фильтр: ' + listError.value, timeout: 5000, type: 'error'});
+    } else listError.value = '';
+}
+
+/**
+ * The whole board. `keepPages`: a live reload keeps as many cards per column as are shown
+ * (a change of the filters starts every column from its first page).
+ */
+async function fetchBoard({ notify = false, keepPages = false }: { notify?: boolean, keepPages?: boolean } = {}) {
+    const query = filterQuery();
+    const seq = ++boardSeq;
+    runDealStats(dealsService.get('stats', query).exec());
+    const shown = keepPages ? Math.max(0, ...Object.values(board.columns).map((column) => column.deals.length)) : 0;
+    boardLoading.value = !board.loaded;
+    const result = await promiseResult(dealsService.get<BoardResponse>('board', { ...query, per_stage: Math.min(200, Math.max(BOARD_PAGE, shown)) }).exec());
+    if (seq !== boardSeq) return;
+    boardLoading.value = false;
+    if (!result.ok) {
+        // the old cards stay; the banner above the board says they are old
+        listError.value = String(result.error?.message || 'ошибка запроса');
+        if (notify) toast.show({message: 'Не удалось применить фильтр: ' + listError.value, timeout: 5000, type: 'error'});
+        return;
+    }
+    listError.value = '';
+    applyBoard(result.value);
+}
+
+// «Показать ещё» of a column: the next cards older than the last one shown
+async function loadMore(stage: Stage) {
+    const column = columnOf(stage.id);
+    if (column.loading) return;
+    const last = column.deals[column.deals.length - 1];
+    column.loading = true;
+    const result = await promiseResult(dealsService.get<BoardResponse>('board', {
+        ...filterQuery(),
+        stages: [stage.id],
+        per_stage: BOARD_PAGE,
+        ...(last ? { before_id: last.id } : {}),
+    }).exec());
+    column.loading = false;
+    if (!result.ok) return toast.show({message: 'Не удалось загрузить сделки: ' + result.error.message, timeout: 4000, type: 'error'});
+    for (const deal of result.value.data) {
+        if (deal.stage?.id === stage.id && !column.deals.some((item) => item.id === deal.id)) column.deals.push(deal);
+    }
+    const total = result.value.stages.find((item) => item.stage_id === stage.id);
+    if (total) {
+        column.count = total.count;
+        column.budget = Number(total.budget) || 0;
+    }
+}
+
+/**
+ * A live update named the deals that changed: only they are read again (and the totals of the
+ * columns); a change of unknown or many deals reloads the board.
+ */
+async function refreshBoard(scope: number[] | '*' | undefined) {
+    if (!board.loaded || !Array.isArray(scope) || !scope.length || scope.length > 50) return fetchBoard({ keepPages: true });
+    const ids: number[] = scope;
+    const seq = boardSeq;
+    const query = filterQuery();
+    runDealStats(dealsService.get('stats', query).exec());
+    const [totals, fresh] = await Promise.all([
+        promiseResult(dealsService.get<BoardResponse>('board', { ...query, per_stage: 0 }).exec()),
+        promiseResult(dealsService.get<BoardResponse>('board', { ...query, ids, per_stage: 200 }).exec()),
+    ]);
+    if (seq !== boardSeq) return;
+    if (!totals.ok || !fresh.ok) return fetchBoard({ keepPages: true });
+    const complete: Record<number, boolean> = {};
+    for (const [id, column] of Object.entries(board.columns)) {
+        complete[Number(id)] = column.deals.length >= column.count;
+        column.deals = column.deals.filter((deal) => !ids.includes(deal.id));
+    }
+    applyTotals(totals.value.stages);
+    for (const deal of fresh.value.data) insertCard(deal, complete[deal.stage?.id ?? -1] ?? true);
+}
+
+// The filters of the page as the API takes them (GET /deals, /deals/stats, /deals/board)
+function filterQuery(): Record<string, any> {
+    const query: Record<string, any> = {};
 
     if (filters.stages.length) {
         query.stages = filters.stages.map((s) => s.id);
@@ -711,8 +917,9 @@ function fetchDeals() {
         }
     }
 
+    // the search box: number, name, client (name, phone, e-mail), company
     if (label.value?.trim()) {
-        query.label = label.value.trim();
+        query.q = label.value.trim();
     }
 
     if (filters.ctrAgent.username) {
@@ -771,12 +978,14 @@ function fetchDeals() {
         }
     }
 
-    if (filters.budgetFrom) {
-        query.budget_from = filters.budgetFrom;
+    const budgetFrom = String(filters.budgetFrom ?? '').replace(/\D/g, '');
+    const budgetTill = String(filters.budgetTill ?? '').replace(/\D/g, '');
+    if (budgetFrom) {
+        query.budget_from = budgetFrom;
     }
 
-    if (filters.budgetTill) {
-        query.budget_till = filters.budgetTill;
+    if (budgetTill) {
+        query.budget_till = budgetTill;
     }
 
     // The API filters by created_after / created_before (createdAt[lt|gt] was ignored)
@@ -785,24 +994,37 @@ function fetchDeals() {
         query.created_before = dateFilter.end;
     }
 
-    runDealStats(dealsService.get('stats', query).exec());
-    run(dealsService.find(query).exec());
+    return query;
 }
 
 watch(kanban, fetchDeals);
 // live: deals created, moved or deleted elsewhere (others, triggers, Telegram, the bot);
-// not while a card is being dragged — then right after the drop
+// not while a card is being dragged — then right after the drop. Tasks change only the
+// statistics of the board, and which deals match the task filters.
 let liveMissed = false;
 useLive((changes) => {
     if (liveTouches(changes, 'stages')) fetchStages();
-    if (!liveTouches(changes, 'deals') && !liveTouches(changes, 'tasks')) return;
+    const dealsChanged = liveTouches(changes, 'deals');
+    const tasksChanged = liveTouches(changes, 'tasks');
+    const membership = dealsChanged || (tasksChanged && filters.tasks.length > 0);
+    if (!kanban.value) {
+        if (membership) fetchDeals();
+        return;
+    }
+    if (!membership) {
+        // a task of a deal: the statistics above the board
+        if (tasksChanged) runDealStats(dealsService.get('stats', filterQuery()).exec());
+        return;
+    }
     if (dragging.value) liveMissed = true;
-    else fetchDeals();
+    else if (dealsChanged && !(tasksChanged && filters.tasks.length)) refreshBoard(changes.deals);
+    else fetchBoard({ keepPages: true });
 }, 1000);
 watch(dragging, (now) => {
     if (!now && liveMissed) {
         liveMissed = false;
-        fetchDeals();
+        if (kanban.value) fetchBoard({ keepPages: true });
+        else fetchDeals();
     }
 });
 

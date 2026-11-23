@@ -3,6 +3,11 @@
         <div>
             <h1 class="text-xl">Аналитика по событиям</h1>
             <h2 class="text-sm text-gray-500">Список событий</h2>
+            <!-- /analytics/events?deal_id=12: the history of one deal -->
+            <p v-if="dealId" class="mt-2 flex items-center gap-2 text-sm text-muted-600 dark:text-muted-300">
+                <span>Только сделка № {{ dealId }}</span>
+                <BaseButton size="sm" @click="dealId = null">Все сделки</BaseButton>
+            </p>
         </div>
         <div class="flex flex-wrap gap-5 justify-between">
             <div class="flex items-center gap-4">
@@ -50,7 +55,7 @@
                                     </li>
                                 </ul>
                             </section>
-                            <form class="flex items-start flex-col gap-2 w-full px-2 overflow-hidden" @submit.prevent="fetchLogs">
+                            <form class="flex items-start flex-col gap-2 w-full px-2 overflow-hidden" @submit.prevent="onFiltersApply(close)">
                                 <DatePicker 
                                     v-model="filters.dates"
                                     format="dd-MM-yyyy" 
@@ -92,7 +97,7 @@
                                     :properties="{label: 'label', value: 'id' }"
                                     multiple 
                                     :fixed="true"
-                                    placeholder="Типы событий" 
+                                    placeholder="Типы событий: все значения" 
                                     :multipleLabel="(value, prop) => {
                                         if (!value.length) return;
                                         else return `${value.map(v => v[prop]).join(', ')}`;
@@ -141,6 +146,7 @@ import TairoPopover from '~/components/tairo/TairoPopover.vue';
 import { type DealEvent,DealEventType } from '~/types/deal';
 import type { PaginatedResponse } from '~/types/generics';
 import { type User,UserRole } from '~/types/user';
+import { EVENT_MOVED, EVENT_TASK_UPDATE, durationOf, fieldLabel, fieldValue, isOutgoing, personName, taskChanges } from '~/components/common/feed';
 
 definePageMeta({
     authRoute: true,
@@ -183,74 +189,36 @@ type NormalizeEvent = {
     link: string;
 } 
 
+// the types of the history (src/events/event.entity.ts); 17 and 18 have no member in DealEventType yet
 const eventTypes: Entity<number>[] = [
-    {
-        id: DealEventType.NewDeal,
-        label: 'Новая сделка'
-    },
-    {
-        id: DealEventType.NewComment,
-        label: 'Новое примечание'
-    },
-    {
-        id: DealEventType.NewChatMessage,
-        label: 'Внутренное сообщение'
-    },
-    {
-        id: DealEventType.NewCompany,
-        label: 'Новая компания'
-    },
-    {
-        id: DealEventType.NewCtrAgent,
-        label: 'Новая контакт'
-    },
-    {
-        id: DealEventType.NewSMS,
-        label: 'Новый СМС'
-    },
-    {
-        id: DealEventType.NewTask,
-        label: 'Новая задача'
-    },
-    {
-        id: DealEventType.NewCallRecording,
-        label: 'Новое голосове'
-    },
-    {
-        id: DealEventType.NewTaskStatus,
-        label: 'Результат по задаче'
-    },
-    {
-        id: DealEventType.NewTelegramCall,
-        label: 'Новый телеграм звонок'
-    },
-    {
-        id: DealEventType.NewEmail,
-        label: 'Новое письмо'
-    },
-    {
-        id: DealEventType.NewFieldValue,
-        label: 'Новое значение'
-    },
-    {
-        id: DealEventType.NewUpdatedFieldValue,
-        label: 'Изменения поля'
-    },
-    {
-        id: DealEventType.NewTelegramMessage,
-        label: 'Новое телеграм сообщение'
-    },
-    {
-        id: DealEventType.NewProduct,
-        label: 'Новый товар'
-    },
+    { id: DealEventType.NewDeal, label: 'Новая сделка' },
+    { id: DealEventType.NewStage, label: 'Смена этапа' },
+    { id: DealEventType.NewComment, label: 'Примечание' },
+    { id: DealEventType.NewChatMessage, label: 'Внутреннее сообщение' },
+    { id: DealEventType.NewCompany, label: 'Компания в сделке' },
+    { id: DealEventType.NewCtrAgent, label: 'Контакт в сделке' },
+    { id: DealEventType.NewSMS, label: 'СМС' },
+    { id: DealEventType.NewTask, label: 'Новая задача' },
+    { id: EVENT_TASK_UPDATE, label: 'Задача изменена' },
+    { id: DealEventType.NewTaskStatus, label: 'Задача выполнена' },
+    { id: DealEventType.NewCallRecording, label: 'Звонок' },
+    { id: DealEventType.NewTelegramCall, label: 'Звонок в Telegram' },
+    { id: DealEventType.NewEmail, label: 'Письмо' },
+    { id: DealEventType.NewFieldValue, label: 'Новое значение поля' },
+    { id: DealEventType.NewUpdatedFieldValue, label: 'Изменение поля' },
+    { id: DealEventType.NewTelegramMessage, label: 'Сообщение Telegram' },
+    { id: DealEventType.NewWhatsAppMessage, label: 'Сообщение WhatsApp' },
+    { id: DealEventType.NewProduct, label: 'Новый товар' },
+    { id: EVENT_MOVED, label: 'Перенос в другую сделку' },
 ];
+const typeLabel = new Map(eventTypes.map((t) => [t.id, t.label]));
 
+// no type chosen = every type (new types too): the filter is not sent
 const initialFilters: Filters = {
     originatedBy: undefined,
     dates: [],
     entities: [],
-    types: eventTypes,
+    types: [],
 };
 
 const route = useRoute();
@@ -264,7 +232,10 @@ const preset = ref<Preset>(Preset.All);
 const perPage = ref(app.pagination.defaultPageSize);
 const currentPage = ref(route.query.page ? parseInt(route.query.page as string) : 1);
 const dateFilter = reactive({start: '', end: ''});
-const sortBy = ref<Record<string, any>>({createdAt: -1});
+// one deal's history (the API filters by deal_id)
+const dealId = ref<number | null>(Number(route.query.deal_id) > 0 ? Number(route.query.deal_id) : null);
+// the date column sorts on the server (newest first by default)
+const sortBy = ref<Record<string, any>>({created_at: -1});
 const { run, data: logs, isLoading } = useAsync<{
     count: number, data: DealEvent[], page_size: number, current_page: number, last_page: 0}
 >(
@@ -296,159 +267,130 @@ const entities = ref<Entity<string>[]>([
     }
 ]);
 
-
-const today = [moment().subtract(1, 'day').format('YYYY-MM-DD'), moment().add(1, 'day').format('YYYY-MM-DD')];
-const yesterday = [moment().subtract(2, 'day').format('YYYY-MM-DD'), moment().format('YYYY-MM-DD')];
-const last30Days = [moment().subtract(31, 'day').format('YYYY-MM-DD'), moment().add(1, 'day').format('YYYY-MM-DD')];
+// periods are inclusive days: «за сегодня» is today only (it was yesterday and today, AUDIT-10)
+const day = (value: moment.MomentInput) => moment(value).format('YYYY-MM-DD');
+const today = [day(moment()), day(moment())];
+const yesterday = [day(moment().subtract(1, 'day')), day(moment().subtract(1, 'day'))];
+const last30Days = [day(moment().subtract(29, 'day')), day(moment())];
 const presetDates = ref([
     { label: 'За сегодня', value: today },
     { label: 'За вчера', value: yesterday },
     { label: 'За последние 30 дней', value: last30Days },
-    { label: 'За эту неделю', value: [moment().startOf('week'), moment().endOf('week')] },
-    { label: 'За прошлую неделю', value: [moment().subtract(1, 'week').startOf('week'), moment().subtract(1, 'week').endOf('week')] },
-    { label: 'За этот месяц', value: [moment().startOf('month'), moment().endOf('month')] },
-    { label: 'За прошлый месяц', value: [moment().subtract(1, 'month').startOf('month'), moment().subtract(1, 'month').endOf('month')] },
-    { label: 'За квартал', value: [moment().startOf('quarters'), moment().endOf('quarters')] },
-    { label: 'За этот год', value: [moment().startOf('year'), moment().endOf('year')] },
+    { label: 'За эту неделю', value: [day(moment().startOf('week')), day(moment().endOf('week'))] },
+    { label: 'За прошлую неделю', value: [day(moment().subtract(1, 'week').startOf('week')), day(moment().subtract(1, 'week').endOf('week'))] },
+    { label: 'За этот месяц', value: [day(moment().startOf('month')), day(moment().endOf('month'))] },
+    { label: 'За прошлый месяц', value: [day(moment().subtract(1, 'month').startOf('month')), day(moment().subtract(1, 'month').endOf('month'))] },
+    { label: 'За квартал', value: [day(moment().startOf('quarter')), day(moment().endOf('quarter'))] },
+    { label: 'За этот год', value: [day(moment().startOf('year')), day(moment().endOf('year'))] },
 ]);
 
-const eventTypeNameMap: Record<DealEventType, (event: DealEvent) => string> = {
-    [DealEventType.NewDeal]: () => 'Новая сделка',
-    [DealEventType.NewComment]: () => 'Новое примечание',
-    [DealEventType.NewChatMessage]: () => 'Внутренное сообщение',
-    [DealEventType.NewCompany]: () => 'Новая компания',
-    [DealEventType.NewCtrAgent]: () => 'Новый контакт',
-    [DealEventType.NewSMS]: () => 'Новый СМС',
-    [DealEventType.NewTask]: () => 'Новая задача',
-    [DealEventType.NewCallRecording]: () => 'Новое голосовое',
-    [DealEventType.NewTaskStatus]: () => 'Результат по задаче',
-    [DealEventType.NewTelegramCall]: () => 'Новый телеграм звонок',
-    [DealEventType.NewEmail]: () => 'Новая почта',
-    [DealEventType.NewFieldValue]: (event: DealEvent) => event.type === DealEventType.NewFieldValue ?  `Новое значения для "${event.after_state.data.field}"` : '',
-    [DealEventType.NewUpdatedFieldValue]: (event: DealEvent) => event.type === DealEventType.NewUpdatedFieldValue ? `Изменено поле "${event.after_state.data.field}"` : '',
-    [DealEventType.NewTelegramMessage]: () => 'Новое телеграм сообщение',
-    [DealEventType.NewProduct]: () => 'Новый товар',
-    [DealEventType.NewStage]: () => 'Новый этап',
-};
-
-const objectNameMap: Record<DealEventType, (event: DealEvent) => string> = {
-    [DealEventType.NewDeal]: () => 'Сделка',
-    [DealEventType.NewComment]: () => 'Сделка',
-    [DealEventType.NewChatMessage]: () => 'Сделка',
+const objectNameMap: Record<number, (event: DealEvent) => string> = {
     [DealEventType.NewCompany]: () => 'Компания',
     [DealEventType.NewCtrAgent]: () => 'Контакт',
-    [DealEventType.NewSMS]: () => 'Сделка',
     [DealEventType.NewTask]: () => 'Задача',
-    [DealEventType.NewCallRecording]: () => 'Сделка',
-    [DealEventType.NewTaskStatus]: () => 'Сделка',
-    [DealEventType.NewTelegramCall]: () => 'Сделка',
-    [DealEventType.NewEmail]: () => 'Сделка',
-    [DealEventType.NewFieldValue]: () => 'Сделка',
-    [DealEventType.NewUpdatedFieldValue]: () => 'Сделка',
-    [DealEventType.NewTelegramMessage]: () => 'Сделка',
-    [DealEventType.NewProduct]: () => 'Сделка',
-    [DealEventType.NewStage]: () => 'Сделка',
+    [EVENT_TASK_UPDATE]: () => 'Задача',
+    [DealEventType.NewTaskStatus]: () => 'Задача',
 };
+
+/** The name of the event: the type; for a field its label («Бюджет», «Компания · ИНН»). */
+function eventName(log: any): string {
+    if (log.type === DealEventType.NewFieldValue || log.type === DealEventType.NewUpdatedFieldValue) {
+        return `${log.type === DealEventType.NewFieldValue ? 'Новое значение' : 'Изменено'}: ${fieldLabel(log.after_state?.data?.field, log.field_of, log.after_state?.data?.subject)}`;
+    }
+    if (log.type === DealEventType.NewCallRecording) {
+        return isOutgoing(log) ? 'Исходящий звонок' : 'Входящий звонок';
+    }
+    if (log.type === DealEventType.NewEmail) {
+        return isOutgoing(log) ? 'Исходящее письмо' : 'Входящее письмо';
+    }
+    return typeLabel.get(log.type) ?? 'Событие';
+}
+
+function short(text: unknown, max = 200): string {
+    const value = String(text ?? '').replace(/\s+/g, ' ').trim();
+    return value.length > max ? `${value.slice(0, max)}…` : value;
+}
 
 const normalized = computed(() => {
     const results: NormalizeEvent[] = [];
-    for (const log of logs.value.data) {
-        let result: NormalizeEvent = {
+    for (const log of logs.value.data as any[]) {
+        const data = log.after_state?.data ?? {};
+        const result: NormalizeEvent = {
             created_at: log.created_at,
-            author: log.originated_by.username,
-            object: objectNameMap[log.type]?.(log),
+            // a deleted employee or contact is still the author (the page broke on null, AUDIT-7)
+            author: personName(log.originated_by),
+            object: objectNameMap[log.type]?.(log) ?? 'Сделка',
             name: '',
-            event: eventTypeNameMap[log.type]?.(log),
+            event: eventName(log),
             value_before: '',
             value_after: '',
             link: ''
         };
+        if (log.deal) {
+            result.name = log.deal.label ?? '';
+            result.link = `/deals/${log.deal.id}`;
+        }
         switch (log.type) {
             case DealEventType.NewProduct: {
-                result.name = log.after_state.data.product.name;
-                result.link = `/lists/products/${log.after_state.data.product.id}`;
+                result.value_after = [data.product?.name, data.quantity ? `${data.quantity} × ${data.price ?? ''}` : ''].filter(Boolean).join(', ');
             } break;
             case DealEventType.NewDeal: {
-                result.name = log.after_state.data.label;
-                result.link = `/deals/${log.after_state.data.id}`;
+                result.name = data.label ?? result.name;
+                if (data.id) result.link = `/deals/${data.id}`;
             } break;
             case DealEventType.NewComment: {
-                result.value_after = log.after_state.data.comment;
-                if (log.deal) {
-                    result.name = log.deal.label;
-                    result.link = `/deals/${log.deal.id}`;
-                }
+                result.value_after = short(data.comment);
             } break;
             case DealEventType.NewCtrAgent: {
-                result.name = log.after_state.data.username;
-                result.link = `/lists/contacts/${log.after_state.data.id}`;
+                result.name = data.username ?? '';
+                if (data.id) result.link = `/lists/contacts/${data.id}`;
             } break;
             case DealEventType.NewCompany: {
-                result.name = log.after_state.data.name;
-                result.link = `/lists/companies/${log.after_state.data.id}`;
+                result.name = data.name ?? '';
+                if (data.id) result.link = `/lists/companies/${data.id}`;
             } break;
             case DealEventType.NewEmail: {
-                result.name = log.after_state.data.subject;
-                result.link = `/mails/${log.after_state.data.id}`;
+                result.value_after = data.subject ?? '';
             } break;
             case DealEventType.NewChatMessage: {
-                result.value_after = log.after_state.data.message;
-                if (log.deal) {
-                    result.name = log.deal.label;
-                    result.link = `/deals/${log.deal.id}`;
-                }
+                result.value_after = short(data.message);
             } break;
             case DealEventType.NewFieldValue: {
-                result.value_after = log.after_state.data.new_value;
-                if (log.deal) {
-                    result.name = log.deal.label;
-                    result.link = `/deals/${log.deal.id}`;
-                }
+                result.value_after = fieldValue(data.field, data.new_value, data.new_label);
             } break;
             case DealEventType.NewUpdatedFieldValue: {
-                result.value_after = log.after_state.data.new_value;
-                result.value_before = log.after_state.data.old_value;
-                if (log.deal) {
-                    result.name = log.deal.label;
-                    result.link = `/deals/${log.deal.id}`;
-                }
+                result.value_after = fieldValue(data.field, data.new_value, data.new_label);
+                result.value_before = fieldValue(data.field, data.old_value, data.old_label);
             } break;
             case DealEventType.NewStage: {
-                result.value_after = log.after_state.data.stage.name;
-                result.value_before = log.after_state.data.stage.name;
-                if (log.deal) {
-                    result.name = log.deal.label;
-                    result.link = `/deals/${log.deal.id}`;
-                }
+                // the stage before is in before_state (the new stage was shown twice)
+                result.value_after = data.stage?.name ?? '';
+                result.value_before = log.before_state?.data?.stage?.name ?? '';
             } break;
-            case DealEventType.NewTask: {
-                result.name = log.after_state.data.deal?.label || log.after_state.data.ctr_agent?.username || log.after_state.data.company?.name || '';
-                result.value_after = log.after_state.data.label;
-                result.link = `/tasks?id=${log.after_state.data.id}`;
-            } break;
+            case DealEventType.NewTask:
+            case EVENT_TASK_UPDATE:
             case DealEventType.NewTaskStatus: {
-                result.name = log.after_state.data.deal?.label || log.after_state.data.ctr_agent?.username || log.after_state.data.company?.name || '';
-                result.value_after = log.after_state.data.result || '';
-                result.link = `/tasks?id=${log.after_state.data.id}`;
+                if (!log.deal) result.name = data.deal?.label || data.ctr_agent?.username || data.company?.name || '';
+                if (log.type === EVENT_TASK_UPDATE) {
+                    result.value_before = log.before_state?.data?.label ?? '';
+                    result.value_after = taskChanges(log.before_state?.data, data).join('; ') || data.label || '';
+                } else {
+                    result.value_after = log.type === DealEventType.NewTaskStatus ? (data.result || data.label || '') : (data.label ?? '');
+                }
+                if (data.id) result.link = `/tasks?id=${data.id}`;
             } break;
+            case DealEventType.NewTelegramMessage:
+            case DealEventType.NewWhatsAppMessage: {
+                const state = log.after_state?.message !== undefined ? log.after_state : data;
+                result.value_after = short(state?.message) || (state?.files?.length ? 'файл' : '');
+            } break;
+            case DealEventType.NewCallRecording:
             case DealEventType.NewTelegramCall: {
-                if (log.deal) {
-                    result.name = log.deal.label;
-                    result.link = `/deals/${log.deal.id}`;
-                }
+                result.value_after = durationOf(log.duration);
             } break;
-            case DealEventType.NewTelegramMessage: {
-                result.value_after = log.after_state.message;
-                if (log.deal) {
-                    result.name = log.deal.label;
-                    result.link = `/deals/${log.deal.id}`;
-                }
-            } break;
-            case DealEventType.NewCallRecording: {
-                if (log.deal) {
-                    result.name = log.deal.label;
-                    result.link = `/deals/${log.deal.id}`;
-                }
+            case EVENT_MOVED: {
+                const to = data.to_deal;
+                result.value_after = to ? `в сделку № ${to.display_id ?? to.id} «${to.label ?? ''}»` : '';
             } break;
         }
 
@@ -462,8 +404,9 @@ const columns = ref<Column[]>([
     {
         label: 'Дата',
         name: 'created_at',
-        dateFormat: 'MMM Do, HH:mm',
+        dateFormat: 'DD.MM.YYYY HH:mm',
         link: (e: NormalizeEvent) => e.link,
+        sortable: true,
         resizable: true,
     },
     {
@@ -504,11 +447,6 @@ const columns = ref<Column[]>([
         name: 'value_before',
         link: (e: NormalizeEvent) => e.link,
         resizable: true,
-        field: (event: DealEvent) => {
-            if (event.type === DealEventType.NewUpdatedFieldValue) {
-                return event.after_state.data.old_value;
-            }
-        }
     },
     {
         label: 'Значение после',
@@ -543,27 +481,37 @@ function onPresetSelect(close: Function, e: Event) {
     }
 
     Object.assign(filters, newFilters);
+    currentPage.value = 1;
+    fetchLogs();
+    close();
+}
+
+function onFiltersApply(close: Function) {
+    currentPage.value = 1;
     fetchLogs();
     close();
 }
 
 function fetchLogs() {
+    const direction = Object.values(sortBy.value ?? {})[0] === 1 ? 1 : -1;
     const query: Record<string, any> = {
         limit: perPage.value,
         skip: (currentPage.value - 1) * perPage.value,
-        sort: { id: -1 },
+        sort: { created_at: direction },
     };
 
-    if (filters.dates?.length === 2) {
-        query.created_before = filters.dates[1];
-        query.created_after = filters.dates[0];
+    // the first and the last day of the period, both included
+    if (filters.dates?.length === 2 && filters.dates[0] && filters.dates[1]) {
+        query.created_after = day(filters.dates[0]);
+        query.created_before = day(filters.dates[1]);
     }
 
     if (filters.entities.length) {
         query.entities = filters.entities.map((e) => e.id);
     }
 
-    if (filters.types.length) {
+    // all types (or none) chosen: no filter, every type is listed
+    if (filters.types.length && filters.types.length < eventTypes.length) {
         query.types = filters.types.map((t) => t.id);
     }
 
@@ -571,10 +519,29 @@ function fetchLogs() {
         query.originated_by = filters.originatedBy.id;
     }
 
+    if (dealId.value) {
+        query.deal_id = dealId.value;
+    }
+
     run(logService.find(query).exec());
 }
 
+// the period above the table is the same filter as the one in the panel (it was not read at all)
+watch(() => [dateFilter.start, dateFilter.end], ([start, end]) => {
+    filters.dates = start && end ? [day(start), day(end)] : [];
+    currentPage.value = 1;
+    fetchLogs();
+});
+
 watch([currentPage, perPage], fetchLogs);
+watch(dealId, () => {
+    currentPage.value = 1;
+    fetchLogs();
+});
+watch(sortBy, () => {
+    currentPage.value = 1;
+    fetchLogs();
+}, { deep: true });
 
 onMounted(() => {
     fetchLogs();

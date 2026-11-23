@@ -31,6 +31,12 @@ export class SearchContactDto extends PaginationRequestDto {
   @Length(1, 255)
   name: string;
 
+  // one search box: the name, the e-mail or the phone (any format)
+  @IsOptional()
+  @IsString()
+  @Length(1, 255)
+  q?: string;
+
   @IsOptional()
   @IsString()
   employees: string;

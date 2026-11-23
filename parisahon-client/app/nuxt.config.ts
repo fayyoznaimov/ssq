@@ -32,8 +32,8 @@ export default defineNuxtConfig({
     },
     app: {
         head: {
-            title: "Houston",
-            titleTemplate: "%s - Houston",
+            // the title template is in app.vue
+            title: "Parisa CRM",
             meta: [
                 {name: "viewport", content: "width=device-width, initial-scale=1"},
             ],

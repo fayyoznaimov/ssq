@@ -19,6 +19,7 @@ import { CreateCollectionDto } from './dto/create.collection.dto';
 import { DealStageCollection } from './deal_stage.collection.entity';
 import { FetchQueryDto } from './dto/fetch.query.dto';
 import { DeleteStageQueryDto } from './dto/delete.stage.query.dto';
+import { SetDefaultStageDto } from './dto/set.default.stage.dto';
 
 @UseGuards(AuthGuard)
 @Controller('stages')
@@ -34,6 +35,22 @@ export class DealStageController {
   async getCollections(
   ): Promise<Record<string, any>> {
     return this.dealStageService.getCollections();
+  }
+
+  /**
+   * The stage new deals without an explicit stage go to (Telegram, WhatsApp, calls, mail,
+   * the bot, a new deal form): as DealService.create picks it. Null when none fits.
+   */
+  @Get('default')
+  async getDefaultStage(): Promise<DealStage | null> {
+    return this.dealStageService.findDefaultStage();
+  }
+
+  /** «Этап для новых сделок» of «Настроить воронку»: a working stage of the active collection. */
+  @Roles(AuthGuard.ADMIN_LEVEL)
+  @Patch('default')
+  async setDefaultStage(@Body() data: SetDefaultStageDto): Promise<DealStage> {
+    return this.dealStageService.setDefaultStage(data.stage_id);
   }
 
   @Roles(AuthGuard.ADMIN_LEVEL)

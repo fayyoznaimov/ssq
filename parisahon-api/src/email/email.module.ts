@@ -20,6 +20,7 @@ import { MailSendingService } from './mail-sending.service';
 import { MailTransporterService } from './mail-transporter.service';
 import { MailTemplateService } from './mail-template.service';
 import { MailSignService } from './mail-sign.service';
+import { MailDealsService } from './mail-deals.service';
 
 @Module({
   imports: [
@@ -41,6 +42,7 @@ import { MailSignService } from './mail-sign.service';
     MailConnectionService,
     MailSyncService,
     MailHistoryService,
+    MailDealsService,
     MailboxService,
     MailSendingService,
     MailTransporterService,

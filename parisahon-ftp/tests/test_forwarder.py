@@ -351,6 +351,21 @@ class PruneTest(ForwarderCase):
         self.forwarder.scan_once()
         self.assertEqual(self.fake.names(), ["sent.wav"])
 
+    def test_audio_the_api_refused_is_kept(self):
+        # the call is not in the CRM: this file is all there is of it, it is never removed by age
+        refused = self.put(5, "refused.wav")
+        self.fake.upload_statuses = [413]
+        with self.assertLogs("ftp.forward", "ERROR") as logs:
+            self.forwarder.scan_once()
+        self.assertIn('rejected user=5 file="refused.wav"', logs.output[0])
+        self.assertIn("the file stays in the folder", logs.output[0])
+        sent = self.put(5, "sent.wav")
+        self.forwarder.scan_once()
+        time.sleep(0.3)
+        self.assertEqual(self.forwarder.prune(), 1)
+        self.assertEqual([os.path.exists(p) for p in (refused, sent)], [True, False])
+        self.assertEqual(self.fake.posts, 2, "the refused file is not sent again")
+
     def test_home_removed_by_hand_is_forgotten(self):
         self.put(5, "a.wav")
         self.put(6, "b.wav")

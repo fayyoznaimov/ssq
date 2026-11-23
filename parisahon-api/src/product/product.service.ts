@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Product } from './product.entity';
 import { DataSource, In, Repository } from 'typeorm';
@@ -43,8 +43,15 @@ export class ProductService {
     let qb = this.productRepository.createQueryBuilder('t0');
 
     if (query.name) {
-      // Search by a part of the name, as companies and contacts do
-      qb = qb.where('t0.name ILIKE :name', { name: `%${query.name}%` });
+      // Search by a part of the name or of the article, as companies and contacts do
+      qb = qb.andWhere('(t0.name ILIKE :name OR t0.sku ILIKE :name)', { name: `%${query.name}%` });
+    }
+    // «Дата создания» of the list (it was never sent): whole days
+    if (query.created_from) {
+      qb = qb.andWhere('t0.created_at >= CAST(:created_from AS date)', { created_from: query.created_from });
+    }
+    if (query.created_till) {
+      qb = qb.andWhere("t0.created_at < CAST(:created_till AS date) + interval '1 day'", { created_till: query.created_till });
     }
 
     return this.helperService.withPagination(
@@ -147,8 +154,12 @@ export class ProductService {
     const newProduct = new Product();
 
     newProduct.name = data.name;
+    newProduct.sku = data.sku ?? null;
+    newProduct.unit = data.unit ?? null;
+    newProduct.price = data.price ?? null;
     newProduct.created_by =
       await this.helperService.extractUserFromRequest(request);
+    data.fillers = data.fillers ?? [];
 
     await this.fillerService.assertRequiredFilled(
       FillableTablesEnum.PRODUCT,
@@ -183,19 +194,32 @@ export class ProductService {
     updatedFields.push(new Field('name', data.name, product.name));
     product.name = data.name;
 
+    // the catalogue fields: only those sent change
+    for (const key of ['sku', 'unit', 'price'] as const) {
+      if (data[key] === undefined) continue;
+      const value = data[key] ?? null;
+      if (value === (product[key] ?? null)) continue;
+      updatedFields.push(
+        new Field(key, value === null ? null : String(value), product[key] === null || product[key] === undefined ? null : String(product[key])),
+      );
+      (product as any)[key] = value;
+    }
+
     product.updated_by = originated_by;
 
-    const productFillerIds = data.fillers.map(
+    const fillersToUpdate = data.fillers ?? [];
+    const fillersToCreate = data.fillers_create ?? [];
+    const productFillerIds = fillersToUpdate.map(
       (filler) => filler.product_filler_id,
     );
     const productFillerIdsToValues = this.getProductFillersHashMap(
-      data.fillers,
+      fillersToUpdate,
     );
-    const productFillers = await this.getProductFillersByIds(productFillerIds);
-    const fillerIdsToEntities = await this.fillerService.getFillersHashMap(
-      data.fillers_create,
-      FillableTablesEnum.PRODUCT,
-    );
+    // values of THIS product only: another product's value id was changed without a trace
+    const productFillers = await this.getProductFillersByIds(productFillerIds, product.id);
+    const fillerIdsToEntities = fillersToCreate.length
+      ? await this.fillerService.getFillersHashMap(fillersToCreate, FillableTablesEnum.PRODUCT)
+      : new Map<number, Filler>();
 
     // Update necessary product fillers
     productFillers.forEach((productFiller) => {
@@ -215,7 +239,7 @@ export class ProductService {
     });
 
     // Create necessary product fillers
-    data.fillers_create.forEach((filler) => {
+    fillersToCreate.forEach((filler) => {
       const newProductFiller = new ProductFiller();
       newProductFiller.value = filler.value;
       newProductFiller.filler = fillerIdsToEntities.get(filler.filler_id);
@@ -231,7 +255,14 @@ export class ProductService {
     });
 
     await this.productFillerRepository.save(productFillers);
-    await this.productRepository.save(product);
+    // update by id: the product holds its deal products (a cycle for save())
+    await this.productRepository.update(product.id, {
+      name: product.name,
+      sku: product.sku,
+      unit: product.unit,
+      price: product.price,
+      updated_by: { id: originated_by.id } as any,
+    });
 
     // Emit necessary events
     product.deal_products.forEach((dealProduct) => {
@@ -266,16 +297,19 @@ export class ProductService {
 
   private async getProductFillersByIds(
     ids: number[],
+    productId: number,
   ): Promise<ProductFiller[]> {
+    const wanted = [...new Set(ids)];
+    if (!wanted.length) return [];
     const productFillers = await this.productFillerRepository.find({
-      where: { id: In(ids) },
+      where: { id: In(wanted), product: { id: productId } },
       relations: ['filler'],
     });
 
-    if (ids.length !== productFillers.length) {
-      this.fillerService.throwExceptionWithNonExistingFillers(
-        ids,
-        productFillers,
+    if (wanted.length !== productFillers.length) {
+      const found = new Set(productFillers.map((row) => row.id));
+      throw new BadRequestException(
+        `Значения доп. полей ${wanted.filter((id) => !found.has(id)).join(', ')} не относятся к этому товару`,
       );
     }
 

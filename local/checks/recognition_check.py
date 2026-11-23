@@ -221,18 +221,41 @@ run().then((r) => console.log(r));
     check("short ИНН, short account and bad email -> warnings, not errors", status in (200, 201) and {"company.inn", "company.bank_account", "company.email"} <= fields, f"{status} {r}")
 
     print("== Recognition: duplicates")
-    status, dup = call("POST", "/companies", {"name": f"Audit Textile Test {STAMP}", "is_old": False, "fillers": required_fillers("company"), "inn": "305123456"}, A)
-    if isinstance(dup, dict) and dup.get("id"):
-        created_companies.append(dup["id"])
-    status, ctr = call("POST", "/companies", {"name": f"AUDIT-CTR-{STAMP}", "is_old": False, "fillers": required_fillers("company"),
-                                            "users": [{"username": f"AUDIT-anna-{STAMP}", "email": f"anna{STAMP}@example.com", "phone": "+998 (90) 123-45-67", "fillers": required_fillers("user")}]}, A)
-    if isinstance(ctr, dict) and ctr.get("id"):
-        created_companies.append(ctr["id"])
+    # The fake card always carries ИНН 305 123 456 and the phone +998 90 123 45 67. ИНН is unique among
+    # live companies and a contact phone among contacts (last 9 digits): on a copy of the real base a
+    # company/contact with them may already exist; then it is the duplicate to find, else we create one.
+    inn_sql = "regexp_replace(coalesce(inn, ''), '[^0-9]', '', 'g') = '305123456' and deleted_at is null"
+    dup_id = psql(f"select id from company where {inn_sql} order by id limit 1")
+    if not dup_id:
+        status, dup = call("POST", "/companies", {"name": f"Audit Textile Test {STAMP}", "is_old": False, "fillers": required_fillers("company"), "inn": "305123456"}, A)
+        if isinstance(dup, dict) and dup.get("id"):
+            created_companies.append(dup["id"])
+        dup_id = psql(f"select id from company where {inn_sql} order by id limit 1")
+    status, again = call("POST", "/companies", {"name": f"Audit Textile Test {STAMP} bis", "is_old": False, "fillers": required_fillers("company"), "inn": "305 123 456"}, A)
+    if isinstance(again, dict) and again.get("id"):
+        created_companies.append(again["id"])
+    check("second company with the same ИНН -> 400", status == 400 and "ИНН" in str(again), f"{status} {again}")
+
+    phone_sql = ("role = 'ctr_agent' and deleted_at is null "
+                 "and right(regexp_replace(coalesce(phone, ''), '[^0-9]', '', 'g'), 9) = '901234567'")
+    ctr_id = psql(f"select id from \"user\" where {phone_sql} order by id limit 1")
+    if not ctr_id:
+        status, ctr = call("POST", "/companies", {"name": f"AUDIT-CTR-{STAMP}", "is_old": False, "fillers": required_fillers("company"),
+                                                "users": [{"username": f"AUDIT-anna-{STAMP}", "email": f"anna{STAMP}@example.com", "phone": "+998 (90) 123-45-67", "fillers": required_fillers("user")}]}, A)
+        if isinstance(ctr, dict) and ctr.get("id"):
+            created_companies.append(ctr["id"])
+        ctr_id = psql(f"select id from \"user\" where {phone_sql} order by id limit 1")
+    status, again = call("POST", "/companies", {"name": f"AUDIT-CTR2-{STAMP}", "is_old": False, "fillers": required_fillers("company"),
+                                              "users": [{"username": f"AUDIT-anna2-{STAMP}", "email": f"anna2{STAMP}@example.com", "phone": "90 123 45 67", "fillers": required_fillers("user")}]}, A)
+    if isinstance(again, dict) and again.get("id"):
+        created_companies.append(again["id"])
+    check("contact with a taken phone in another format -> 400", status == 400 and "телефон" in str(again), f"{status} {again}")
+
     status, r = upload("/companies/recognize", A, PNG, "card.png", "image/png")
     comps = r.get("duplicates", {}).get("companies", []) if isinstance(r, dict) else []
-    check("existing company found by ИНН", any(c["id"] == dup.get("id") and c["match"] == "inn" for c in comps), comps)
+    check("existing company found by ИНН", dup_id and any(str(c["id"]) == dup_id and c["match"] == "inn" for c in comps), f"{dup_id} {comps}")
     contacts = r.get("duplicates", {}).get("contacts", []) if isinstance(r, dict) else []
-    check("existing contact found by phone in another format", any(c["match"] == "phone" and c["username"] == f"AUDIT-anna-{STAMP}" for c in contacts), contacts)
+    check("existing contact found by phone in another format", ctr_id and any(str(c["id"]) == ctr_id and c["match"] == "phone" for c in contacts), f"{ctr_id} {contacts}")
 
     print("== Roles")
     perm = {k: {"view": 3, "create": 3, "update": 3, "delete": 3, "export": 3} for k in ("deal", "contact", "company")}

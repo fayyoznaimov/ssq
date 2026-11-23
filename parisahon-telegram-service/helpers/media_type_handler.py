@@ -1,3 +1,4 @@
+import asyncio
 import re
 import secrets
 import pyrogram
@@ -101,38 +102,80 @@ def determine_file_format(file_path: str) -> str:
     return 'jpg'
 
 
-# TODO: No need to save .ogg files, change download_media to in_memory and generate .mp3 file from there
+def convert_ogg_to_mp3(source: str, target: str) -> None:
+    """ffmpeg through pydub; blocking, so the listener runs it in a worker thread."""
+    if os.environ.get('USE_CUSTOM_FFMPEG_INSTALLATION') == 'true':
+        AudioSegment.converter = f"{os.environ.get('FFMPEG_INSTALLATION_DIR')}/ffmpeg"
+        AudioSegment.ffprobe = f"{os.environ.get('FFMPEG_INSTALLATION_DIR')}/ffprobe"
+    AudioSegment.from_ogg(source).export(target, format="mp3")
+
+
 async def save_audio(
         client: pyrogram.Client,
         message: pyrogram.types.Message,
 ) -> List[File]:
-    files = []
+    """A voice message: mp3 for every browser; when ffmpeg fails the original ogg is kept (never an empty bubble)."""
+    file_name = f"{output_dir}/voice_{generate_random_filename()}"
+    full_file_name = f"{file_name}.ogg"
     try:
-        # Generate a unique file name
-        file_name = f"{output_dir}/voice_{generate_random_filename()}"
-        full_file_name = f"{file_name}.ogg"
-
-        # Download voice message
         await client.download_media(message=message, file_name=full_file_name, in_memory=False, block=True)
-
-        if os.environ.get('USE_CUSTOM_FFMPEG_INSTALLATION') == 'true':
-            AudioSegment.converter = f"{os.environ.get('FFMPEG_INSTALLATION_DIR')}/ffmpeg"
-            AudioSegment.ffprobe = f"{os.environ.get('FFMPEG_INSTALLATION_DIR')}/ffprobe"
-
-        audio = AudioSegment.from_ogg(full_file_name)
-        exported_name = f"{file_name}.mp3"
-        audio.export(exported_name, format="mp3")
-
-        if os.path.exists(full_file_name):
-            # Delete the file
-            os.remove(full_file_name)
-
-        # Create File object and append to list
-        files.append(File('voice_message', extract_file_name(exported_name), 'voice', message.caption))
-
-        return files
     except Exception as e:
-        logger.error(f"Something went wrong during processing voice message: {e}")
+        logger.error(f"Something went wrong during downloading a voice message: {e}")
+        return []
+    if not os.path.exists(full_file_name):
+        return []
+    exported_name = f"{file_name}.mp3"
+    try:
+        # off the event loop: a conversion must not stop the messages of every account
+        await asyncio.to_thread(convert_ogg_to_mp3, full_file_name, exported_name)
+        os.remove(full_file_name)
+        return [File('voice_message', extract_file_name(exported_name), 'voice', message.caption)]
+    except Exception as e:
+        logger.error(f"voice message not converted to mp3, the ogg is kept: {e}")
+        try:
+            if os.path.exists(exported_name):
+                os.remove(exported_name)
+        except OSError:
+            pass
+        return [File('voice_message.ogg', extract_file_name(full_file_name), 'voice', message.caption)]
+
+
+def name_with_extension(name: str, default_ext: str) -> str:
+    """'Видео' -> 'Видео.mp4'; a name that has an extension stays as it is."""
+    name = (name or '').strip()
+    if not name:
+        return name
+    return name if re.search(r'\.[A-Za-z0-9]{1,8}$', name) else f"{name}.{default_ext}"
+
+
+async def save_audio_file(client: pyrogram.Client, message: pyrogram.types.Message) -> List[File]:
+    """A music / audio file (not a voice message)."""
+    try:
+        audio = message.audio
+        original = getattr(audio, 'file_name', None) or ''
+        if '.' in original:
+            ext = safe_extension(extract_file_extension(original))
+        else:
+            mime = (getattr(audio, 'mime_type', None) or '').split('/')[-1]
+            ext = safe_extension({'mpeg': 'mp3', 'mp4': 'm4a', 'x-m4a': 'm4a'}.get(mime, mime) or 'mp3')
+        file_name = f"{output_dir}/audio_{generate_random_filename()}.{ext}"
+        await client.download_media(message=message, file_name=file_name, in_memory=False, block=True)
+        name = original or getattr(audio, 'title', None) or 'Аудио'
+        return [File(name_with_extension(name, ext), extract_file_name(file_name), 'audio', message.caption)]
+    except Exception as e:
+        logger.error(f"Error while saving an audio file: {e}")
+        return []
+
+
+async def save_animation(client: pyrogram.Client, message: pyrogram.types.Message) -> List[File]:
+    """A GIF (Telegram sends it as an mp4 without sound): kept as a video."""
+    try:
+        file_name = f"{output_dir}/video_{generate_random_filename()}.mp4"
+        await client.download_media(message=message, file_name=file_name, in_memory=False, block=True)
+        name = getattr(message.animation, 'file_name', None) or 'GIF.mp4'
+        return [File(name_with_extension(name, 'mp4'), extract_file_name(file_name), 'video', message.caption)]
+    except Exception as e:
+        logger.error(f"Error while saving a GIF: {e}")
         return []
 
 
@@ -143,13 +186,14 @@ async def save_document(
     files = []
     try:
         # Generate a unique file name
-        file_name = f"{output_dir}/document_{generate_random_filename()}.{safe_extension(extract_file_extension(message.document.file_name))}"
+        original = message.document.file_name or ''
+        file_name = f"{output_dir}/document_{generate_random_filename()}.{safe_extension(extract_file_extension(original) if '.' in original else 'bin')}"
 
         # Download document file
         await client.download_media(message=message, file_name=file_name, in_memory=False, block=True)
 
         # Create File object and append to list
-        files.append(File(message.document.file_name, extract_file_name(file_name), 'document', message.caption))
+        files.append(File(original or 'Файл', extract_file_name(file_name), 'document', message.caption))
 
         return files
     except Exception as e:
@@ -201,8 +245,9 @@ async def save_video(
         # Download video message
         await client.download_media(message=message, file_name=full_file_name, in_memory=False, block=True)
 
-        # Create File object and append to list
-        files.append(File(message.video.file_name, extract_file_name(full_file_name), 'video', message.caption))
+        # a phone video usually has no file name (Pyrogram gives None): named by its kind, never null
+        name = name_with_extension(getattr(message.video, 'file_name', None) or 'Видео', 'mp4')
+        files.append(File(name, extract_file_name(full_file_name), 'video', message.caption))
 
         return files
     except Exception as e:
@@ -237,13 +282,14 @@ async def save_sticker(client: pyrogram.Client, message: pyrogram.types.Message)
     try:
         # Generate a unique file name
         file_name = f"{output_dir}/sticker_{generate_random_filename()}"
-        full_file_name = f"{file_name}.{extract_file_extension(message.sticker.file_name)}"
+        original = message.sticker.file_name or ''
+        full_file_name = f"{file_name}.{safe_extension(extract_file_extension(original) if '.' in original else 'webp')}"
 
         # Download video message
         await client.download_media(message=message, file_name=full_file_name, in_memory=False, block=True)
 
         # Create File object and append to list
-        files.append(File(message.sticker.file_name, extract_file_name(full_file_name), 'sticker', message.caption))
+        files.append(File(original or 'Стикер', extract_file_name(full_file_name), 'sticker', message.caption))
 
         return files
 

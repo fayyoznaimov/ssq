@@ -2,6 +2,7 @@
     <!-- no column gaps below lg: 11 gaps of 2rem were wider than a phone and pushed the card off the right edge -->
     <div class="grid grid-cols-12 gap-x-0 gap-y-6 lg:gap-8 px-4 lg:px-10 lg:h-[calc(100vh-6.4rem)]">
         <form
+            ref="formRef"
             class="col-span-12 lg:col-span-4 rounded-md"
             @submit.prevent="onSubmit"
         >
@@ -54,6 +55,7 @@
                             icon="ph:envelope"
                             :loading="companyLoading"
                             :error="errors.email || recognitionWarning('email')"
+                            @input="(e: Event) => onChange('email', (e.target as HTMLInputElement).value)"
                         />
                         <p v-if="company.email_from_contact" class="-mt-2 text-xs text-muted-500">Почта основного контакта ({{ company.email_from_contact }}); сохранится как почта компании.</p>
                         <SimilarClients
@@ -91,13 +93,11 @@
                                         wrapper: 'w-full',
                                         inputWrapper: 'flex gap-2',
                                     }"
-                                    :label="filler.field"
+                                    :label="filler.field + (filler.is_required ? '*' : '')"
                                     :name="`fillers.${filler.id}.${idx}`"
                                     :required="filler.is_required"
-                                    :error="errors[filler.tempId]"
-                                    @input="
-                                        onChange(filler.tempId, filler.value)
-                                    "
+                                    :error="errors[fillerKey(filler)]"
+                                    @input="(e: Event) => onChange(fillerKey(filler), (e.target as HTMLInputElement).value)"
                                 />
                             </li>
                         </ul>
@@ -205,11 +205,15 @@ import { useAsync } from "~/composables/useAsync";
 import { useValidation } from "~/composables/useValidation";
 import type { FillersCreate } from "~/types/filler";
 import { type Company, type User,UserRole } from "~/types/user";
+import { invalidFieldsMessage, revealFirstError } from "~/utils/formErrors";
 import {
+    minLength,
+    optional,
     required,
     type Schema,
-    validPhone,
+    validEmail,
 } from "~/utils/validation";
+import { phoneOrLocal } from "~/components/company/phone";
 
 const route = useRoute();
 
@@ -239,15 +243,24 @@ const {
 
 const { runWithId, isLoadingMap } = useAsync();
 
+// A name of 3+ characters (as the API wants) and a valid phone; the e-mail is checked only when filled.
+// Required extra fields are added by applyCompanyFillers().
 const schema: Schema<string> = {
-    name: [required("Обязательное поле")],
-    phone: [validPhone("Неверный номер телефона")],
+    name: [required("Обязательное поле"), minLength(2, "Не короче 3 символов")],
+    // optional, as in the API: a company from a Telegram chat may have no phone and must still be
+    // saved; 9 digits are a local number (stored as +998…)
+    phone: [optional(phoneOrLocal("Неверный номер: нужен формат +998901200000"))],
+    email: [optional(validEmail("Неверный формат почты"))],
 };
 
 const { onChange, validate, errors } = useValidation(schema);
 
+const formRef = ref<HTMLFormElement>();
+// the key of an extra field in the schema and in `errors`
+const fillerKey = (filler: { id: number }) => `filler-${filler.id}`;
+
 const companyFillersDTO = computed(() => {
-    return company.value.fillers.filter((f) => f.value);
+    return (company.value.fillers ?? []).filter((f) => String(f.value ?? "").trim());
 });
 
 // ---------------------------------------------------------------- requisites + card recognition
@@ -339,34 +352,47 @@ async function onSubmit() {
         requisiteFields.map((f) => [f.key, (company.value[f.key] ?? "").toString().trim()])
     );
 
-    const fillersCreate: FillersCreate[] = [];
+    // Extra fields: a value the company already has is changed by its id (value_id),
+    // a field without a value yet is created; empty ones are not sent
+    const filled = companyFillersDTO.value.map((f: any) => ({ ...f, value: String(f.value).trim() }));
+    const fillersCreate: FillersCreate[] = filled
+        .filter((f) => !f.value_id)
+        .map((f) => ({ filler_id: f.id, value: f.value }));
+    const fillersUpdate = filled
+        .filter((f) => f.value_id)
+        .map((f) => ({ id: f.value_id, value: f.value }));
+    // a value removed from the form is sent as "": the API deletes it (it used to stay)
+    const fillersCleared = (company.value.fillers ?? [])
+        .filter((f: any) => f.value_id && !String(f.value ?? "").trim())
+        .map((f: any) => ({ id: f.value_id, value: "" }));
 
-    // const fieldsMap: Record<string, string> = {};
-
-    // for (const key in companyFillers) {
-    //     const filler = companyFillers[key];
-    //     if (!filler.value) continue;
-    //     if (filler.new)
-    //         fillersCreate.push({ filler_id: filler.id, value: filler.value });
-    //     else companyFillers.push({ filler_id: filler.id, value: filler.value });
-    //     fieldsMap[filler.tempId] = filler.value;
-    // }
-
-    companyFillersDTO.value.forEach((f) => {
-        if (f.new) {
-            fillersCreate.push({ filler_id: f.id, value: f.value });
-        }
-        f.filler_id = f.id;
-    });
+    const fieldsMap: Record<string, string> = {};
+    for (const f of company.value.fillers ?? []) fieldsMap[fillerKey(f)] = String(f.value ?? "").trim();
 
     const validationResult = validate({
-        name,
+        name: (name ?? "").trim(),
         phone,
         email,
-        // ...fieldsMap,
+        ...fieldsMap,
     });
 
-    if (!validationResult.valid) return;
+    if (!validationResult.valid) {
+        // the fields are on the "Общее" tab: open it and show the first wrong one
+        activeTab.value = "general";
+        const labels: Record<string, string> = {
+            name: "Название компании",
+            phone: "Номер телефона",
+            email: "Электронная почта",
+        };
+        for (const f of company.value.fillers ?? []) labels[fillerKey(f)] = (f as any).field;
+        toast.show({
+            message: invalidFieldsMessage(validationResult.errors, labels),
+            type: "error",
+            timeout: 5000,
+        });
+        revealFirstError(formRef.value);
+        return;
+    }
 
     let promise;
     if (id)
@@ -377,9 +403,11 @@ async function onSubmit() {
                 email,
                 is_old,
                 ...requisites,
-                fillers: companyFillersDTO.value,
+                fillers: [...fillersUpdate, ...fillersCleared],
                 fillers_create: fillersCreate,
                 users: getCtrAgentsDTO(),
+                // contacts taken off with the trash button: detached from the company
+                removed_user_ids: ctrAgentsStore.removedIds,
                 primary_contact_id: ctrAgentsStore.primaryContactId ?? null,
             })
             .exec();
@@ -390,8 +418,7 @@ async function onSubmit() {
                 phone,
                 email,
                 ...requisites,
-                fillers: companyFillersDTO.value,
-                fillers_create: fillersCreate,
+                fillers: fillersCreate,
                 is_old,
                 users: getCtrAgentsDTO(),
             })
@@ -422,6 +449,16 @@ async function onSubmit() {
 }
 
 async function onDelete() {
+    // one click used to delete the client: say what goes with it, and ask
+    const deals = await promiseResult(companiesService.get(`${company.value.id}/deals`).exec());
+    const dealCount = deals.ok && Array.isArray(deals.value) ? deals.value.length : null;
+    const contactCount = company.value.users?.length ?? 0;
+    const parts = [
+        `контактов: ${contactCount}`,
+        dealCount === null ? null : `сделок: ${dealCount}`,
+    ].filter(Boolean).join(", ");
+    if (!confirm(`Удалить компанию «${company.value.name}»? У неё ${parts}. Компания пропадёт из списков, её сделки останутся без компании. Вернуть её сможет администратор или руководитель (Компании → Удалённые).`)) return;
+
     const result = await promiseResult(
         runWithId(companiesService.remove(company.value.id).exec(), "delete")
     );
@@ -502,13 +539,21 @@ const tabs = computed(() => {
     return generalTabs.sort((a, b) => a.order - b.order);
 });
 
+// The form shows every extra field of companies; GET /companies/:id gives the company's values
+// as { id: the id of the value, filler_id, value }
 const applyCompanyFillers = () => {
-    company.value.fillers = fillers.value.company.map((filler) => ({
-        ...filler,
-        value:
-            company.value.fillers?.find((cf) => cf.id === filler.id)?.value ||
-            undefined,
-    }));
+    const values: any[] = company.value.fillers ?? [];
+    company.value.fillers = fillers.value.company.map((filler) => {
+        const saved = values.find((cf) => cf.filler_id === filler.id);
+        return {
+            ...filler,
+            value: saved?.value || undefined,
+            value_id: saved?.id,
+        };
+    }) as any;
+    for (const filler of fillers.value.company) {
+        if (filler.is_required) schema[fillerKey(filler)] = [required("Обязательное поле")];
+    }
 };
 
 onMounted(async () => {
@@ -538,9 +583,10 @@ definePageMeta({
     authRoute: true,
     layout: "no-min-height",
     verbose: "Редактировать компанию",
+    verboseNew: "Новая компания",
 });
 
 useHead({
-    title: "Редактировать компанию",
+    title: isAdd ? "Новая компания" : "Редактировать компанию",
 });
 </script>

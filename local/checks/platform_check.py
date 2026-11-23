@@ -119,6 +119,36 @@ def main():
         status, _ = http("DELETE", f"/groups/{gid}", token=admin)
         check("admin deletes the group", status == 200 and psql(f"select count(*) from \"group\" where id = {gid}") == "0", status)
 
+        print("== groups: a group with staff or open tasks is not deleted silently, names stay unique")
+        s1, b1 = http("POST", "/groups", {"name": f"{TAG}-g3"}, admin)
+        s2, b2 = http("POST", "/groups", {"name": f"{TAG}-g4"}, admin)
+        check("admin creates two more groups", s1 == 201 and s2 == 201, (s1, s2))
+        g3, g4 = (b1["id"] if s1 == 201 else 0), (b2["id"] if s2 == 201 else 0)
+        status, _ = http("POST", "/groups", {"name": f"{TAG}-G3"}, admin)
+        check("a new group with the name of another one (other case) -> 400", status == 400, status)
+        status, _ = http("PATCH", f"/groups/{g4}", {"name": f" {TAG}-g3 "}, admin)
+        check("renaming a group to the name of another one -> 400, the name stays",
+              status == 400 and psql(f"select name from \"group\" where id = {g4}") == f"{TAG}-g4", status)
+        psql(f"update \"user\" set group_id = {g3} where id = {A['id']}")
+        task_id = psql(f"insert into task (label, start_time, end_time, group_id) values ('{TAG}-task', now(), now() + interval '1 hour', {g3}) returning id")
+        status, usage = http("GET", f"/groups/{g3}/usage", token=admin)
+        check("GET /groups/:id/usage: the staff and the open tasks of the group",
+              status == 200 and isinstance(usage, dict) and usage.get("users") == 1 and usage.get("open_tasks") == 1, (status, usage))
+        status, _ = http("GET", f"/groups/{g3}/usage", token=A["token"])
+        check("... for the admin only (agent -> 403)", status == 403, status)
+        status, body = http("DELETE", f"/groups/{g3}", token=admin)
+        check("deleting a group with staff and an open task -> 409, nothing changes",
+              status == 409 and psql(f"select count(*) from \"group\" where id = {g3}") == "1"
+              and psql(f"select group_id from \"user\" where id = {A['id']}") == str(g3), (status, body))
+        status, _ = http("DELETE", f"/groups/{g3}?move_to={g3}", token=admin)
+        check("... move_to the same group -> 400", status == 400, status)
+        status, _ = http("DELETE", f"/groups/{g3}?move_to={g4}", token=admin)
+        check("... with move_to: the staff and the open task go to the other group, then the group is deleted",
+              status == 200 and psql(f"select count(*) from \"group\" where id = {g3}") == "0"
+              and psql(f"select group_id from \"user\" where id = {A['id']}") == str(g4)
+              and psql(f"select group_id from task where id = {task_id}") == str(g4), status)
+        psql(f"update \"user\" set group_id = {groups[0]} where id = {A['id']}")
+
         print("== task types")
         status, _ = http("POST", "/task-types", {"name": f"{TAG}-t"}, A["token"])
         check("an agent cannot create a task type -> 403", status == 403, status)
@@ -148,6 +178,29 @@ def main():
         check("the action log is open to a manager", status == 200, status)
         status, _ = http("GET", "/logs?limit=5", token=A["token"])
         check("... and closed to an agent -> 403", status == 403, status)
+        # the journal «Список событий»: every type when none is asked, inclusive days, newest first, names not accounts
+        e_stage = psql(f"insert into event (type, user_id, after_state, before_state) values (15, {M['id']}, "
+                       f"jsonb_build_object('data', jsonb_build_object('stage', jsonb_build_object('name', '{TAG}-new'))), "
+                       f"jsonb_build_object('data', jsonb_build_object('stage', jsonb_build_object('name', '{TAG}-old')))) returning id").split()[0]
+        e_old = psql(f"insert into event (type, user_id, after_state, created_at) values (5, {M['id']}, "
+                     f"jsonb_build_object('data', jsonb_build_object('comment', '{TAG}-yesterday')), now() - interval '1 day') returning id").split()[0]
+        status, body = http("GET", f"/logs?originated_by={M['id']}&limit=50", token=M["token"])
+        ids = [str(e.get("id")) for e in items(body)] if status == 200 else []
+        check("the journal lists a stage change when no type is asked (types 15 and 16 were never listed)", e_stage in ids, (status, ids[:5]))
+        check("... newest first by the time of the event", e_stage in ids and e_old in ids and ids.index(e_stage) < ids.index(e_old), ids[:5])
+        today = psql("select to_char(now(), 'YYYY-MM-DD')")
+        status, body = http("GET", f"/logs?originated_by={M['id']}&created_after={today}&created_before={today}&limit=50", token=M["token"])
+        ids = [str(e.get("id")) for e in items(body)] if status == 200 else []
+        check("a period of one day (created_after = created_before = today): today only, not yesterday as well",
+              status == 200 and e_stage in ids and e_old not in ids, (status, ids[:5]))
+        row = next((e for e in items(body) if str(e.get("id")) == e_stage), {}) if status == 200 else {}
+        author = row.get("originated_by") or {}
+        check("... the author by name, without the rights of the account", author.get("username") == f"{TAG}-manager" and "permissions" not in author, author)
+        status, _ = http("GET", f"/logs?sort[id]=sideways&limit=5", token=M["token"])
+        check("... a wrong sort direction -> 400", status == 400, status)
+        # the history of one deal (/analytics/events?deal_id=…): the events of no other deal
+        status, body = http("GET", f"/logs?originated_by={M['id']}&deal_id=2147483000&limit=50", token=M["token"])
+        check("... deal_id: only that deal's events (none for a missing deal)", status == 200 and items(body) == [], (status, str(body)[:200]))
         status, body = http("GET", "/desktop?my_stats=true&from_date=2026-01-01&till_date=2026-12-31", token=A["token"])
         check("the desktop answers an agent with their own counters", status == 200 and isinstance(body, dict) and body, (status, str(body)[:200]))
         status, _ = http("GET", "/desktop?from_date=2026-01-01&till_date=2026-12-31", token=A["token"])
@@ -166,6 +219,14 @@ def main():
         status, _ = http("DELETE", f"/users/{A['id']}", token=admin)
         status2, _ = http("POST", "/auth/login", {"email": A["email"], "password": A["password"]})
         check("a deleted agent cannot log in", status == 200 and status2 == 401, (status, status2))
+        # what a dismissed employee did keeps their name (it said «—» and the journal page broke, AUDIT-7)
+        e_by_a = psql(f"insert into event (type, user_id, after_state) values (5, {A['id']}, "
+                      f"jsonb_build_object('data', jsonb_build_object('comment', '{TAG}-by-deleted'))) returning id").split()[0]
+        status, body = http("GET", f"/logs?originated_by={A['id']}&limit=50", token=M["token"])
+        row = next((e for e in items(body) if str(e.get("id")) == e_by_a), {}) if status == 200 else {}
+        author = row.get("originated_by") or {}
+        check("the journal shows the author of a deleted account by name, marked deleted",
+              author.get("username") == f"{TAG}-agent" and bool(author.get("deleted_at")), (status, author))
     finally:
         print("== cleanup")
         if isinstance(settings_before, dict):
@@ -174,6 +235,7 @@ def main():
         psql(";".join([
             "begin",
             f"delete from event where user_id in (select id from \"user\" where username like '{TAG}%') or target_user_id in (select id from \"user\" where username like '{TAG}%')",
+            f"delete from task where label like '{TAG}%'",
             f"delete from \"user\" where username like '{TAG}%'",
             f"delete from \"group\" where name like '{TAG}%'",
             f"delete from task_type where name like '{TAG}%'",

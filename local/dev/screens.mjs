@@ -19,12 +19,16 @@ const out = process.env.SCREEN_OUT || join(here, 'screens');
 mkdirSync(out, { recursive: true });
 const chrome = process.env.SCREEN_CHROME || `${process.env.HOME}/.cache/ms-playwright/chromium_headless_shell-1243/chrome-headless-shell-linux64/chrome-headless-shell`;
 
-const res = await fetch(`${api}/auth/login`, {
-  method: 'POST', headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ email: env.ADMIN_EMAIL || 'admin@gmail.com', password: env.ADMIN_PASSWORD }),
-});
-if (!res.ok) { console.error(`login failed: ${res.status}`); process.exit(1); }
-const { access_token: token } = await res.json();
+// SCREEN_TOKEN: the pages as another user (a login token of theirs) instead of the admin
+let token = process.env.SCREEN_TOKEN;
+if (!token) {
+  const res = await fetch(`${api}/auth/login`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: env.ADMIN_EMAIL || 'admin@gmail.com', password: env.ADMIN_PASSWORD }),
+  });
+  if (!res.ok) { console.error(`login failed: ${res.status}`); process.exit(1); }
+  ({ access_token: token } = await res.json());
+}
 
 const sizes = [
   { name: 'pc', width: 1440, height: 900 },
@@ -53,6 +57,13 @@ try {
         await page.waitForTimeout(1000);
         await tab.click({ timeout: 5000 }).catch((e) => console.error(`tab "${process.env.SCREEN_TAB}" not clicked: ${e.message.split('\n')[0]}`));
       }
+      // SCREEN_CLICK: a CSS selector clicked once the page (and the tab) is open, e.g. the submit button of a form
+      if (process.env.SCREEN_CLICK) {
+        const target = page.locator(process.env.SCREEN_CLICK).first();
+        await target.waitFor({ timeout: 15000 }).catch(() => undefined);
+        await page.waitForTimeout(1000);
+        await target.click({ timeout: 5000 }).catch((e) => console.error(`"${process.env.SCREEN_CLICK}" not clicked: ${e.message.split('\n')[0]}`));
+      }
       await page.waitForTimeout(1500);
       const file = join(out, `${path.replace(/[^\w]+/g, '_').replace(/^_|_$/g, '') || 'home'}${process.env.SCREEN_TAB ? '_' + process.env.SCREEN_TAB.replace(/\s+/g, '_') : ''}-${size.name}.png`);
       await page.screenshot({ path: file, fullPage: true });
@@ -62,8 +73,12 @@ try {
       const base = (process.env.SCREEN_BASE || '').replace(/\/+$/, '');
       const fullPath = new URL(page.url()).pathname;
       const finalPath = base && fullPath.startsWith(base) ? fullPath.slice(base.length) || '/' : fullPath;
+      // for local/checks/ui_check.py: the title of the tab, the text on the page and how many elements match SCREEN_PROBE (a CSS selector)
+      const title = await page.title();
+      const text = (await page.evaluate(() => document.body?.innerText || '')).slice(0, 20000);
+      const probe = process.env.SCREEN_PROBE ? await page.locator(process.env.SCREEN_PROBE).count() : null;
       files.push(file);
-      report.push({ path, size: size.name, file, url: finalPath, overflow, pageErrors: errors.splice(0), consoleErrors: consoleErrors.splice(0), api5xx: failed.splice(0) });
+      report.push({ path, size: size.name, file, url: finalPath, overflow, title, text, probe, pageErrors: errors.splice(0), consoleErrors: consoleErrors.splice(0), api5xx: failed.splice(0) });
       if (!json) {
         const last = report[report.length - 1];
         console.log(`${file}${overflow > 1 ? `  (wider than the screen by ${overflow}px)` : ''}${last.pageErrors.length ? `  (page errors: ${last.pageErrors.join(' | ').slice(0, 200)})` : ''}`);

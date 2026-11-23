@@ -128,6 +128,7 @@
 </template>
 
 <script lang="ts" setup>
+import { confirmFillerDelete } from "~/components/company/fillerDelete";
 import { useAsync } from "~/composables/useAsync";
 import type { Filler } from "~/types/filler";
 
@@ -222,6 +223,9 @@ async function onFillerDelete(e: Event) {
         );
         return;
     }
+
+    // deleting a field deletes its value in every company: say how many, and ask
+    if (!(await confirmFillerDelete(fillersService, id))) return;
 
     const result = await promiseResult(
         runWithId(fillersService.remove(id).exec(), actionId)

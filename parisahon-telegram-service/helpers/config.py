@@ -19,6 +19,15 @@ CRM_API_URL = env("CRM_API_URL", "http://crm-app:3000/api/v1").rstrip("/")
 CRM_API_TOKEN = env("CRM_API_TOKEN")
 CRM_API_TIMEOUT = int(env("CRM_API_TIMEOUT", "30"))
 
+# the token the CRM API must send to this service's own HTTP API (X-Telegram-Service-Token on every route
+# except /health). Default: CRM_API_TOKEN, the same shared secret (the API's TELEGRAM_SERVICE_TOKEN), so an
+# existing setup needs no change. Without any token every route except /health answers 401.
+HTTP_API_TOKEN = env("SERVICE_HTTP_TOKEN", CRM_API_TOKEN)
+
+# every N seconds each connected account is asked who it is (get_me): a session ended in Telegram
+# (revoked on the phone, AUTH_KEY_UNREGISTERED) is seen within this time, not only at the next restart
+HEALTH_SEC = float(env("HEALTH_SEC", "300"))
+
 # sqlite with the Telegram sessions of the managers and the outbox of undelivered messages
 SERVICE_DB = env("SERVICE_DB", "telegram_service.db")
 LOGS_DIR = env("LOGS_DIR", "logs")

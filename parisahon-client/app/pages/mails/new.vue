@@ -3,23 +3,25 @@
         <form @submit.prevent="onSend" id="email-form"></form>
         <div class="flex flex-col gap-3">
             <div class="flex flex-col gap-3">
-                <BaseSelect :loading="transportersLoading" name="transporter_id" form="email-form" label="От" required v-model="transporterId">
-                    <option v-for="transporter of transporters" :value="transporter.id">{{ transporter.email }}</option>
+                <BaseSelect :loading="transportersLoading" name="transporter_id" form="email-form" label="От" v-model="transporterId">
+                    <option v-for="transporter of transporters" :value="String(transporter.id)">{{ transporter.email }}</option>
+                    <option value="">Общий ящик компании</option>
                 </BaseSelect>
-                <p v-if="!transportersLoading && !transporters?.length" class="text-sm text-amber-600 dark:text-amber-400">
-                    Нет ящика для отправки. Добавьте его в разделе <NuxtLink to="/settings/transporters" class="underline">Настройки → Транспортеры</NuxtLink>.
+                <p v-if="!transportersLoading && !transporters?.length" class="text-sm text-muted-500 dark:text-muted-400">
+                    Письмо уйдёт с общего ящика компании. Свой ящик можно подключить в <NuxtLink to="/mails/settings" class="underline">Почта → Настройки</NuxtLink>.
                 </p>
                 <form @submit.prevent="onRecepientSubmit" ref="toFormRef">
                     <input type="hidden" name="key" value="to">
                     <BaseInput
                         label="Кому *"
-                        type="email"
+                        type="text"
                         icon="ph:envelope-simple"
                         name="email"
+                        placeholder="адрес и Enter, можно несколько через запятую"
                         :required="recepients.to.length < 1"
                     />
                 </form>
-                <div v-if="recepients.to.length" class="flex gap-2">
+                <div v-if="recepients.to.length" class="flex flex-wrap gap-2">
                     <template v-for="(email, i) in recepients.to">
                         <BaseSnack size="sm" @delete="() => recepients.to.splice(i, 1)">{{ email }}</BaseSnack>
                         <input type="hidden" name="to[]" :value="email" form="email-form" />
@@ -29,12 +31,13 @@
                     <input type="hidden" name="key" value="cc">
                     <BaseInput
                         label="CC"
-                        type="email"
+                        type="text"
                         icon="ph:at"
                         name="email"
+                        placeholder="адрес и Enter, можно несколько через запятую"
                     />
                 </form>
-                <div v-if="recepients.cc.length" class="flex gap-2">
+                <div v-if="recepients.cc.length" class="flex flex-wrap gap-2">
                     <template v-for="(email, i) in recepients.cc">
                         <BaseSnack size="sm" @delete="() => recepients.cc.splice(i, 1)">{{ email }}</BaseSnack>
                         <input type="hidden" name="cc[]" :value="email" form="email-form" />
@@ -46,6 +49,8 @@
                 </BaseSelect>
                 <div class="bg-white dark:bg-transparent text-sm rounded-md border border-muted-300 dark:border-muted-700 pb-2">
                     <Editor v-model="emailBody" form="email-form" />
+                    <SignaturePreview v-model="withSignature" />
+                    <MailAssistant v-model:body="emailBody" v-model:subject="emailSubject" />
                 </div>
             </div>
             <div class="self-start">
@@ -68,6 +73,8 @@
 import type BaseSnack from '~/components/base/BaseSnack.vue';
 import Editor from '~/components/common/Editor.vue';
 import BaseSelect from '~/components/form/BaseSelect.vue';
+import MailAssistant from '~/components/mail/MailAssistant.vue';
+import SignaturePreview from '~/components/mail/SignaturePreview.vue';
 import { useAsync } from '~/composables/useAsync';
 import type { Template, Transporter } from '~/types/mail';
 import { promiseResult } from '~/utils/result';
@@ -83,27 +90,36 @@ useHead({
     title: 'Письмо'
 });
 
-const transporterId = ref(1);
+// "" = the shared mailbox of the company; the user's own mailbox when there is one
+const transporterId = ref('');
 const toFormRef = ref();
 const ccFormRef = ref();
 const mailService = useService('emails', {auth: true});
 const transporterService = useService('emails/transporters', {auth: true});
 const templateService = useService('emails/templates', {auth: true});
 const toast = useToast('GlobalToast');
-const emailBody = ref();
-const emailSubject = ref();
+const emailBody = ref('');
+const emailSubject = ref('');
 const template = ref();
+// the server adds the signature under the text (in the editor it lost its formatting)
+const withSignature = ref(true);
 const recepients = reactive<{cc: string[], to: string[]}>({cc: [], to: []});
 const { runAsync, isLoading } = useAsync();
 const { run, data: transporters, isLoading: transportersLoading } = useAsync<Transporter[]>([]);
 const { data: templates, isLoading: templatesLoading, run: runTemplates } = useAsync<Template[]>([]);
 
+/** "a@b.uz, c@d.uz; e@f.uz" -> three addresses */
+function splitAddresses(value: unknown): string[] {
+    return String(value ?? '').split(/[,;\s]+/).map((s) => s.trim()).filter(Boolean);
+}
+
 function onRecepientSubmit(e: Event) {
     const form = e.target as HTMLFormElement;
     const formData = new FormData(form);
-    const email = formData.get('email') as string;
     const key = formData.get('key') as 'cc' | 'to';
-    recepients[key].push(email);
+    for (const email of splitAddresses(formData.get('email'))) {
+        if (!recepients[key].includes(email)) recepients[key].push(email);
+    }
     form.reset();
 }
 
@@ -114,18 +130,17 @@ watch(template, (id) => {
         emailBody.value = found.template_body + emailBody.value;
         emailSubject.value = found.subject;
         lastTemplate = found;
-    } 
+    }
 });
 
 watch(transporters, () => {
-    // no sender account yet: the page still opens and says where to add one
-    transporterId.value = transporters.value?.[0]?.id;
+    // no sender account: the letter goes from the shared mailbox
+    transporterId.value = transporters.value?.[0]?.id ? String(transporters.value[0].id) : '';
 });
 
 async function onSend(e: Event) {
     toFormRef.value.reportValidity();
-    ccFormRef.value.reportValidity();
-    if (!toFormRef.value.checkValidity() || !ccFormRef.value.checkValidity()) {
+    if (!toFormRef.value.checkValidity()) {
         return;
     }
 
@@ -134,18 +149,16 @@ async function onSend(e: Event) {
     const ccEmail = new FormData(ccFormRef.value).get('email');
     const toEmail = new FormData(toFormRef.value).get('email');
 
-    if (toEmail) {
-        formData.append('to[]', toEmail);
-    }
+    // what is typed but not yet added with Enter goes too
+    for (const address of splitAddresses(toEmail)) formData.append('to[]', address);
+    for (const address of splitAddresses(ccEmail)) formData.append('cc[]', address);
+    if (!formData.get('transporter_id')) formData.delete('transporter_id');
 
-    if (ccEmail) {
-        formData.append('cc[]', ccEmail);
-    }
-
-    formData.append('body', emailBody.value);
+    formData.append('body', emailBody.value ?? '');
+    formData.append('with_signature', withSignature.value ? 'true' : 'false');
 
     const result = await promiseResult(runAsync(mailService.create(formData).exec()));
-    if (!result.ok) return toast.show({message: result.error.message, type: 'error', timeout: 3000});
+    if (!result.ok) return toast.show({message: result.error.message, type: 'error', timeout: 5000});
     toast.show({message: 'Письмо отправлено', type: 'success', timeout: 3000});
     navigateTo('/mails');
 }

@@ -1,10 +1,10 @@
 import {
   IsArray,
   IsEnum,
+  IsInt,
   IsNumber,
   IsObject,
   IsOptional,
-  IsPhoneNumber,
   IsString,
   Length,
   ValidateIf,
@@ -13,9 +13,21 @@ import {
 import { RoleEnum } from '../user.entity';
 import { LoginUserDto } from '../../auth/dto/login.user.dto';
 import { CreateUserPermissionsDto } from './create.user.permissions.dto';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { ChildFiller } from '../../filler/filler.entity';
-import { Trim } from '../../helper/validators';
+import { IsPhoneLike, Trim } from '../../helper/validators';
+
+/**
+ * "" from a form is "no value": a contact (ctr_agent) may have no e-mail and no phone (Telegram,
+ * WhatsApp, calls create them so), and "" must not reach @IsEmail / @IsPhoneLike.
+ */
+export function EmptyToNull(): PropertyDecorator {
+  return Transform(({ value }) => {
+    if (typeof value !== 'string') return value;
+    const trimmed = value.trim();
+    return trimmed === '' ? null : trimmed;
+  });
+}
 
 export class CreateUserFillerDto implements ChildFiller {
   @IsNumber()
@@ -33,12 +45,18 @@ export class CreateUserDto extends LoginUserDto {
 
   @Trim()
   @IsString()
-  @Length(3, 255)
+  @Length(2, 255)
   username: string;
 
+  // a contact needs no e-mail ("" = none); staff accounts still need one to log in (LoginUserDto)
+  @EmptyToNull()
+  email: string;
+
+  // one rule for every phone: as people type it, stored normalized (helper/phone.ts)
+  @EmptyToNull()
   @IsOptional()
   @IsString()
-  @IsPhoneNumber()
+  @IsPhoneLike()
   @Length(3, 255)
   phone: string;
 
@@ -50,9 +68,10 @@ export class CreateUserDto extends LoginUserDto {
   @IsNumber()
   group_id: number;
 
-  @ValidateIf((o) => o.role === RoleEnum.CTR_AGENT)
-  @IsNumber()
-  company_id: number;
+  // a contact may have no company: Telegram, WhatsApp and calls create them without one
+  @ValidateIf((o) => o.role === RoleEnum.CTR_AGENT && o.company_id != null)
+  @IsInt()
+  company_id: number | null;
 
   @ValidateIf((o) => ![RoleEnum.ADMIN, RoleEnum.CTR_AGENT].includes(o.role))
   @IsObject()
@@ -60,7 +79,7 @@ export class CreateUserDto extends LoginUserDto {
   @Type(() => CreateUserPermissionsDto)
   permissions: CreateUserPermissionsDto;
 
-  @ValidateIf((o) => o.role === RoleEnum.CTR_AGENT)
+  @ValidateIf((o) => o.role === RoleEnum.CTR_AGENT && o.fillers != null)
   @ValidateNested({ each: true })
   @Type(() => CreateUserFillerDto)
   @IsArray()

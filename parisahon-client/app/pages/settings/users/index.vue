@@ -147,15 +147,17 @@ const columns = ref<Column[]>([
     }
 ]);
 
+// staff=true: employees only, without the customer contacts (an API without the filter lists everybody)
 function fetchUsers() {
     runUsers(usersService.find({
         skip: (currentPage.value - 1) * perPage.value,
         limit: perPage.value,
         sort: sortBy.value,
+        staff: 'true',
     }).exec());
 }
 
-const searchByUsername = debounce((username: string) => runUsers(usersService.find({username}).exec()), 300);
+const searchByUsername = debounce((username: string) => runUsers(usersService.find({username, staff: 'true'}).exec()), 300);
 
 watch(username, searchByUsername);
 watch([currentPage, sortBy, perPage, dateFilter], fetchUsers);

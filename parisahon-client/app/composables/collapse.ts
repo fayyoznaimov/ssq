@@ -71,11 +71,17 @@ export function useCollapse() {
             return [];
         }
 
+        // an item without a subject (the divider, «Выйти») is for everybody; a section whose
+        // pages are all closed to the user is not shown
+        const allowed = (subject?: string) => !subject || ability.can('read', subject);
         const items = [];
         for (const item of app.tairo.collapse.navigation.items) {
-            if (!ability.can('read', item.subject)) continue;
+            if (!allowed(item.subject)) continue;
             const newItem = {...item, children: item.children};
-            if (item.children) newItem.children = item.children.filter((i) => ability.can('read', i.subject));
+            if (item.children) {
+                newItem.children = item.children.filter((i) => allowed(i.subject));
+                if (!newItem.children.length) continue;
+            }
             items.push(
                 <TairoCollapseResolvedConfig>{
                     ...newItem,

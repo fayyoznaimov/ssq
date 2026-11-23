@@ -18,10 +18,14 @@
                 <span class="text-muted-500">Логин</span><span>любой, например <code>crm</code></span>
                 <span class="text-muted-500">Пароль</span><span>токен менеджера (выдаётся ниже)</span>
                 <span class="text-muted-500">Режим</span><span>пассивный</span>
+                <span class="text-muted-500">Шифрование</span><span>FTPS (явный TLS, «AUTH TLS»), если приложение его умеет</span>
             </div>
             <p class="text-muted-500">
                 Номер, направление и время звонка CRM берёт из имени файла (Cube ACR и другие рекордеры).
-                Один и тот же файл дважды не попадёт.
+                Один и тот же файл дважды не попадёт; обрезанная копия звонка не задвоит его — остаётся более длинная запись.
+            </p>
+            <p class="text-amber-600">
+                Без шифрования токен передаётся открытым текстом: такой телефон подключайте только в офисной сети или через VPN.
             </p>
         </BaseCard>
 
@@ -77,6 +81,7 @@
                         <option value="failed">с ошибкой</option>
                         <option value="pending">в очереди</option>
                         <option value="done">обработанные</option>
+                        <option value="duplicate">повторы</option>
                         <option value="all">все</option>
                     </select>
                     <BaseButton size="sm" variant="pastel" :loading="busy === 'process'" @click="processNow">Обработать сейчас</BaseButton>
@@ -94,7 +99,7 @@
                         <td class="break-all">{{ u.file_name }} <span class="text-muted-400">{{ u.source === 'folder' ? '(из папки)' : u.source === 'ftp' ? '(FTP)' : '' }}</span></td>
                         <td class="whitespace-nowrap">{{ u.from_number || u.caller_name || '—' }} {{ u.outgoing ? '↗' : '↙' }}</td>
                         <td>{{ statusLabel[u.status] || u.status }}</td>
-                        <td class="text-rose-600 break-all">{{ u.error }}</td>
+                        <td class="break-all" :class="u.status === 'duplicate' ? 'text-muted-500' : 'text-rose-600'">{{ u.error }}</td>
                         <td class="text-right whitespace-nowrap">
                             <template v-if="u.status === 'failed' || u.status === 'pending'">
                                 <BaseButton v-if="u.status === 'failed'" size="sm" variant="pastel" :loading="busy === 'retry' + u.id" @click="retry(u)">Повторить</BaseButton>
@@ -126,6 +131,7 @@
                     <div class="text-sm md:w-72 shrink-0">
                         <div>{{ fmt(r.created_at) }} · {{ r.user?.username }}</div>
                         <div class="text-muted-500">{{ r.from_number || 'номер неизвестен' }} · {{ r.outgoing ? 'исходящий' : 'входящий' }} · {{ minutes(r.duration) }}</div>
+                        <div v-if="r.contact" class="text-muted-500">клиент: {{ r.contact.username }}</div>
                         <NuxtLink v-if="r.deal" :to="`/deals/${r.deal.id}`" class="text-primary-600 underline">{{ r.deal.label }}</NuxtLink>
                         <div v-else class="flex flex-wrap items-center gap-2">
                             <span class="text-muted-400">нет в сделках</span>
@@ -160,7 +166,7 @@ useHead({ title: 'Запись звонков' });
 
 type TokenRow = { user_id: number; username: string; role: string; has_token: boolean; issued_at: string | null; last_upload_at: string | null };
 type QueueRow = { id: number; user: { id: number; username: string } | null; file_name: string; from_number: string | null; caller_name: string | null; outgoing: boolean; source: string; status: string; error: string | null; received_at: string };
-type RecordingRow = { id: number; user: { id: number; username: string } | null; duration: number; outgoing: boolean; path: string; from_number: string | null; created_at: string; deal: { id: number; label: string } | null };
+type RecordingRow = { id: number; user: { id: number; username: string } | null; duration: number; outgoing: boolean; path: string; from_number: string | null; created_at: string; deal: { id: number; label: string } | null; contact?: { id: number; username: string } | null };
 
 const toast = useToast('GlobalToast');
 const config = useRuntimeConfig();
@@ -176,7 +182,7 @@ const queueStatus = ref('failed');
 const recordings = ref<{ data: RecordingRow[]; count: number; page: number; limit: number }>({ data: [], count: 0, page: 1, limit: 50 });
 const filters = reactive({ user_id: '', from: '', till: '', number: '' });
 const busy = ref('');
-const statusLabel: Record<string, string> = { pending: 'в очереди', done: 'обработан', failed: 'ошибка', discarded: 'убран' };
+const statusLabel: Record<string, string> = { pending: 'в очереди', done: 'обработан', failed: 'ошибка', discarded: 'убран', duplicate: 'повтор' };
 
 function fmt(value: string | null) {
     return value ? new Date(value).toLocaleString('ru') : '—';
@@ -262,8 +268,8 @@ async function processNow() {
     const r = await promiseResult(callsService.post('/process', {}).exec());
     busy.value = '';
     if (!r.ok) return fail(r.error);
-    const v = r.value as { done: number; failed: number };
-    toast.show({ type: 'success', message: `Обработано: ${v.done}, с ошибкой: ${v.failed}`, timeout: 3000 });
+    const v = r.value as { done: number; failed: number; duplicate?: number };
+    toast.show({ type: 'success', message: `Обработано: ${v.done}, с ошибкой: ${v.failed}` + (v.duplicate ? `, повторов: ${v.duplicate}` : ''), timeout: 3000 });
     await Promise.all([loadQueue(), loadRecordings(), loadTokens()]);
 }
 

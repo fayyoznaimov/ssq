@@ -9,13 +9,14 @@
             <BaseAutocomplete 
                 v-model="linkable"
                 name="linkable"
-                :items="linkables" 
+                :items="linkableItems" 
                 label="Компании, контакты или сделки" 
                 placeholder="Поиск..." size="md"
                 @input="onSearch"
                 :properties="{
-                    value: 'id',
+                    value: 'key',
                     label: 'name',
+                    sublabel: (l: Linkable) => LINKABLE_KINDS[l.type] ?? '',
                 }"
                 dropdown
                 required
@@ -68,7 +69,20 @@ const user = useState<User>('user');
 type Linkable = {
     id: number;
     name: string;
-    type: 'ctr_agent' | 'company' | 'deal';
+    type: 'ctr_agent' | 'user' | 'company' | 'deal';
+    // a company and a deal may have the same id: the list tells them apart by type and id
+    key?: string;
+}
+
+const LINKABLE_KINDS: Record<string, string> = {
+    deal: 'Сделка',
+    company: 'Компания',
+    user: 'Контакт',
+    ctr_agent: 'Контакт',
+};
+
+function withKey(l: Linkable): Linkable {
+    return {...l, key: `${l.type === 'user' ? 'ctr_agent' : l.type}-${l.id}`};
 }
 
 const linkableService = useService('/linkables', {auth: true});
@@ -78,6 +92,7 @@ const { data: linkables, run: runLinkables } = useAsync<Linkable[]>([]);
 const { runAsync: saveTask, isLoading: saving } = useAsync();
 const { runAsync: deleteTask, isLoading: deleting } = useAsync();
 const linkable = ref<Linkable>();
+const linkableItems = computed(() => (linkables.value ?? []).map(withKey));
 
 const { validate, errors, onChange } = useValidation({
     linkable: [required('Обязательное поле')],
@@ -136,21 +151,25 @@ async function onSubmit(e: Event) {
     closeModal();
 }
 
+// the deal first: an automatic task names the deal and its company, and the deal is what it is about
 function shown(data: Task) {
     task.value = data;
-    if (data.ctr_agent) {
-        linkable.value = {id: data.ctr_agent.id, name: data.ctr_agent.username, type: 'ctr_agent'};
+    linkable.value = undefined;
+    if (data.deal) {
+        linkable.value = withKey({id: data.deal.id, name: data.deal.label, type: 'deal'});
+    } else if (data.ctr_agent) {
+        linkable.value = withKey({id: data.ctr_agent.id, name: data.ctr_agent.username, type: 'ctr_agent'});
     } else if (data.company) {
-        linkable.value = {id: data.company.id, name: data.company.name, type: 'company'};
-    } else if (data.deal) {
-        linkable.value = {id: data.deal.id, name: data.deal.label, type: 'deal'};
+        linkable.value = withKey({id: data.company.id, name: data.company.name, type: 'company'});
     }
 }
 
-function onSearch(e: Event) {
-    const target = (e.target as HTMLInputElement);
-    runLinkables(linkableService.find({ name: encodeURIComponent(target.value) }).exec());
-}
+// useService encodes the query itself: encoding here too sent "%D0%9F..." and Cyrillic names were never found
+const onSearch = debounce((e: Event) => {
+    const value = (e.target as HTMLInputElement).value.trim();
+    if (!value) return;
+    runLinkables(linkableService.find({ name: value }).exec());
+}, 300);
 
 function closeModal() {
     emit('save');

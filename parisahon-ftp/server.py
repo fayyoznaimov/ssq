@@ -72,10 +72,19 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, stop)
     passive = f"{config.passive_ports.start}-{config.passive_ports.stop - 1}" if config.passive_ports else "any"
-    log.info("listening on %s:%s, passive ports %s%s, FTPS %s, root %s, API %s, scan every %gs, settle %gs, keep files %s",
+    ftps = "required" if config.tls_required else "offered (AUTH TLS)" if config.tls_cert else "off"
+    if config.tls_required:
+        plain = "off"
+    else:
+        plain = ("from " + " ".join(str(n) for n in config.plain_networks)) if config.plain_networks else "from anywhere"
+        plain += "" if config.plain_download else ", upload only"
+    log.info("listening on %s:%s, passive ports %s%s, FTPS %s, plain FTP %s, root %s, API %s, scan every %gs, settle %gs, keep files %s",
              config.host, config.port, passive, f" (announced address {config.masquerade_address})" if config.masquerade_address else "",
-             "offered (AUTH TLS)" if config.tls_cert else "off", config.root, config.api_url, config.scan_sec, config.settle_sec,
+             ftps, plain, config.root, config.api_url, config.scan_sec, config.settle_sec,
              f"{config.retain_days:g} days" if config.retain_days > 0 else "forever")
+    if not config.tls_required and not config.plain_networks:
+        log.warning("plain FTP is allowed from any network: the recorder tokens can be read on the way "
+                    "(set FTP_PLAIN_NETWORKS to the office / VPN networks, or FTP_TLS_REQUIRED=1 when every phone does FTPS)")
     forwarder.start()
     try:
         server.serve_forever(handle_exit=False)

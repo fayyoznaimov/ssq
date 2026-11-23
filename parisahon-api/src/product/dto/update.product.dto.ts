@@ -1,12 +1,13 @@
 import {
   IsArray,
   IsNumber,
+  IsOptional,
   IsString,
   Length,
   ValidateNested,
 } from 'class-validator';
 import { Type } from 'class-transformer';
-import { CreateProductFillerDto } from './create.product.dto';
+import { CreateProductFillerDto, ProductCatalogueDto } from './create.product.dto';
 import { Trim } from '../../helper/validators';
 
 export class UpdateProductFillerDto {
@@ -18,17 +19,19 @@ export class UpdateProductFillerDto {
   value: string;
 }
 
-export class UpdateProductDto {
+export class UpdateProductDto extends ProductCatalogueDto {
   @Trim()
   @IsString()
   @Length(1, 255)
   name: string;
 
+  @IsOptional()
   @ValidateNested({ each: true })
   @Type(() => UpdateProductFillerDto)
   @IsArray()
   fillers: UpdateProductFillerDto[];
 
+  @IsOptional()
   @ValidateNested({ each: true })
   @Type(() => CreateProductFillerDto)
   @IsArray()

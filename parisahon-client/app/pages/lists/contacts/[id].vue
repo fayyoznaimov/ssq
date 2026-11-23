@@ -25,6 +25,7 @@
                             :error="errors.username"
                             @input="(e: Event) => onChange('username', (e.target as HTMLInputElement).value)"
                         />
+                        <!-- a contact from Telegram, WhatsApp or a call has no e-mail and no company: both optional -->
                         <BaseInput
                             v-model="contact.phone"
                             type="text"
@@ -33,7 +34,6 @@
                             placeholder="пр.: +998901200000"
                             icon="ph:phone"
                             :loading="contactLoading"
-                            required
                             :error="errors.phone"
                             @input="(e: Event) => onChange('phone', (e.target as HTMLInputElement).value)"
                         />
@@ -45,7 +45,6 @@
                             placeholder="пр.: andrei@example.com"
                             icon="ph:envelope"
                             :loading="contactLoading"
-                            required
                             :error="errors.email"
                             @input="(e: Event) => onChange('email', (e.target as HTMLInputElement).value)"
                         />
@@ -55,14 +54,19 @@
                             :display-value="(company: Company) => company?.name"
                             :properties="{ value: 'id', label: 'name' }"
                             label="Компания"
+                            placeholder="Без компании"
                             clearable
                             dropdown
                             name="company"
-                            :error="errors.company"
-                            required
                             @input="onCompanyInput"
-                            @change="(c: Company) => onChange('company', c.id)"
                         />
+                        <p
+                            v-if="contact.id && movedCompany"
+                            class="-mt-2 text-xs text-muted-500 dark:text-muted-400"
+                        >
+                            {{ contact.company ? `Контакт перейдёт в «${contact.company.name}»` : "Контакт будет отвязан от компании" }}:
+                            это попадёт в историю его сделок.
+                        </p>
                         <ul class="flex flex-col gap-3">
                             <li
                                 v-for="(filler, idx) in contact.user_fillers"
@@ -272,7 +276,14 @@
             </BaseTabs>
         </section>
         <section class="col-span-12 lg:col-span-8 flex flex-col relative min-w-0 min-h-[60vh]">
+            <p
+                v-if="eventsDenied"
+                class="text-sm text-muted-500 dark:text-muted-400"
+            >
+                Нет доступа к истории этого контакта.
+            </p>
             <EventsList 
+                v-else
                 :events="events" 
                 :classes="{wrapper: 'max-h-[calc(100%-4rem)]'}" 
                 :events-loading="eventsLoading" 
@@ -358,6 +369,8 @@ import { Can } from "@casl/vue";
 import type BaseTabs from "~/components/base/BaseTabs.vue";
 import EventSchedulerSingle from "~/components/common/EventSchedulerSingle.vue";
 import ContactDeals from "~/components/company/ContactDeals.vue";
+import { phoneOrLocal } from "~/components/company/phone";
+import { confirmFillerDelete } from "~/components/company/fillerDelete";
 import EventsList from "~/components/common/EventsList.vue";
 import EmailReplyForm from "~/components/mail/EmailReplyForm.vue";
 import { useAsync } from "~/composables/useAsync";
@@ -444,12 +457,24 @@ const { data: companies, run: runCompanies } = useAsync<{data: Company[]}>({data
 const { runWithId, isLoadingMap } = useAsync();
 const currentUser = useState<User>("user");
 
+// As the API: a contact needs a name only. Contacts from Telegram, WhatsApp and calls have no company
+// and no e-mail, and could not be saved at all. A phone is checked when it is filled; 9 digits are a
+// local number (the API adds +998): phoneOrLocal.
+
 const schema: Schema<string> = {
     username: [required("Обязательное поле")],
-    company: [required("Обязательное поле")],
-    email: [required("Обязательное поле"), validEmail("Неверный формат почты")],
-    phone: [required("Обязательное поле"), validPhone("Неверный номер телефона")],
+    email: [optional(validEmail("Неверный формат почты"))],
+    phone: [optional(phoneOrLocal("Неверный номер телефона: нужен вид +998901200000"))],
 };
+
+// the company of the loaded contact: a change of it is a move (the history of the deals says so)
+const loadedCompanyId = ref<number | null | undefined>(undefined);
+const movedCompany = computed(() => loadedCompanyId.value !== undefined
+    && (contact.value.company?.id ?? null) !== loadedCompanyId.value);
+watch(() => contact.value.id, () => {
+    if (contact.value.id && loadedCompanyId.value === undefined) loadedCompanyId.value = contact.value.company?.id ?? null;
+});
+const eventsDenied = ref(false);
 
 const {onChange, validate, errors} = useValidation(schema);
 
@@ -524,6 +549,8 @@ async function onFillerDelete(e: Event) {
         return;
     }
 
+    // deleting a field deletes its value in every contact: say how many, and ask
+    if (!(await confirmFillerDelete(fillersService, id))) return;
     const result = await promiseResult(runWithId(fillersService.remove(id).exec(), actionId));
     if (!result.ok) return toast.show({ message: result.error.message, type: "error", timeout: 3000 });
     fillers.value.user = fillers.value.user.filter((f) => f.id !== id);
@@ -553,15 +580,15 @@ async function onSubmit(e: Event) {
         email,
         phone,
         username,
-        company: company?.id,
         ...fieldsMap,
     });
 
     if (!validationResult.valid) return;
 
+    // no company: null detaches the contact from its company (not sent at all would keep it)
     let promise;
-    if (id) promise = userService.patch(id, { username, phone, role, permissions, email, company_id: company?.id, fillers, fillers_create: fillersCreate }).exec();
-    else promise = userService.create({ username, phone, email, role, permissions, company_id: company?.id, fillers: fillersCreate }).exec();
+    if (id) promise = userService.patch(id, { username, phone, role, permissions, email, company_id: company?.id ?? null, fillers, fillers_create: fillersCreate }).exec();
+    else promise = userService.create({ username, phone, email, role, permissions, company_id: company?.id ?? null, fillers: fillersCreate }).exec();
 
     const result = await promiseResult(runWithId(promise, "save"));
     if (!result.ok) return toast.show({ message: result.error.message, type: "error", timeout: 3000 });
@@ -569,6 +596,11 @@ async function onSubmit(e: Event) {
 }
 
 async function onDelete() {
+    // one click used to delete the client: say what goes with it, and ask
+    const deals = await promiseResult(userService.get(`${contact.value.id}/deals`).exec());
+    const dealCount = deals.ok && Array.isArray(deals.value) ? deals.value.length : null;
+    const dealsText = dealCount ? ` Сделок с ним: ${dealCount} — они останутся, без этого контакта.` : "";
+    if (!confirm(`Удалить контакт «${contact.value.username}»?${dealsText} Контакт пропадёт из списков и поиска.`)) return;
     const result = await promiseResult(runWithId(userService.remove(contact.value.id).exec(), "delete"));
     if (!result.ok) return toast.show({ message: result.error.message, type: "error", timeout: 3000 });
     navigateTo("/lists/contacts");
@@ -598,7 +630,15 @@ useLive(async (changes) => {
 async function onIntersect() {
     if (eventsEnded.value || eventsLoading.value) return;
     const result = await fetchEvents();
-    if (!result.ok) return;
+    if (!result.ok) {
+        // no right to the contact's history: say so once instead of asking again on every scroll
+        const status = (result.error as any)?.statusCode;
+        if (status === 403 || status === 404) {
+            eventsDenied.value = true;
+            eventsEnded.value = true;
+        }
+        return;
+    }
     if (result.value.current_page === result.value.last_page) eventsEnded.value = true;
     currentPage++;
 }

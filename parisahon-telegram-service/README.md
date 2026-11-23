@@ -8,7 +8,17 @@ Connects the managers' own Telegram accounts (Pyrogram) to the CRM.
   creates the contact and the deal and writes the history; nothing is written to Postgres here.
   Bots, Telegram's service accounts (login codes), groups and "Saved Messages" are skipped
   (`helpers/chat_filter.py`).
-- If the API is unreachable the message waits in the `outbox` table and is resent in order.
+- If the API is unreachable (or refuses the service itself: 401/403 after a token change) the message
+  waits in the `outbox` table and is resent in order; a message the API fails on (500) is retried with its
+  own pause without holding up the others and set aside after `API_MAX_FAILED_ATTEMPTS`; one the API refuses
+  (400, 404, 410 for a manager who is no longer staff) goes to the `rejected` table at once — never dropped.
+- The HTTP API (`app.py`) wants `X-Telegram-Service-Token` = `SERVICE_HTTP_TOKEN` (default `CRM_API_TOKEN`,
+  the same shared secret; the API sends `TELEGRAM_SERVICE_HTTP_TOKEN` or `TELEGRAM_SERVICE_TOKEN`) on every
+  route except `GET /health`.
+- Each account's state (`connected`, `error`, `revoked` = ended in Telegram itself) is in `/get-sessions` and
+  `/health`; every `HEALTH_SEC` each client is asked who it is. A new connection replaces the running client
+  at once; `POST /logout` signs the account out of Telegram and forgets it (the CRM's «Отключить»).
+- Edits of a message go to the CRM too (`edited: true`, the recorded text is replaced).
 - `chat.photo` of the payload: the client's Telegram profile photo, saved into the uploads folder as
   `<hex>.jpg`, with the first message of a chat after the listener starts, then at most once a day per
   chat and only when it changed; `null` when there is no photo or privacy hides it, left out otherwise

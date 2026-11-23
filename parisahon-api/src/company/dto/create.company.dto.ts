@@ -56,6 +56,8 @@ export class CreateCompanyDto extends CompanyRequisitesDto {
   @IsBoolean()
   is_old: boolean;
 
+  // "" from the form: no e-mail (it failed @IsEmail)
+  @EmptyToUndefined()
   @IsOptional()
   @IsString()
   @IsEmail()

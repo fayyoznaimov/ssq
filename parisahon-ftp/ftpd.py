@@ -3,6 +3,11 @@
 Any user name is accepted; the password is the recorder token the admin issued in the CRM
 (settings -> calls). The API says whose token it is (GET /calls/recorder) and the session gets
 FTP_ROOT/<user_id>/ as its root: nothing above it can be named, listed or written.
+
+With a certificate explicit FTPS (AUTH TLS) is offered. Plain FTP stays for the phones whose sync
+app cannot do TLS, but it can be narrowed: FTP_PLAIN_NETWORKS (plain logins only from the office
+network or the VPN, refused at USER, before the token is sent), FTP_PLAIN_DOWNLOAD=0 (a plain
+session uploads only, the recordings cannot be read back), FTP_TLS_REQUIRED=1 (no plain FTP at all).
 """
 import hashlib
 import logging
@@ -15,7 +20,7 @@ from pyftpdlib.authorizers import AuthenticationFailed
 from pyftpdlib.handlers import FTPHandler
 from pyftpdlib.servers import ThreadedFTPServer
 
-from config import Config
+from config import Config, address_in
 from crm import CrmApi
 from forwarder import shown, wanted
 from state import State
@@ -124,6 +129,9 @@ class RecorderSession:
     kick: Callable[[], None] = staticmethod(lambda: None)
     crm_user_id: Optional[int] = None
     crm_user_name: str = ""
+    tls_offered: bool = False      # a certificate is configured (FTPS can be used)
+    plain_networks = None          # Config.plain_networks: where plain FTP may log in from (None: anywhere)
+    plain_download: bool = True    # Config.plain_download: RETR without TLS
 
     def _relative(self, path: str) -> str:
         home = self.authorizer.home_of(self.crm_user_id)
@@ -135,8 +143,32 @@ class RecorderSession:
     def _secured(self) -> bool:
         return bool(getattr(self, "_ssl_established", False))
 
+    def _data_secured(self) -> bool:
+        # TLS on the control connection and PROT P: the data connection is encrypted too
+        return self._secured() and bool(getattr(self, "_prot", False))
+
     def on_login(self, username):
-        log.info("login user=%s name=%s ip=%s%s", self.crm_user_id, shown(self.crm_user_name), self.remote_ip, " tls" if self._secured() else "")
+        how = " tls" if self._secured() else (" plain" if self.tls_offered else "")
+        log.info("login user=%s name=%s ip=%s%s", self.crm_user_id, shown(self.crm_user_name), self.remote_ip, how)
+
+    def ftp_USER(self, line):
+        # plain FTP from a network that is not trusted: refused before the password (the token) is sent in clear
+        if not self._secured() and not address_in(self.plain_networks, self.remote_ip):
+            if self.tls_offered:
+                msg = "Plain FTP is not allowed from this network: use FTPS (explicit TLS, AUTH TLS)."
+            else:
+                msg = "FTP is not allowed from this network."
+            self.respond("550 " + msg)
+            log.warning("login refused ip=%s: plain FTP from outside FTP_PLAIN_NETWORKS", self.remote_ip)
+            return
+        return super().ftp_USER(line)
+
+    def ftp_RETR(self, file):
+        # FTP_PLAIN_DOWNLOAD=0: a token read off the network uploads at most, the recordings are not read back
+        if not self.plain_download and not self._data_secured():
+            self.respond("550 Downloads need FTPS (AUTH TLS and PROT P).")
+            return None
+        return super().ftp_RETR(file)
 
     def on_login_failed(self, username, password):
         # neither the user name nor the password goes to the log: people paste the token into either field
@@ -204,11 +236,16 @@ def make_handler(config: Config, authorizer: TokenAuthorizer, state: State, kick
     base = FTPHandler
     settings = {}
     if config.tls_cert:
-        # explicit FTPS: offered (AUTH TLS), never required - the phones' sync apps often speak plain FTP only
+        # explicit FTPS: offered (AUTH TLS); required only with FTP_TLS_REQUIRED - the phones' sync apps
+        # often speak plain FTP only (FTP_PLAIN_NETWORKS / FTP_PLAIN_DOWNLOAD narrow what they may do)
         from pyftpdlib.handlers import TLS_FTPHandler
         base = TLS_FTPHandler
-        settings.update(certfile=config.tls_cert, keyfile=config.tls_key, tls_control_required=False, tls_data_required=False, ssl_context=None)
+        required = bool(config.tls_required)
+        settings.update(certfile=config.tls_cert, keyfile=config.tls_key, tls_control_required=required, tls_data_required=required, ssl_context=None)
     settings.update(
+        tls_offered=bool(config.tls_cert),
+        plain_networks=config.plain_networks,
+        plain_download=config.plain_download,
         authorizer=authorizer,
         state=state,
         kick=staticmethod(kick),

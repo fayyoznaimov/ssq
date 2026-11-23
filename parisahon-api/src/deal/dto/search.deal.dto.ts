@@ -1,12 +1,15 @@
 import { PaginationRequestDto } from '../../helper/dto/pagination.dto';
 import {
+  ArrayMaxSize,
   IsArray,
   IsDateString,
   IsEnum,
   IsInt,
   IsNumberString,
   IsOptional,
+  IsString,
   Length,
+  Max,
   Min,
   ValidateNested,
 } from 'class-validator';
@@ -209,10 +212,31 @@ export class SearchCompanyDto {
   fillers: FillerDto[];
 }
 
+/** stages=5 is the same as stages[]=5 */
+const toNumberList = ({ value }) =>
+  value === undefined || value === null ? value : (Array.isArray(value) ? value : [value]).map(Number);
+
 export class SearchDealDto extends PaginationRequestDto {
   @IsOptional()
   @Length(1, 255)
   label: string;
+
+  /**
+   * The search box of the deals page: the number of the deal (125, #125), its name, the name,
+   * e-mail and phone (by digits: "90 123-45-67") of a client, the company of the deal or of a client.
+   */
+  @IsOptional()
+  @IsString()
+  @Length(1, 255)
+  q: string;
+
+  /** Only these deals (the kanban re-reads the deals a live update named) */
+  @IsOptional()
+  @Transform(toNumberList)
+  @IsArray()
+  @ArrayMaxSize(200)
+  @IsInt({ each: true })
+  ids: number[];
 
   /**
    * Query string values are strings, so the value is converted to a number
@@ -242,7 +266,7 @@ export class SearchDealDto extends PaginationRequestDto {
 
   @IsOptional()
   // stages=5 is the same as stages[]=5
-  @Transform(({ value }) => (value === undefined || value === null ? value : (Array.isArray(value) ? value : [value]).map(Number)))
+  @Transform(toNumberList)
   @IsArray()
   @IsInt({ each: true })
   stages: number[];
@@ -284,4 +308,33 @@ export class SearchDealDto extends PaginationRequestDto {
   @ValidateNested()
   @Type(() => SearchCompanyDto)
   company: SearchCompanyDto;
+}
+
+/**
+ * GET /deals/board: the kanban, column by column. The filters of GET /deals apply;
+ * limit / skip / sort do not (a column is ordered newest first).
+ */
+export class SearchDealBoardDto extends SearchDealDto {
+  /** Cards of every column; 0 = the totals of the columns only */
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(200)
+  per_stage: number = 50;
+
+  /** «Показать ещё» of a column (with stages=<its id>): the cards older than this deal */
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  before_id: number;
+
+  /** The closing columns show the deals closed in the last N days; 0 = all of them */
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(36500)
+  closed_days: number = 30;
 }

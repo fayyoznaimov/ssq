@@ -1,8 +1,10 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Post,
+  Query,
   Req,
   UploadedFiles,
 } from '@nestjs/common';
@@ -17,12 +19,13 @@ import { UploadFiles } from '../file/upload-files.decorator';
 /**
  * Telegram of the managers (their own accounts, through parisahon-telegram-service).
  * Every route needs a CRM login (global guard); who may do what is decided
- * in TelegramService: a manager connects and writes only from their own account.
+ * in TelegramService: a manager connects, disconnects and writes only from their own account.
  */
 @Controller('telegram')
 export class TelegramController {
   constructor(private telegramService: TelegramService) {}
 
+  // the connected accounts, each with `telegram`: the state of its session (works / error / ended in Telegram)
   @Get('/active-sessions')
   async fetchSessions(): Promise<Record<string, any>> {
     return instanceToPlain(await this.telegramService.fetchActiveSessions());
@@ -53,5 +56,11 @@ export class TelegramController {
     @Body() data: StartSessionDto,
   ): Promise<Record<string, any>> {
     return this.telegramService.activateAuth(request, data);
+  }
+
+  // «Отключить»: own account; an admin: anyone's (also of a deleted user)
+  @Delete('/session')
+  async disconnect(@Req() request: Request, @Query('user_id') userId?: string): Promise<Record<string, any>> {
+    return this.telegramService.disconnect(request, Number(userId) || undefined);
   }
 }

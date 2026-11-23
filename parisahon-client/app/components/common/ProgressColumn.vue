@@ -3,9 +3,13 @@
         <div>
             <div class="flex flex-col items-center justify-center pt-2 pb-1.5">
                 <h2 class="uppercase text-xs font-semibold">{{ props.stageName }}</h2>
+                <!-- the totals of the whole column (the server counts them), not of the cards loaded -->
                 <span class="text-sm text-muted-700 dark:text-muted-400">
-                    {{ arr?.length || 0 }} сделок: 
-                    <Money :value="stageDealsBudget" />
+                    {{ count }} сделок:
+                    <Money :value="columnBudget" />
+                </span>
+                <span v-if="props.closedSince" class="text-xs text-muted-500 dark:text-muted-400">
+                    закрытые с {{ moment(props.closedSince).format('DD.MM.YYYY') }}
                 </span>
             </div>
             <hr class="border-2" :style="{borderColor: props.stage.color }">
@@ -30,6 +34,12 @@
                 <CardDeal :item="element" />
             </template>
         </Draggable>
+        <div v-if="count > arr.length" class="board-more flex flex-col items-center gap-1">
+            <span class="text-xs text-muted-600 dark:text-muted-400">Показано {{ arr.length }} из {{ count }}</span>
+            <BaseButton size="sm" :loading="props.loadingMore" :disabled="props.loadingMore" @click="emits('load-more')">
+                Показать ещё
+            </BaseButton>
+        </div>
     </div>
 </template>
 
@@ -39,6 +49,7 @@ const dragOptions = {
     ghostClass: 'ghost',
 };
 
+import moment from 'moment';
 import Draggable from 'vuedraggable';
 
 import AddDealCard from '~/components/common/AddDealCard.vue';
@@ -51,9 +62,24 @@ import type { Stage } from '~/types/stage';
 import { promiseResult } from '~/utils/result';
 
 const { runAsync: patchAsync } = useAsync();
-const props = withDefaults(defineProps<{ columnData: [], isCreateDeal: boolean, stage: any, stageName: string}>(),
+const props = withDefaults(defineProps<{
+    columnData: any[],
+    isCreateDeal: boolean,
+    stage: any,
+    stageName: string,
+    // the number of deals and their budget in the whole column (GET /deals/board)
+    total?: number,
+    budget?: number,
+    loadingMore?: boolean,
+    // a closing column shows the deals closed since then
+    closedSince?: string | null,
+}>(),
     {
         columnData: () => ([]),
+        total: undefined,
+        budget: undefined,
+        loadingMore: false,
+        closedSince: null,
     });
 
 const dragging = defineModel('dragging');
@@ -61,6 +87,7 @@ const emits = defineEmits<{
     (e: 'stage:changed', {id, stage}: {id: number, stage: Stage}): void;
     (e: 'stage:patched', {id, stage}: {id: number, stage: Stage}): void;
     (e: 'deal:created', value: Deal): void;
+    (e: 'load-more'): void;
 }>();
 
 const arr = computed(() => props.columnData);
@@ -70,9 +97,14 @@ const dealsService = useService('deals', { auth: true });
 async function changeStage(event: Record<string, any>) {
     if (event.added) {
         const id = event.added.element.id;
+        // the card still has the stage it came from: it goes back there when the server refuses
+        const from = event.added.element.stage as Stage | null;
         emits('stage:changed', { id, stage: props.stage });
         const result = await promiseResult(patchAsync(dealsService.patch(`${id}/stage`, { stage_id: props.stage.id }).exec()));
-        if (!result.ok) return toast.show({message: result.error.message, timeout: 3000, type: 'error'});
+        if (!result.ok) {
+            if (from?.id) emits('stage:changed', { id, stage: from });
+            return toast.show({message: result.error.message, timeout: 3000, type: 'error'});
+        }
         emits('stage:patched', { id, stage: props.stage });
     }
 }
@@ -80,6 +112,9 @@ async function changeStage(event: Record<string, any>) {
 const stageDealsBudget = computed(() => {
     return arr.value?.reduce((acc, deal) => acc + +deal.budget, 0);
 });
+
+const count = computed(() => props.total ?? arr.value?.length ?? 0);
+const columnBudget = computed(() => props.budget ?? stageDealsBudget.value);
 
 </script>
 

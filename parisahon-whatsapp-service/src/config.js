@@ -21,6 +21,10 @@ export function loadConfig(env = process.env) {
     pollSec: positive(env.POLL_SEC, 10),
     maxBackoffSec: positive(env.MAX_BACKOFF_SEC, 300),
     startWaitMs: positive(env.START_WAIT_SEC, 10) * 1000,
+    // POST /send answers 504 {pending} after this; the CRM API waits 120 s, so keep it below that
+    sendWaitMs: positive(env.SEND_WAIT_SEC, 90) * 1000,
+    // on SIGTERM the messages in hand are handled for at most this long (docker stop waits 10 s by default)
+    drainMs: positive(env.DRAIN_SEC, 8) * 1000,
     qrTimeoutMs: positive(env.QR_TIMEOUT_SEC, 180) * 1000,
     logLevel: env.LOG_LEVEL || 'info',
     baileysLogLevel: env.BAILEYS_LOG_LEVEL || 'warn',

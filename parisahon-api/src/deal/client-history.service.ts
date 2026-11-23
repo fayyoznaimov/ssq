@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
+import { Access } from '../auth/access';
 import { Deal } from './deal.entity';
 
 /** Deals of the same client: any of the deal's contacts, or its company (also through the contacts' company). */
@@ -46,7 +47,8 @@ export class ClientHistoryService {
     };
   }
 
-  async forDeal(id: number) {
+  /** `access`: only the deals the user may see (DEAL-15: the deals of colleagues with the same client showed). */
+  async forDeal(id: number, access?: Access) {
     const deal = await this.deals.findOne({
       where: { id },
       relations: { ctr_agents: { company: true }, company: true, repeat_of: true },
@@ -65,6 +67,7 @@ export class ClientHistoryService {
     }));
     const company = deal.company ?? deal.ctr_agents?.find((c) => c.company)?.company ?? null;
     const contactIds = contacts.map((c) => c.id);
+    const scope = ClientHistoryService.scope(access);
 
     const others = contactIds.length || company
       ? await this.deals
@@ -75,6 +78,7 @@ export class ClientHistoryService {
           .where('d.id <> :id', { id })
           .andWhere('d.deleted_at IS NULL')
           .andWhere(CLIENT_DEALS_SQL, { company_id: company?.id ?? 0, contact_ids: contactIds.length ? contactIds : [0] })
+          .andWhere(scope.sql, scope.params)
           .orderBy('d.created_at', 'DESC')
           .addOrderBy('d.id', 'DESC')
           .take(50)
@@ -103,17 +107,23 @@ export class ClientHistoryService {
     };
   }
 
-  /** GET /companies/:id/deals — every deal of a company (own and its contacts'), newest first. */
-  async forCompany(companyId: number) {
-    return this.list(COMPANY_DEALS_SQL, { company_id: companyId });
+  /** GET /companies/:id/deals — every deal of a company (own and its contacts') the user may see, newest first. */
+  async forCompany(companyId: number, access?: Access) {
+    return this.list(COMPANY_DEALS_SQL, { company_id: companyId }, access);
   }
 
-  /** GET /users/:id/deals — every deal a contact is linked to, newest first. */
-  async forContact(contactId: number) {
-    return this.list(CONTACT_DEALS_SQL, { contact_id: contactId });
+  /** GET /users/:id/deals — every deal a contact is linked to that the user may see, newest first. */
+  async forContact(contactId: number, access?: Access) {
+    return this.list(CONTACT_DEALS_SQL, { contact_id: contactId }, access);
   }
 
-  private async list(condition: string, params: Record<string, any>) {
+  /** The deals (alias d) the user may see; no `access`: all of them. */
+  private static scope(access?: Access): { sql: string; params: Record<string, any> } {
+    return access ? access.dealSql('d', 'view') : { sql: 'TRUE', params: {} };
+  }
+
+  private async list(condition: string, params: Record<string, any>, access?: Access) {
+    const scope = ClientHistoryService.scope(access);
     const list = await this.deals
       .createQueryBuilder('d')
       .leftJoinAndSelect('d.stage', 'stage')
@@ -121,6 +131,7 @@ export class ClientHistoryService {
       .leftJoinAndSelect('d.ctr_agents', 'contact')
       .where('d.deleted_at IS NULL')
       .andWhere(condition, params)
+      .andWhere(scope.sql, scope.params)
       .orderBy('d.created_at', 'DESC')
       .addOrderBy('d.id', 'DESC')
       .take(500)

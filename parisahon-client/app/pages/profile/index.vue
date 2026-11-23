@@ -5,15 +5,26 @@
             <h2 class="text-sm text-gray-500">Настройки профиля</h2>
         </div>
         <div>
-            <form class="flex flex-col gap-4">
+            <!-- own name and phone (PATCH /users/me): the phone is needed to connect Telegram and goes into
+                 the e-mail signature; role, group and e-mail stay with the administrator -->
+            <form class="flex flex-col gap-4" @submit.prevent="saveProfile">
                 <div class="grid grid-cols-2 gap-4">
                     <BaseInput
-                        v-model.trim="user.username"
-                        label="Логин"
-                        placeholder="Логин"
-                        :error="errors.username"
+                        v-model="profile.username"
+                        label="Имя"
+                        name="username"
+                        placeholder="пр.: Андрей"
+                        :error="profile.errors.username"
                         icon="ph:user"
-                        readonly
+                    />
+                    <BaseInput
+                        v-model="profile.phone"
+                        label="Телефон"
+                        name="phone"
+                        placeholder="пр.: +998901200000"
+                        :error="profile.errors.phone"
+                        type="text"
+                        icon="ph:phone"
                     />
                     <BaseInput
                         v-model="user.email"
@@ -50,6 +61,11 @@
                         <option v-if="!groups.length">Нет компаний</option>
                     </BaseSelect>
                 </div>
+                <div class="flex items-center gap-3">
+                    <BaseButton color="primary" type="submit" :loading="profile.busy" :disabled="!profileChanged">Сохранить</BaseButton>
+                    <span v-if="profile.done" class="text-sm text-green-600">Сохранено.</span>
+                    <span v-else-if="profile.error" class="text-sm text-red-500">{{ profile.error }}</span>
+                </div>
             </form>
         </div>
         <BaseCard class="p-6 flex flex-col gap-3 max-w-2xl">
@@ -72,7 +88,7 @@
                     name="new_password"
                     type="password"
                     autocomplete="new-password"
-                    placeholder="не меньше 8 символов"
+                    placeholder="не меньше 10 символов"
                     :error="password.errors.new"
                 />
                 <BaseInput
@@ -85,10 +101,17 @@
                 />
                 <div class="sm:col-span-3 flex items-center gap-3">
                     <BaseButton color="primary" type="submit" :loading="password.busy">Сменить пароль</BaseButton>
-                    <span v-if="password.done" class="text-sm text-green-600">Пароль изменён.</span>
+                    <span v-if="password.done" class="text-sm text-green-600">Пароль изменён. На других устройствах нужно войти заново, Telegram-бот CRM отключён.</span>
                     <span v-else-if="password.error" class="text-sm text-red-500">{{ password.error }}</span>
                 </div>
             </form>
+            <!-- lost phone, a computer left signed in: POST /auth/logout ends every session and unlinks the CRM bot -->
+            <div class="flex flex-wrap items-center gap-3 border-t border-muted-200 dark:border-muted-700 pt-3">
+                <NuxtLink :to="{path: '/logout', query: {everywhere: '1'}}">
+                    <BaseButton type="button">Выйти на всех устройствах</BaseButton>
+                </NuxtLink>
+                <span class="text-sm text-gray-500">Завершает все сеансы, этот тоже, и отключает Telegram-бота CRM.</span>
+            </div>
         </BaseCard>
         <BaseCard class="p-6 flex flex-col gap-3 max-w-2xl">
             <div class="flex items-center gap-2">
@@ -151,6 +174,39 @@ const errors = ref({username: '', email: '', password: '', role: ''});
 
 // PATCH /users/me/password (old + new password), available to every staff user
 const usersService = useService('users', {auth: true});
+
+// PATCH /users/me: own name and phone (only an admin could change them before)
+const profile = reactive({username: '', phone: '', busy: false, done: false, error: '', errors: {username: '', phone: ''}});
+watch(() => [user.value?.username, user.value?.phone], () => {
+    profile.username = user.value?.username ?? '';
+    profile.phone = user.value?.phone ?? '';
+}, {immediate: true});
+const profileChanged = computed(() => profile.username.trim() !== (user.value?.username ?? '')
+    || profile.phone.trim() !== (user.value?.phone ?? ''));
+
+async function saveProfile() {
+    profile.done = false;
+    profile.error = '';
+    profile.errors = {username: '', phone: ''};
+    const username = profile.username.trim();
+    const phone = profile.phone.trim();
+    if (username.length < 2) profile.errors.username = 'Не короче 2 символов';
+    // as the API: digits with spaces, brackets, dashes and «+», 5 to 15 digits
+    if (phone && !/^\+?(?:[\s\-().]*\d){5,15}[\s\-().]*$/.test(phone)) profile.errors.phone = 'Неверный номер: пр. +998901200000';
+    if (profile.errors.username || profile.errors.phone) return;
+
+    profile.busy = true;
+    try {
+        const answer = await usersService.patch<{ username: string; phone: string | null }>('me', {username, phone}).exec();
+        // the API stores the phone in one format (+998901234567)
+        user.value = {...user.value, username: answer.username, phone: answer.phone ?? ''} as User;
+        profile.done = true;
+    } catch (e) {
+        profile.error = botError(e);
+    } finally {
+        profile.busy = false;
+    }
+}
 const password = reactive({old: '', new: '', repeat: '', busy: false, done: false, error: '', errors: {old: '', new: '', repeat: ''}});
 
 async function changePassword() {
@@ -169,6 +225,8 @@ async function changePassword() {
         if (answer?.access_token) localStorage.setItem('token', answer.access_token);
         password.old = password.new = password.repeat = '';
         password.done = true;
+        // the new password has unlinked the CRM bot (src/auth/sign-out.ts in the API)
+        loadBot();
     } catch (e) {
         password.error = botError(e);
     } finally {

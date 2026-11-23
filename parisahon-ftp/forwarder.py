@@ -2,7 +2,8 @@
 
 The files stay where the phone put them (a sync app compares its folder with the listing here and
 would upload a missing file again); what was done with them is in the sqlite state. Old files are
-removed after FTP_RETAIN_DAYS.
+removed after FTP_RETAIN_DAYS, except audio that is not in the CRM: waiting to be sent, or refused
+by the API (it is the only copy of that call; the admin decides, see README).
 """
 import hashlib
 import logging
@@ -233,7 +234,8 @@ class Forwarder:
             self._accepted = True
             self._refused.pop(user_id, None)
             self.state.mark_rejected(user_id, sha, rel, size, result.error)
-            log.warning("rejected user=%s file=%s size=%s status=%s reason=%s (will not be sent again)", user_id, shown(rel), size, result.status, shown(result.error))
+            log.error("rejected user=%s file=%s size=%s status=%s reason=%s (will not be sent again; the file stays in the folder: this call is not in the CRM)",
+                      user_id, shown(rel), size, result.status, shown(result.error))
             return False
         if result.kind == "auth":
             # 401 / 403. The files of this manager wait; the other managers go on (if it is the token, they get the same answer)
@@ -279,7 +281,8 @@ class Forwarder:
     def prune(self) -> int:
         """Removes files that have been here longer than FTP_RETAIN_DAYS (counted from when they
         arrived or last changed here, not from the recording's own date), except audio that is
-        still waiting to be sent. Also forgets what is no longer on the disk. Returns the number removed."""
+        still waiting to be sent or that the API refused (the call is not in the CRM: this file is
+        all there is of it). Also forgets what is no longer on the disk. Returns the number removed."""
         for path in self.state.receiving_paths():
             if not os.path.lexists(path):
                 self.state.receiving_done(path)
@@ -301,8 +304,8 @@ class Forwarder:
                 if wanted(os.path.basename(rel)) and info.st_size > 0 and not self.state.is_receiving(full):
                     sha = self.state.seen_sha(user_id, rel, info.st_size, info.st_mtime_ns)
                     row = self.state.upload(user_id, sha) if sha else None
-                    if row is None or row["status"] not in ("sent", "rejected"):
-                        continue  # not sent yet: keep it whatever its age
+                    if row is None or row["status"] != "sent":
+                        continue  # not sent yet, or refused by the API: keep it whatever its age
                 try:
                     os.remove(full)
                 except OSError as error:

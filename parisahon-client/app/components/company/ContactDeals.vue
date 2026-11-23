@@ -3,6 +3,10 @@
         <template v-if="loading && !deals.length">
             <BasePlaceload v-for="n in 3" :key="n" class="h-12 w-full rounded-md" />
         </template>
+        <!-- no right to the contact's deals: say so, not «сделок нет» -->
+        <p v-else-if="denied" class="text-sm text-muted-500 dark:text-muted-400">
+            Нет доступа к сделкам этого контакта.
+        </p>
         <template v-else>
             <p v-if="deals.length" class="text-xs text-muted-500 dark:text-muted-400">
                 {{ deals.length }} {{ russianDecline(deals.length, 'сделка', 'сделки', 'сделок') }}<template v-if="openCount">, в работе {{ openCount }}</template><template v-if="wonCount">, успешных {{ wonCount }} на сумму <Money :value="wonBudget" class="font-medium text-muted-700 dark:text-muted-200" /></template>
@@ -24,6 +28,7 @@ const props = defineProps<{ contactId?: number | string }>();
 const usersService = useService('users', { auth: true });
 const deals = ref<MiniDeal[]>([]);
 const loading = ref(false);
+const denied = ref(false);
 
 const openCount = computed(() => deals.value.filter((d) => !d.closed_at).length);
 // successful orders only (the API marks them: closed in the successful stage)
@@ -35,6 +40,8 @@ async function load() {
     loading.value = true;
     const result = await promiseResult(usersService.get(`${props.contactId}/deals`).exec());
     loading.value = false;
+    const status = !result.ok ? (result.error as any)?.statusCode : null;
+    denied.value = status === 403 || status === 404;
     if (result.ok) deals.value = result.value as MiniDeal[];
 }
 

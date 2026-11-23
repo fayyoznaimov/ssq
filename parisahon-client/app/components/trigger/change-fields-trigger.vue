@@ -18,14 +18,18 @@ const filler = ref<Filler>();
 watch(filler, () => {
     if (!filler.value) return;
 
+    const chosen = filler.value;
     props.trigger.change_fields_data.fields.push({
-        field: filler.value?.field!,
+        field: chosen.field,
         is_filler: true,
         value: '',
-        label: filler.value?.field!,
+        label: chosen.field,
+        // kept by id too: renaming the field does not break the trigger
+        filler_id: chosen.id,
     });
 
-    fillers.value = fillers.value.map((f) => ({...f, hidden: true}));
+    // the chosen field is not offered twice; the others stay
+    fillers.value = fillers.value.map((f) => f.id === chosen.id ? ({...f, hidden: true}) : f);
     filler.value = undefined;
 });
 

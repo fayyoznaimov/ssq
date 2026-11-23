@@ -17,7 +17,7 @@
                     <MainTab 
                         v-if="activeValue === 'main'" :deal="deal" :stages="stages" :stages-loading="stagesLoading" :fillers="fillers" 
                         @created="onDealCreated" 
-                        @updated="() => router.push('/deals')"
+                        @updated="onDealUpdated"
                         :user="user" 
                         :users="users.data"
                     />
@@ -173,6 +173,13 @@
                     />
                     <EventSchedulerSingle v-if="messageType.id === 'task'" :agent="user" v-model="task" size="md" :initial-date="task.start" />
                 </form>
+                <!-- from which Telegram / WhatsApp it goes and whether it works; «Не клиент» for the chosen contact -->
+                <MessengerComposerStatus
+                    v-if="messageType.id === 'tg' || messageType.id === 'wa'"
+                    :channel="messageType.id"
+                    :contact="messageTarget"
+                    :deal="deal"
+                />
                 <EmailReplyForm 
                     v-if="messageType.id === 'email'" 
                     :reply-options="replyEmails"
@@ -189,8 +196,8 @@
                     name="content"
                     ref="commentRef"
                     v-model="content"
-                    required
-                    minlength="3"
+                    :required="!isClientMessenger"
+                    :minlength="isClientMessenger ? undefined : 3"
                     form="compose-form"
                 >
                     <template #addon>
@@ -233,6 +240,7 @@ import type { Stage } from '~/types/stage';
 import { UserRole, type Company, type Group, type User } from '~/types/user';
 import { promiseResult } from '~/utils/result';
 
+import MessengerComposerStatus from '~/components/whatsapp/MessengerComposerStatus.vue';
 import ClientBlock from './ClientBlock.vue';
 import FilesTab from './files-tab.vue';
 import MainTab from './main-tab.vue';
@@ -605,7 +613,7 @@ async function onDealCreated(deal: Deal) {
             const data = event.after_state.data;
             return taskService.create({
                 label: data.label,
-                type_id: data.type.id,
+                type_id: data.type?.id,
                 assign_to: {
                     target: data.agent ? 'agent' : 'group',
                     id: data.agent?.id || data.group?.id,
@@ -768,11 +776,13 @@ async function onEvent(e: Event) {
         case 'task': {
             onTask(formData);
         } break;
-        case 'tg': {
-            onTgMessage(formData);
-        } break;
+        case 'tg':
         case 'wa': {
-            onWaMessage(formData);
+            // the form is cleared only when the messenger took the message: on a failure the text and
+            // the files stay for another try (the same request_id: never sent twice)
+            const sent = await (type === 'tg' ? onTgMessage(formData) : onWaMessage(formData));
+            if (!sent) return;
+            messengerRequestId = '';
         } break;
         default:
             break;
@@ -797,30 +807,64 @@ async function onEvent(e: Event) {
     }
 }
 
-async function onTgMessage(formData: FormData) {
-    const content = formData.get('content');
-    if (!content) return;
+// one id per typed message (kept until it is sent): a repeated click or a retry is not sent twice
+let messengerRequestId = '';
+const isClientMessenger = computed(() => messageType.value?.id === 'tg' || messageType.value?.id === 'wa');
+
+function messengerRequest(cleanFormData: FormData) {
+    if (!messengerRequestId) messengerRequestId = Date.now().toString(36) + Math.random().toString(36).slice(2, 12);
+    cleanFormData.append('request_id', messengerRequestId);
+    // recorded in this deal (not in another open deal of the client)
+    const dealId = deal.value?.id ?? route.params.id;
+    if (dealId) cleanFormData.append('deal_id', String(dealId));
+}
+
+/** The answer of /telegram|whatsapp/send-message: true = done (sent, or still being sent and recorded later). */
+function messengerAnswer(result: { ok: boolean; value?: any; error?: any }, removeOptimistic: () => void): boolean {
+    if (result.ok) {
+        if (result.value?.pending) toast.show({message: result.value.message, timeout: 8000, type: 'success'});
+        return true;
+    }
+    const data = result.error?.data ?? {};
+    const partly = Number(data.sent) > 0 || (Array.isArray(data.message_ids) && data.message_ids.length > 0);
+    toast.show({message: data.message || result.error?.message || 'Сообщение не отправлено', timeout: 8000, type: 'error'});
+    removeOptimistic();
+    // a part went out and is in the history: the form is cleared so that it is not sent twice
+    if (partly) {
+        fetchEvents();
+        return true;
+    }
+    return false;
+}
+
+async function onTgMessage(formData: FormData): Promise<boolean> {
+    const content = formData.get('content') as string | null;
+    const fileList = formData.getAll('files').filter((f) => f instanceof File && f.size > 0);
+    if (!content?.trim() && !fileList.length) return false;
+    if (!messageTarget.value?.id) {
+        toast.show({message: 'Выберите контакт клиента', timeout: 4000, type: 'error'});
+        return false;
+    }
     const cleanFormData = new FormData();
-    cleanFormData.append('message', content);
-    const fileList = formData.getAll('files');
+    cleanFormData.append('message', content || '');
     const dealFiles = fileListToDealFiles(fileList, cleanFormData);
     const event = TgMessageEvent({
         user: user.value,
-        message: content as string,
+        message: content || '',
         files: dealFiles,
         formData: cleanFormData,
         target_user: messageTarget.value as User
     });
     const latest = events.value.pages.length - 1;
     events.value.pages[latest].data.unshift(event);
-    cleanFormData.append('to_user', String(messageTarget.value?.id));
+    cleanFormData.append('to_user', String(messageTarget.value.id));
     cleanFormData.append('from_user', String(user.value.id));
+    messengerRequest(cleanFormData);
     const result = await promiseResult(runEventAsync(telegramService.post('/send-message', cleanFormData).exec()));
-    if (!result.ok) {
-        toast.show({message: result.error.message, timeout: 3000, type: 'error'});
-        // remove optimistic event if there is a failure
+    // remove the optimistic event if there is a failure
+    return messengerAnswer(result, () => {
         events.value.pages[latest].data = events.value.pages[latest].data.filter((item) => item.id !== event.id);
-    }
+    });
 }
 
 // Telegram / WhatsApp from a deal: only to this deal's contacts, the first one chosen by itself
@@ -841,13 +885,13 @@ watch([messageType, tgContacts, waContacts], () => {
     if (!list.some((c) => c.id === (messageTarget.value as any)?.id)) messageTarget.value = list[0];
 });
 
-async function onWaMessage(formData: FormData) {
-    const content = formData.get('content');
+async function onWaMessage(formData: FormData): Promise<boolean> {
+    const content = formData.get('content') as string | null;
     const fileList = formData.getAll('files').filter((f) => f instanceof File && f.size > 0);
-    if (!content && !fileList.length) return;
+    if (!content?.trim() && !fileList.length) return false;
     if (!messageTarget.value?.id) {
-        toast.show({message: 'Выберите контакт клиента', timeout: 3000, type: 'error'});
-        return;
+        toast.show({message: 'Выберите контакт клиента', timeout: 4000, type: 'error'});
+        return false;
     }
     const cleanFormData = new FormData();
     cleanFormData.append('message', (content as string) || '');
@@ -862,11 +906,11 @@ async function onWaMessage(formData: FormData) {
     const latest = events.value.pages.length - 1;
     events.value.pages[latest].data.unshift(event);
     cleanFormData.append('to_user', String(messageTarget.value.id));
+    messengerRequest(cleanFormData);
     const result = await promiseResult(runEventAsync(whatsappService.post('/send-message', cleanFormData).exec()));
-    if (!result.ok) {
-        toast.show({message: result.error.message, timeout: 4000, type: 'error'});
+    return messengerAnswer(result, () => {
         events.value.pages[latest].data = events.value.pages[latest].data.filter((item) => item.id !== event.id);
-    }
+    });
 }
 
 async function onTask(formData: FormData) {
@@ -1014,14 +1058,25 @@ watchEffect(() => {
 
 provide('commentScrollRef', commentScrollRef);
 
+function loadDeal() {
+    return runDeal(dealService.get(route.params.id as string).exec(), (deal) => {
+        if (!deal.company) deal.company = {} as Company;
+        serverStageId = deal.stage?.id;
+        if (!deal.agent && user.value.role !== 'admin') deal.agent = Object.assign(user.value, {user_fillers: []})
+        return deal;
+    });
+}
+
+// Saved: the card stays open (it used to throw the manager out to the list) and shows the deal
+// as the server has it now (the new values of the fields got their ids)
+async function onDealUpdated() {
+    toast.show({message: 'Сделка сохранена', timeout: 2500, type: 'success'});
+    await loadDeal();
+}
+
 onMounted(() => {
     if (route.params.id) {
-        runDeal(dealService.get(route.params.id as string).exec(), (deal) => {
-            if (!deal.company) deal.company = {} as Company;
-            serverStageId = deal.stage?.id;
-            if (!deal.agent && user.value.role !== 'admin') deal.agent = Object.assign(user.value, {user_fillers: []})
-            return deal;
-        });
+        loadDeal();
         fetchTasks();
     }
     runStages(stageService.find().exec());

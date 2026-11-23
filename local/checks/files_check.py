@@ -16,7 +16,9 @@ Regression checks for the files module: upload to a deal -> list -> download -> 
 * Prints PASS/FAIL per check, exits 1 if anything failed.
 
 Covered: upload limits (size, count, file names, page-like files), the list with its filters,
-pagination and rights (admin / agent / agent without the "files" switch / no login), download
+pagination and rights (admin / agent / agent without the "files" switch / no login; an agent with
+"own deals" sees the files of their deals and their own uploads, e-mail attachments only with the
+mail switch and of their own address), download
 (no login, no path traversal), deleting from a deal (the row and the file on disk go only when
 nothing else refers to the file: another deal, a deal in the trash, an e-mail, a Telegram
 message), the file in the comment history, no files left on disk by failed requests.
@@ -531,6 +533,68 @@ def main():
     s, b = http("GET", "/deals/%d/files" % deal1, token=agent_nofiles["token"])
     check("... the files tab of a deal still works for them -> 200", s == 200, s)
 
+    # CALL-4 / ACL-3: the list follows the deal rights and the mail switch, like the deal pages
+    def scoped_agent(suffix, mail):
+        person = {"email": "audit-files-%s-%s@example.test" % (suffix, RUN), "password": secrets.token_urlsafe(12)}
+        perms = dict(permissions, deal=dict(permissions["deal"], view=1, update=1, delete=1), mail=mail, file=True)
+        status, body = http("POST", "/users", {
+            "email": person["email"], "password": person["password"], "username": "%s-%s" % (P, suffix),
+            "role": "agent", "group_id": group_id, "permissions": perms,
+        }, token=admin)
+        if status != 201 or not isinstance(body, dict):
+            raise SystemExit("cannot create the test agent: %s %s" % (status, message_of((status, body))))
+        person["id"] = body["id"]
+        person["token"] = login(person["email"], person["password"])
+        return person
+
+    own = scoped_agent("own", False)
+    own_mail = scoped_agent("own-mail", True)
+    deal_own = int(scalar(
+        "INSERT INTO deal (label, display_id, budget, stage_id, agent_id, created_by) VALUES (%s, %d, 100, %d, %d, %d) RETURNING id"
+        % (q(P + "-deal-own"), 900000000 + secrets.randbelow(90000000), stage_id, own["id"], admin_id)))
+    r, _ = upload(deal_own, [("files", P + "-in-own-deal.txt", b"own deal", "text/plain")])
+    in_own_deal = r[1][0]["id"] if r[0] == 201 else 0
+    # uploaded by the agent into a deal that is not theirs (any more: it was handed over to admin)
+    r, _ = upload(deal1, [("files", P + "-own-upload.txt", b"own upload", "text/plain")])
+    own_upload = r[1][0]["id"] if r[0] == 201 else 0
+    sql("UPDATE file SET uploaded_by = %d WHERE id = %d" % (own["id"], own_upload))
+    mail_id = int(scalar("INSERT INTO email (subject, \"from\") VALUES (%s, %s) RETURNING id" % (q(P + "-scoped-mail"), q("client@example.test"))))
+    own_mail_id = int(scalar("INSERT INTO email (subject, \"from\") VALUES (%s, %s) RETURNING id" % (q(P + "-own-mail"), q(own_mail["email"]))))
+
+    def mail_file(name, email):
+        return int(scalar(
+            "INSERT INTO file (name, path, size, \"from\", extension, email_id) VALUES (%s, %s, 1, 'from_emails', '.txt', %d) RETURNING id"
+            % (q(name), q(secrets.token_hex(32) + ".txt"), email)))
+
+    foreign_attachment = mail_file(P + "-attachment.txt", mail_id)
+    own_attachment = mail_file(P + "-own-attachment.txt", own_mail_id)
+
+    def listed(token):
+        s, b = http("GET", "/files?%s&limit=100" % mine, token=token)
+        return s, {f["id"]: f for f in (b or {}).get("data", [])} if s == 200 else {}
+
+    s, rows = listed(own["token"])
+    check("agent with 'own deals': the files of their deal and their own upload are listed",
+          s == 200 and in_own_deal in rows and own_upload in rows, (s, sorted(rows)))
+    check("... not the files of another manager's deal (deal1 of admin)",
+          s == 200 and note_file.get("id") not in rows and by_agent.get("id") not in rows, sorted(rows))
+    check("... their upload into a deal they may not see does not name that deal",
+          s == 200 and (rows.get(own_upload) or {}).get("deals") == [], rows.get(own_upload))
+    check("... no e-mail attachments without the mail switch",
+          s == 200 and foreign_attachment not in rows and own_attachment not in rows, sorted(rows))
+    check("... the count is the agent's, not of all files",
+          s == 200 and http("GET", "/files?%s&limit=100" % mine, token=own["token"])[1].get("count") == len(rows), len(rows))
+    s, rows = listed(own_mail["token"])
+    check("agent with the mail switch: the attachment of a letter of their own address, not of other letters",
+          s == 200 and own_attachment in rows and foreign_attachment not in rows, (s, sorted(rows)))
+    s, rows = listed(admin)
+    check("admin still sees every file, the attachments too",
+          s == 200 and {in_own_deal, own_upload, foreign_attachment, own_attachment, note_file.get("id")} <= set(rows), sorted(rows))
+    check("... and the deals of a file with their label",
+          s == 200 and [d.get("label") for d in (rows.get(own_upload) or {}).get("deals", [])] == [P + "-deal-1"], rows.get(own_upload))
+    # the two attachment rows have no file on disk: gone before the orphan checks below
+    sql("DELETE FROM file WHERE id IN (%d, %d)" % (foreign_attachment, own_attachment))
+
     section("Files tab (GET /deals/:id/files, /deals/:id/files/:file_id)")
     s, b = http("GET", "/deals/%d/files?limit=100" % deal1, token=admin)
     tab = b.get("data", []) if s == 200 else []
@@ -594,11 +658,22 @@ def main():
           s == 200 and file_row(comment_file or 0) is None and not on_disk(comment_path), s)
     check("... the comment stays, without the file",
           (state.get("data") or {}).get("comment") == P + " comment with a file" and (state.get("data") or {}).get("files") == [], state)
+    # the history is not silently rewritten: the entry says which file was taken off and when (AUDIT-12)
+    removed = (state.get("data") or {}).get("removed_files") or []
+    check("... and says the file was removed (its name and the time)",
+          len(removed) == 1 and removed[0].get("id") == comment_file and removed[0].get("name") == P + "-in-comment.txt"
+          and removed[0].get("removed_at"), removed)
 
     s, _ = http("DELETE", "/deals/%d/files/%d" % (deal1, note_file.get("id", 0)))
     check("no login -> 401", s == 401, s)
+    # the controller looks the file up in the deal first (its name goes into the deal's history,
+    # DEAL-17): a file of another deal is "not in this deal" -> 404, as GET of the same path
+    events_before = count("SELECT count(*) FROM event WHERE deal_id = %d" % deal2)
     s, _ = http("DELETE", "/deals/%d/files/%d" % (deal2, note_file.get("id", 0)), token=admin)
-    check("file of another deal -> 400, nothing changes", s == 400 and links(note_file.get("id", 0)) == [deal1], s)
+    check("file of another deal -> 404, nothing changes, nothing in the other deal's history",
+          s == 404 and links(note_file.get("id", 0)) == [deal1]
+          and count("SELECT count(*) FROM event WHERE deal_id = %d" % deal2) == events_before,
+          (s, links(note_file.get("id", 0))))
     s, _ = http("DELETE", "/deals/%d/files/99999999" % deal1, token=admin)
     check("missing file -> 404", s == 404, s)
 

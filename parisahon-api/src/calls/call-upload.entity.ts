@@ -15,6 +15,8 @@ export enum CallUploadStatus {
   DONE = 'done',
   FAILED = 'failed',
   DISCARDED = 'discarded',
+  // a second copy of a call that is there already (cut off, then whole): only the longer copy is kept
+  DUPLICATE = 'duplicate',
 }
 
 /**

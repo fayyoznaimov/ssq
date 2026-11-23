@@ -8,7 +8,9 @@ import {
   Patch,
   Post,
   Query,
+  Req,
 } from '@nestjs/common';
+import { Request } from 'express';
 import { TriggerService } from './trigger.service';
 import { AssignTriggerDto } from './dto/assign.trigger.dto';
 import { Trigger } from './trigger.entity';
@@ -19,9 +21,10 @@ import { AuthGuard } from '../auth/auth.guard';
 export class TriggerController {
   constructor(private readonly triggerService: TriggerService) {}
 
+  /** The triggers of a stage; admins and managers also get `runs` (failed runs of 7 days, the last error). */
   @Get('triggers')
-  async fetchAll(@Param('id', ParseIntPipe) id: number): Promise<any> {
-    return this.triggerService.fetchAll(id);
+  async fetchAll(@Param('id', ParseIntPipe) id: number, @Req() request: Request): Promise<any> {
+    return this.triggerService.fetchAll(id, request['user']);
   }
 
   @Get('triggers/:trigger_id')
@@ -32,14 +35,15 @@ export class TriggerController {
     return this.triggerService.fetchOne(id, triggerId);
   }
 
-  /** The schedule and the history of a trigger (trigger_run rows), newest first. */
+  /** The schedule and the history of a trigger (trigger_run rows), newest first; only the deals the user may see. */
   @Get('triggers/:trigger_id/runs')
   async fetchRuns(
     @Param('id', ParseIntPipe) id: number,
     @Param('trigger_id', ParseIntPipe) triggerId: number,
+    @Req() request: Request,
     @Query('limit') limit?: string,
   ): Promise<any[]> {
-    return this.triggerService.fetchRuns(id, triggerId, Number(limit) || 100);
+    return this.triggerService.fetchRuns(id, triggerId, Number(limit) || 100, request['user']);
   }
 
   @Roles(AuthGuard.ADMIN_LEVEL)

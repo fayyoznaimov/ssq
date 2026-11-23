@@ -59,6 +59,12 @@ import { type User,UserRole } from "~/types/user";
 
 const route = useRoute();
 
+// admin and manager choose whose recordings to listen to (GET /calls/staff/:id lets them); an agent has their own page
+const currentUser = useState<User>("user");
+if (currentUser.value && currentUser.value.role !== UserRole.Admin && currentUser.value.role !== UserRole.Manager) {
+    navigateTo(`/lists/calls/${currentUser.value.id}`, { replace: true });
+}
+
 const userService = useService("users", { auth: true });
 const sortBy = ref<Record<string, any>>({ id: -1 });
 
@@ -168,10 +174,11 @@ useHead({
     title: "Записи звонков",
 });
 
+// no `subject`: an agent who opens /lists/calls lands on their own recordings (above);
+// the list of the agents is for admin and manager
 definePageMeta({
     authRoute: true,
     layout: "account",
     verbose: "Записи звонков",
-    subject: "Call",
 });
 </script>

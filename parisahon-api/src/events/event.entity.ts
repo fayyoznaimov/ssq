@@ -30,6 +30,12 @@ export enum EventTypes {
   NEW_PRODUCT = 14,
   NEW_DEAL_STAGE = 15,
   NEW_WHATSAPP_MESSAGE = 16,
+  // a task was changed (PATCH /tasks/:id): who changed it, the version before and after;
+  // the NEW_TASK entry of its creation stays as it was written
+  NEW_TASK_UPDATE = 17,
+  // a letter or a message was moved to another deal: the trace in the deal it left
+  // (after_state.data: event_id, type, to_deal)
+  EVENT_MOVED = 18,
 }
 
 export enum FieldsOf {
@@ -48,6 +54,8 @@ export enum FieldsOf {
 @Index('IDX_event_chat_deal', { synchronize: false })
 @Index('IDX_event_chat_unreplied', { synchronize: false })
 @Index('IDX_event_deal_tg_message', { synchronize: false })
+// the history entries of a letter (after_state.data.id of type 9), migration 1795260000000-mail-threads
+@Index('IDX_event_email_id', { synchronize: false })
 @Entity()
 export class Event {
   @PrimaryGeneratedColumn()

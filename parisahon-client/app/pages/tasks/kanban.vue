@@ -13,6 +13,9 @@ const props = withDefaults(defineProps<{
 
 const emits = defineEmits(['fetchTasks']);
 
+// the board shows every open task of the filters, not one page of the list (25)
+const BOARD_QUERY = { skip: 0, limit: 1000 };
+
 type GroupedTasks = {
   overdue: Task[];
   today: Task[];
@@ -29,7 +32,11 @@ const thisWeek = ref<Task[]>([]);
 const nextWeek = ref<Task[]>([]);
 const future = ref<Task[]>([]);
 
-
+/**
+ * A column by day: overdue — the deadline passed; otherwise by the start (a task already started
+ * and not overdue is today's). Weeks are Monday to Sunday; "на будущее" is after next week.
+ * The days are computed once per grouping, nothing is shifted while comparing.
+ */
 watch(() => props.tasks, () => {
     const grouped: GroupedTasks = {
         overdue: [],
@@ -40,43 +47,50 @@ watch(() => props.tasks, () => {
         future: [],
     };
 
+    const now = moment();
+    const todayStart = now.clone().startOf('day');
+    const tomorrowStart = todayStart.clone().add(1, 'day');
+    const nextWeekStart = todayStart.clone().add(1, 'week').startOf('isoWeek');
+    const futureStart = nextWeekStart.clone().add(1, 'week');
+
     for (const task of props.tasks.data) {
-        const endAt = moment(task.end).endOf('day');
-        const startAt = moment(task.start).endOf('day');
-        const now = moment();
-        const next = moment().add(1, 'week').startOf('week');
-        const isOverdue = endAt.isBefore(moment()) && !task.closed_at;
-        const isToday = startAt.isSame(now, 'day');
-        const isTomorrow = startAt.isSame(now.add(1, 'day'), 'day');
-        const isThisWeek = startAt.isSame(now, 'week');
-        const isNextWeek = startAt.isSame(next, 'week');
-        const isFuture = startAt.isSame(moment().add(1, 'month').startOf('month').endOf('day'));
-        if (isOverdue) grouped.overdue.push(task);
-        else if (isToday) grouped.today.push(task);
-        else if (isTomorrow) grouped.tomorrow.push(task);
-        else if (isThisWeek) grouped.thisWeek.push(task);
-        if (isNextWeek) grouped.nextWeek.push(task);
-        if (isFuture) grouped.future.push(task);
+        if (task.closed_at) continue;
+        if (moment(task.end).isBefore(now)) {
+            grouped.overdue.push(task);
+            continue;
+        }
+        const day = moment.max(moment(task.start), now).clone().startOf('day');
+        if (day.isSame(todayStart, 'day')) grouped.today.push(task);
+        else if (day.isSame(tomorrowStart, 'day')) grouped.tomorrow.push(task);
+        else if (day.isBefore(nextWeekStart)) grouped.thisWeek.push(task);
+        else if (day.isBefore(futureStart)) grouped.nextWeek.push(task);
+        else grouped.future.push(task);
     }
 
-    overdue.value = grouped.overdue;
-    today.value = grouped.today;
-    tomorrow.value = grouped.tomorrow;
-    thisWeek.value = grouped.thisWeek;
-    nextWeek.value = grouped.nextWeek;
-    future.value = grouped.future;
-});
+    const byStart = (a: Task, b: Task) => moment(a.start).valueOf() - moment(b.start).valueOf();
+    overdue.value = grouped.overdue.sort((a, b) => moment(a.end).valueOf() - moment(b.end).valueOf());
+    today.value = grouped.today.sort(byStart);
+    tomorrow.value = grouped.tomorrow.sort(byStart);
+    thisWeek.value = grouped.thisWeek.sort(byStart);
+    nextWeek.value = grouped.nextWeek.sort(byStart);
+    future.value = grouped.future.sort(byStart);
+}, { immediate: true });
 
-onMounted(() => {
-    emits('fetchTasks');
-});
+function reload() {
+    emits('fetchTasks', BOARD_QUERY);
+}
+
+onMounted(reload);
 
 </script>
 <template>
     <div>
         <TaskResultModal id="TaskResultModal" @saved="emits('fetchTasks')" />
         <TaskModal @save="emits('fetchTasks')" id="TaskModal" />
-        <ul class="grid grid-cols-4 gap-4">
+        <p v-if="tasks.count > tasks.data.length" class="text-sm text-amber-500 mb-2">
+            Показаны {{ tasks.data.length }} задач из {{ tasks.count }}: сузьте фильтры.
+        </p>
+        <ul class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <li>
                 <TaskColumn 
                     :tasks="overdue" 
@@ -84,6 +98,7 @@ onMounted(() => {
                     divider="border-red-400" 
                     color="text-red-400" 
                     type="overdue"
+                    @moved="reload"
                 />
             </li>
             <li>
@@ -93,21 +108,22 @@ onMounted(() => {
                     divider="border-green-600 dark:border-green-400" 
                     color="text-green-600 dark:text-green-400"
                     type="today"
+                    @moved="reload"
                 />
             </li>
             <li>
-                <TaskColumn :tasks="tomorrow" title="Задачи на завтра" type="tomorrow" />
+                <TaskColumn :tasks="tomorrow" title="Задачи на завтра" type="tomorrow" @moved="reload" />
             </li>
             <li>
                 <ul class="flex flex-col gap-6">
                     <li>
-                        <TaskColumn :tasks="thisWeek" title="Задачи на эту неделю" type="thisWeek" />
+                        <TaskColumn :tasks="thisWeek" title="Задачи на эту неделю" type="thisWeek" @moved="reload" />
                     </li>
                     <li>
-                        <TaskColumn :tasks="nextWeek" title="Задачи на следующую неделю" type="nextWeek" />
+                        <TaskColumn :tasks="nextWeek" title="Задачи на следующую неделю" type="nextWeek" @moved="reload" />
                     </li>
                     <li>
-                        <TaskColumn :tasks="future" title="Задачи на будущее" type="future" />
+                        <TaskColumn :tasks="future" title="Задачи на будущее" type="future" @moved="reload" />
                     </li>
                 </ul>
             </li>

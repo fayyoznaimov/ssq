@@ -3,7 +3,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { DataSource, Not, Repository } from 'typeorm';
+import { DataSource, EntityManager, Not, Repository } from 'typeorm';
 import { DealStage } from './deal_stage.entity';
 import { CreateDealStageDto } from './dto/create.deal.stage.dto';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -61,44 +61,114 @@ export class DealStageService {
       qb = qb.andWhere('t2.is_active = true');
     }
 
-    return qb
+    const stages = await qb
       .orderBy('t0.order', 'ASC', 'NULLS LAST')
       .addOrderBy('t0.id', 'ASC')
       .getMany();
+
+    // the kanban and the settings page tell the closing columns apart (won / lost)
+    for (const stage of stages) {
+      (stage as DealStage & { is_closing?: boolean }).is_closing = this.isClosingStage(stage);
+    }
+
+    return stages;
   }
 
   /**
-   * Stage for deals created without an explicit stage:
-   * the one chosen in settings, otherwise the "unknown" stage of the active
-   * collection.
+   * Stage for deals created without an explicit stage (Telegram, WhatsApp, calls, mail, the bot):
+   * the one chosen in «Настроить воронку» when it belongs to the active collection; a stage of a
+   * collection that is not active any more is replaced by the stage of the same name of the active
+   * one; otherwise (and instead of a closing stage) the "unknown" stage of the active collection.
+   * Null when nothing fits (no active collection and nothing chosen).
    */
-  async getDefaultStage(): Promise<DealStage> {
+  async findDefaultStage(): Promise<DealStage | null> {
     const settings = await this.settingRepository.find({
-      relations: ['default_stage'],
+      relations: ['default_stage', 'default_stage.collection'],
       order: {
         id: 'DESC',
       },
       take: 1,
     });
+    const chosen = settings[0]?.default_stage ?? null;
+    const usable = chosen && !this.isClosingStage(chosen) ? chosen : null;
 
-    if (settings[0]?.default_stage) {
-      return settings[0].default_stage;
+    if (usable?.collection?.is_active) {
+      return usable;
     }
 
-    const fallbackStage = await this.dealStageRepository
-      .createQueryBuilder('t0')
-      .innerJoin('t0.collection', 't1')
-      .where('t1.is_active = true')
-      .andWhere('t0.name = :name', { name: process.env.DEAL_STAGE_UNKNOWN })
-      .getOne();
+    const active = await this.collectionRepository.findOneBy({ is_active: true });
+    if (!active) {
+      return usable;
+    }
 
-    if (!fallbackStage) {
+    return (
+      (usable ? await this.stageOfCollection(this.dataSource.manager, active.id, usable.name) : null) ??
+      (await this.stageOfCollection(this.dataSource.manager, active.id, process.env.DEAL_STAGE_UNKNOWN))
+    );
+  }
+
+  async getDefaultStage(): Promise<DealStage> {
+    const stage = await this.findDefaultStage();
+
+    if (!stage) {
       throw new BadRequestException(
-        'Default deal stage is not configured: choose it in settings or pass stage_id',
+        'Не задан этап для новых сделок: выберите его в «Сделки → Настроить» или передайте stage_id',
       );
     }
 
-    return fallbackStage;
+    return stage;
+  }
+
+  /**
+   * PATCH /stages/default: the stage new deals without an explicit stage go to.
+   * Only a working (not closing) stage of the active collection.
+   */
+  async setDefaultStage(stageId: number): Promise<DealStage> {
+    const stage = await this.helperService.getById(DealStage, stageId, ['collection']);
+
+    if (!stage.collection?.is_active) {
+      throw new BadRequestException(
+        `Этап «${stage.name}» не из активной воронки: этап для новых сделок выбирается из неё`,
+      );
+    }
+
+    if (this.isClosingStage(stage)) {
+      throw new BadRequestException(
+        `Этап «${stage.name}» закрывает сделку: новые сделки в него не ставятся`,
+      );
+    }
+
+    const settings = await this.settingRepository.find({ order: { id: 'DESC' }, take: 1 });
+    if (settings[0]) {
+      await this.settingRepository.update(settings[0].id, {
+        default_stage: { id: stage.id } as DealStage,
+      });
+    } else {
+      await this.settingRepository.save(
+        this.settingRepository.create({ default_stage: { id: stage.id } as DealStage }),
+      );
+    }
+
+    stage.collection = undefined;
+    return stage;
+  }
+
+  /** The stage named `name` of a collection (null for no name / no such stage). */
+  private async stageOfCollection(
+    manager: EntityManager,
+    collectionId: number,
+    name: string | null | undefined,
+  ): Promise<DealStage | null> {
+    if (!name) {
+      return null;
+    }
+
+    return manager
+      .createQueryBuilder(DealStage, 't0')
+      .where('t0.collection_id = :collection_id', { collection_id: collectionId })
+      .andWhere('t0.name = :name', { name })
+      .orderBy('t0.id', 'ASC')
+      .getOne();
   }
 
   async getById(id: number): Promise<DealStage> {
@@ -222,6 +292,11 @@ export class DealStageService {
    *
    * Existing deals are NOT moved: they stay in the stages of the collection
    * they were created in.
+   *
+   * The stage for new deals (settings) moves along: to the stage of the same
+   * name of the new collection, otherwise to its "unknown" stage. Before, the
+   * deals from Telegram, WhatsApp, calls and mail kept going to the stage of
+   * the old collection and were not on the board.
    */
   async activateCollection(id: number): Promise<void> {
     const targetCollection = await this.helperService.getById(
@@ -243,6 +318,23 @@ export class DealStageService {
         .set({ is_active: true })
         .where('id = :id', { id: targetCollection.id })
         .execute();
+
+      const settings = await manager.find(Setting, {
+        relations: ['default_stage', 'default_stage.collection'],
+        order: { id: 'DESC' },
+        take: 1,
+      });
+      const setting = settings[0];
+      if (!setting || setting.default_stage?.collection?.id === targetCollection.id) {
+        return;
+      }
+
+      const next =
+        (await this.stageOfCollection(manager, targetCollection.id, setting.default_stage?.name)) ??
+        (await this.stageOfCollection(manager, targetCollection.id, process.env.DEAL_STAGE_UNKNOWN));
+      await manager.update(Setting, setting.id, {
+        default_stage: next ? ({ id: next.id } as DealStage) : null,
+      });
     });
   }
 
@@ -451,8 +543,9 @@ export class DealStageService {
           [targetStage.id, stage.id, new Date()],
         );
       } else {
+        // a working stage: its deals are open (closed_at means closed everywhere)
         await manager.query(
-          `UPDATE deal SET stage_id = $1 WHERE stage_id = $2`,
+          `UPDATE deal SET stage_id = $1, closed_at = NULL WHERE stage_id = $2`,
           [targetStage.id, stage.id],
         );
       }
@@ -522,10 +615,31 @@ export class DealStageService {
     return reasons;
   }
 
+  /** Names of the stages that close a deal: «успешно реализовано» and «закрыто и не реализовано». */
   getClosedStageNames(): string[] {
     return [
       process.env.DEAL_STAGE_CLOSED,
       process.env.DEAL_STAGE_CLOSED_NOT_REALIZED,
-    ];
+    ].filter(Boolean);
+  }
+
+  /** A deal in this stage is closed (deal.closed_at is set); in any other one it is open. */
+  isClosingStage(stage: Pick<DealStage, 'name'> | null | undefined): boolean {
+    return !!stage && this.getClosedStageNames().includes(stage.name);
+  }
+
+  /** Ids of the closing stages of all collections. */
+  async closingStageIds(): Promise<number[]> {
+    const names = this.getClosedStageNames();
+    if (names.length === 0) {
+      return [];
+    }
+
+    const rows: { id: number }[] = await this.dataSource.query(
+      `SELECT id FROM deal_stage WHERE name = ANY($1::text[])`,
+      [names],
+    );
+
+    return rows.map((row) => Number(row.id));
   }
 }

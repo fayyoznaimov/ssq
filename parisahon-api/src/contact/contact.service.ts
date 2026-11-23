@@ -2,7 +2,6 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { RoleEnum } from '../user/user.entity';
 import { DataSource, In, Repository } from 'typeorm';
-import { Company } from '../company/company.entity';
 import {
   PaginationRequestDto,
   PaginationResponseDto,
@@ -22,6 +21,14 @@ import {
   TaskTypesToWeights,
 } from '../deal/dto/search.deal.dto';
 import { HelperService } from '../helper/helper.service';
+import { Access } from '../auth/access';
+import { AuthUser } from '../auth/auth.guard';
+import { phoneDigits } from '../helper/phone';
+
+/** A condition with named parameters (Access) put into raw SQL with $n parameters. */
+function bindNamed(sql: string, named: Record<string, any>, bind: (value: unknown) => string): string {
+  return sql.replace(/:(\w+)/g, (match, name: string) => (name in named ? bind(named[name]) : match));
+}
 
 @Injectable()
 export class ContactService {
@@ -30,21 +37,50 @@ export class ContactService {
     private userFillerRepository: Repository<UserFiller>,
     @InjectRepository(CompanyFiller)
     private companyFillerRepository: Repository<CompanyFiller>,
-    @InjectRepository(Company)
+    // was declared with @InjectRepository(Company), i.e. it was the company repository
     private dataSource: DataSource,
     private helperService: HelperService,
   ) {}
 
+  /**
+   * GET /contacts: contacts (ctr_agent) and companies in one list.
+   * - role=ctr_agent: contacts only — with or without a company (the list of the «Контакты» page;
+   *   employees=true hid every contact from Telegram, WhatsApp and calls, they have no company);
+   * - employees=true: contacts of a live company; employees=false: no company (with role=ctr_agent:
+   *   contacts without a company, otherwise companies too);
+   * - q: the name, e-mail or phone (any format) at once;
+   * - `requester`: only the contacts and companies the user may see (contact / company view right).
+   * Every row also has `agent` (responsible for the latest deal) and `last_activity_at` (the latest event).
+   */
   async fetchAll(
     query: SearchContactDto,
+    requester?: AuthUser,
   ): Promise<PaginationResponseDto<ContactDto[]>> {
     const [sortBy, sortByType] = this.performAdditionalValidations(query);
+    const limit = this.helperService.normalizeLimit(query.limit);
+    const skip = this.helperService.normalizeSkip(query.skip);
 
-    const [filtrationQuery, argumentToValuesMap] =
-      this.createFiltrationQueryString(query, 4);
+    const params: unknown[] = [];
+    const bind = (value: unknown) => {
+      params.push(value);
+      return `$${params.length}`;
+    };
 
     const [userQuery, companyQuery] =
       this.createUserAndCompanyFiltrationQueries(query.tasks, query.stages);
+
+    // the view right: contacts by Access.contactSql, companies by Access.companySql
+    let contactScope = 'TRUE';
+    let companyScope = 'TRUE';
+    if (requester) {
+      const access = new Access(requester);
+      const contacts = access.contactSql('u', 'view');
+      const companies = access.companySql('cmpn', 'view');
+      contactScope = bindNamed(contacts.sql, contacts.params, bind);
+      companyScope = bindNamed(companies.sql, companies.params, bind);
+    }
+    const contactRole = bind(RoleEnum.CTR_AGENT);
+    const filtrationQuery = this.createFiltrationQueryString(query, bind);
 
     /**
      * Using RAW sql for better control over the query!
@@ -56,37 +92,25 @@ export class ContactService {
         FROM public.user u
         LEFT JOIN public.company c ON u.company_id = c.id AND c.deleted_at IS NULL
         ${userQuery ? userQuery + ' AND ' : ' WHERE '}
-        u.role = $1 AND u.deleted_at IS NULL
+        u.role = ${contactRole} AND u.deleted_at IS NULL AND ${contactScope}
         UNION
         SELECT 'company' AS type, cmpn.id, cmpn.name, cmpn.email, NULL AS company_id, NULL AS company_name, cmpn.phone,
         cmpn.updated_at, cmpn.created_at, cmpn.created_by, cmpn.updated_by
         FROM public.company cmpn
         ${companyQuery ? companyQuery + ' AND ' : ' WHERE '}
-        cmpn.deleted_at IS NULL
+        cmpn.deleted_at IS NULL AND ${companyScope}
       )
       SELECT *, COUNT(*) OVER() as total_count
       FROM union_results_with_count
       ${filtrationQuery}
-      ORDER BY ${sortBy === 'company' ? 'company_name' : sortBy} ${sortByType}
-      LIMIT $2
-      OFFSET $3;
+      ORDER BY ${sortBy === 'company' ? 'company_name' : sortBy} ${sortByType}, type, id ${sortByType}
+      LIMIT ${bind(limit)}
+      OFFSET ${bind(skip)};
     `;
-
-    const parameters: any[] = [
-      RoleEnum.CTR_AGENT,
-      query.limit ?? 25,
-      query.skip ?? 0,
-    ];
-
-    if (argumentToValuesMap.size > 0) {
-      argumentToValuesMap.forEach((value, index) => {
-        parameters[Number(index) - 1] = value;
-      });
-    }
 
     const result: ContactRowDto[] = await this.dataSource.query(
       unionQuery,
-      parameters,
+      params,
     );
 
     const totalCount = result.length > 0 ? result[0]['total_count'] : 0;
@@ -118,6 +142,7 @@ export class ContactService {
       result,
       additionalHashMaps,
     );
+    await this.addActivity(responseData, userIds, companyIds);
 
     /**
      * Appending the response data to pagination data!
@@ -128,11 +153,53 @@ export class ContactService {
     response.data = responseData;
 
     response.count = Number(totalCount);
-    response.page_size = Number(query.limit ?? 25);
-    response.current_page = Math.floor(query.skip / query.limit + 1);
-    response.last_page = Math.floor(response.count / query.limit + 1);
+    response.page_size = limit;
+    response.current_page = Math.floor(skip / limit) + 1;
+    response.last_page = this.helperService.calculateLastPage(response.count, limit);
 
     return response;
+  }
+
+  /** «Ответственный» (the manager of the latest deal) and «Последнее касание» (the latest event) of the page's rows. */
+  private async addActivity(rows: ContactDto[], userIds: number[], companyIds: number[]): Promise<void> {
+    const info = new Map<string, { agent_id: number | null; agent_name: string | null; last_at: string | null }>();
+    if (userIds.length) {
+      const found: any[] = await this.dataSource.query(
+        `SELECT x.id,
+                (SELECT a.id FROM deal_user du JOIN deal d ON d.id = du."dealId" JOIN "user" a ON a.id = d.agent_id
+                  WHERE du."userId" = x.id AND d.deleted_at IS NULL ORDER BY d.created_at DESC LIMIT 1) AS agent_id,
+                (SELECT a.username FROM deal_user du JOIN deal d ON d.id = du."dealId" JOIN "user" a ON a.id = d.agent_id
+                  WHERE du."userId" = x.id AND d.deleted_at IS NULL ORDER BY d.created_at DESC LIMIT 1) AS agent_name,
+                GREATEST(
+                  (SELECT MAX(e.created_at) FROM event e WHERE e.user_id = x.id),
+                  (SELECT MAX(e.created_at) FROM event e WHERE e.target_user_id = x.id),
+                  (SELECT MAX(e.created_at) FROM event e
+                    WHERE e.deal_id IN (SELECT du."dealId" FROM deal_user du WHERE du."userId" = x.id))
+                ) AS last_at
+           FROM unnest($1::int[]) AS x(id)`,
+        [userIds],
+      );
+      found.forEach((row) => info.set(`user-${row.id}`, row));
+    }
+    if (companyIds.length) {
+      const found: any[] = await this.dataSource.query(
+        `SELECT x.id,
+                (SELECT a.id FROM deal d JOIN "user" a ON a.id = d.agent_id
+                  WHERE d.company_id = x.id AND d.deleted_at IS NULL ORDER BY d.created_at DESC LIMIT 1) AS agent_id,
+                (SELECT a.username FROM deal d JOIN "user" a ON a.id = d.agent_id
+                  WHERE d.company_id = x.id AND d.deleted_at IS NULL ORDER BY d.created_at DESC LIMIT 1) AS agent_name,
+                (SELECT MAX(e.created_at) FROM event e
+                  WHERE e.deal_id IN (SELECT d.id FROM deal d WHERE d.company_id = x.id)) AS last_at
+           FROM unnest($1::int[]) AS x(id)`,
+        [companyIds],
+      );
+      found.forEach((row) => info.set(`company-${row.id}`, row));
+    }
+    for (const row of rows) {
+      const found = info.get(`${row.type === ContactTypes.CTR_AGENT ? 'user' : 'company'}-${row.id}`);
+      row.agent = found?.agent_id ? { id: Number(found.agent_id), username: found.agent_name } : null;
+      row.last_activity_at = found?.last_at ?? null;
+    }
   }
 
   private createUserAndCompanyFiltrationQueries(
@@ -223,7 +290,7 @@ export class ContactService {
         }
       }
       if (stages && stages.length > 0) {
-        userQuery += `dl.stage_id IN (${stages.join(',')})`;
+        userQuery += `dl.stage_id IN (${stages.map((stage) => Number(stage)).join(',')})`;
       }
     }
 
@@ -241,7 +308,7 @@ export class ContactService {
         }
       }
       if (stages && stages.length > 0) {
-        companyQuery += `dl1.stage_id IN (${stages.join(',')})`;
+        companyQuery += `dl1.stage_id IN (${stages.map((stage) => Number(stage)).join(',')})`;
       }
     }
 
@@ -250,71 +317,68 @@ export class ContactService {
 
   private createFiltrationQueryString(
     data: SearchContactDto,
-    shift: number = 0,
-  ): [string, Map<number, any>] {
+    bind: (value: unknown) => string,
+  ): string {
     const queries = [];
-    let argumentNumber = shift;
-    const argumentToValues = new Map<number, any>();
 
     if (data.name) {
-      queries.push(`name ILIKE $${argumentNumber}`);
-      argumentToValues.set(argumentNumber, `%${data.name}%`);
-      argumentNumber++;
+      queries.push(`name ILIKE ${bind(`%${data.name}%`)}`);
     }
 
     if (data.phone) {
       // "+998 90 111 00 03" finds "+998901110003": digits are compared
-      const digits = String(data.phone).replace(/[^0-9]/g, '');
+      const digits = phoneDigits(data.phone);
       if (digits) {
-        queries.push(`regexp_replace(COALESCE(phone, ''), '[^0-9]', '', 'g') LIKE $${argumentNumber}`);
-        argumentToValues.set(argumentNumber, `%${digits}%`);
+        queries.push(`regexp_replace(COALESCE(phone, ''), '[^0-9]', '', 'g') LIKE ${bind(`%${digits}%`)}`);
       } else {
-        queries.push(`phone ILIKE $${argumentNumber}`);
-        argumentToValues.set(argumentNumber, `%${data.phone}%`);
+        queries.push(`phone ILIKE ${bind(`%${data.phone}%`)}`);
       }
-      argumentNumber++;
     }
 
     if (data.email) {
-      queries.push(`email ILIKE $${argumentNumber}`);
-      argumentToValues.set(argumentNumber, `%${data.email}%`);
-      argumentNumber++;
+      queries.push(`email ILIKE ${bind(`%${data.email}%`)}`);
+    }
+
+    // one search box: the name, the e-mail or the phone (in any format; the last 9 digits are enough)
+    if (data.q && data.q.trim()) {
+      const text = data.q.trim();
+      const like = bind(`%${text}%`);
+      const alternatives = [`name ILIKE ${like}`, `email ILIKE ${like}`, `company_name ILIKE ${like}`];
+      const digits = phoneDigits(text);
+      if (digits.length >= 3) {
+        const tail = digits.length >= 9 ? digits.slice(-9) : digits;
+        alternatives.push(`regexp_replace(COALESCE(phone, ''), '[^0-9]', '', 'g') LIKE ${bind(`%${tail}%`)}`);
+      }
+      queries.push(`(${alternatives.join(' OR ')})`);
     }
 
     if (data.created_by) {
-      queries.push(`created_by = $${argumentNumber}`);
-      argumentToValues.set(argumentNumber, data.created_by);
-      argumentNumber++;
+      queries.push(`created_by = ${bind(data.created_by)}`);
     }
 
     if (data.updated_by) {
-      queries.push(`updated_by = $${argumentNumber}`);
-      argumentToValues.set(argumentNumber, data.updated_by);
-      argumentNumber++;
+      queries.push(`updated_by = ${bind(data.updated_by)}`);
     }
 
     if (data.created_before) {
-      queries.push(`created_at < $${argumentNumber}`);
-      argumentToValues.set(argumentNumber, data.created_before);
-      argumentNumber++;
+      queries.push(`created_at < ${bind(data.created_before)}`);
     }
 
     if (data.created_after) {
-      queries.push(`created_at > $${argumentNumber}`);
-      argumentToValues.set(argumentNumber, data.created_after);
-      argumentNumber++;
+      queries.push(`created_at > ${bind(data.created_after)}`);
     }
 
     if (data.updated_before) {
-      queries.push(`updated_at < $${argumentNumber}`);
-      argumentToValues.set(argumentNumber, data.updated_before);
-      argumentNumber++;
+      queries.push(`updated_at < ${bind(data.updated_before)}`);
     }
 
     if (data.updated_after) {
-      queries.push(`updated_at > $${argumentNumber}`);
-      argumentToValues.set(argumentNumber, data.updated_after);
-      argumentNumber++;
+      queries.push(`updated_at > ${bind(data.updated_after)}`);
+    }
+
+    // role=ctr_agent: contacts only (with or without a company)
+    if (data.role === RoleEnum.CTR_AGENT) {
+      queries.push(`type = 'user'`);
     }
 
     // employees=true: contacts attached to a (live) company;
@@ -325,10 +389,7 @@ export class ContactService {
       queries.push(`company_name IS NULL`);
     }
 
-    return [
-      queries.length ? `WHERE ${queries.join(' AND ')}` : '',
-      argumentToValues,
-    ];
+    return queries.length ? `WHERE ${queries.join(' AND ')}` : '';
   }
 
   /**
@@ -355,20 +416,20 @@ export class ContactService {
 
       if (Object.keys(query.sort).length != 0) {
         if (
-          !['name', 'email', 'phone', 'company', 'id'].includes(
+          !['name', 'email', 'phone', 'company', 'id', 'created_at', 'updated_at'].includes(
             Object.keys(query.sort)[0],
           )
         ) {
           throw new BadRequestException({
             message: [
-              'each value in sort must be one of the following values: id, name, email, phone, company',
+              'each value in sort must be one of the following values: id, name, email, phone, company, created_at, updated_at',
             ],
             error: 'Bad Request',
             statusCode: 400,
           });
         }
         sortBy = Object.keys(query.sort)[0];
-        if (query.sort[sortBy].includes('-')) {
+        if (String(query.sort[sortBy]).includes('-')) {
           sortByType = 'DESC';
         }
       }
@@ -396,15 +457,19 @@ export class ContactService {
     userIds: number[],
     companyIds: number[],
   ): Promise<[UserFiller[], CompanyFiller[]]> {
-    const companyFillers = await this.companyFillerRepository.find({
-      where: { company: In(companyIds) },
-      relations: ['filler', 'company'],
-    });
+    const companyFillers = companyIds.length
+      ? await this.companyFillerRepository.find({
+          where: { company: In(companyIds) },
+          relations: ['filler', 'company'],
+        })
+      : [];
 
-    const userFillers = await this.userFillerRepository.find({
-      where: { user: In(userIds) },
-      relations: ['filler', 'user'],
-    });
+    const userFillers = userIds.length
+      ? await this.userFillerRepository.find({
+          where: { user: In(userIds) },
+          relations: ['filler', 'user'],
+        })
+      : [];
 
     return [userFillers, companyFillers];
   }
@@ -438,6 +503,7 @@ export class ContactService {
       newContactRowDto.phones = [];
       newContactRowDto.emails = [];
       newContactRowDto.company = null;
+      newContactRowDto.created_at = row.created_at;
 
       /**
        * Append phone number from entity itself!

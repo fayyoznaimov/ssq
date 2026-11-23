@@ -45,15 +45,23 @@ const parseUserId = (value) => {
   return n > 0 ? n : null
 }
 
-/** createApp({ manager, outbox, token, logger }) -> http.Server (not listening yet). */
-export function createHttpServer({ manager, outbox, token, logger }) {
+/**
+ * createApp({ manager, outbox, token, logger, sendWaitMs }) -> http.Server (not listening yet).
+ * sendWaitMs: how long POST /send waits for WhatsApp before it answers 504 {pending: true} (the CRM API
+ * waits 120 s); the send goes on and is recorded in the CRM by the service.
+ */
+export function createHttpServer({ manager, outbox, token, logger, sendWaitMs = 90_000 }) {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://local')
     const parts = url.pathname.split('/').filter(Boolean)
     const method = req.method
     try {
       if (method === 'GET' && url.pathname === '/health') {
-        return send(res, 200, { ok: true, sessions: manager.count, outbox: outbox?.size ?? 0 })
+        // every number's state (WA-1) and what waits for the CRM: the server watchdog reads this
+        return send(res, 200, {
+          ok: true, ...manager.health(),
+          outbox: outbox?.size ?? 0, outbox_oldest_sec: outbox?.oldestSec ?? 0, rejected: outbox?.rejectedCount ?? 0,
+        })
       }
       if (!tokenMatches(req.headers['x-whatsapp-service-token'], token)) {
         return fail(res, 401, 'unauthorized', 'Нет доступа к WhatsApp-сервису')
@@ -86,10 +94,29 @@ export function createHttpServer({ manager, outbox, token, logger }) {
         if (!userId) return fail(res, 400, 'bad user_id', 'Неверный пользователь')
         if (body.files !== undefined && !Array.isArray(body.files)) return fail(res, 400, 'bad files', 'Неверный список файлов')
         if (body.text !== undefined && body.text !== null && typeof body.text !== 'string') return fail(res, 400, 'bad text', 'Неверный текст')
-        const result = await manager.send({
+        if (body.request_id !== undefined && body.request_id !== null && !/^[A-Za-z0-9_-]{1,64}$/.test(String(body.request_id))) {
+          return fail(res, 400, 'bad request_id', 'Неверный запрос')
+        }
+        // the same request_id again (a repeated click, a retry) is never sent twice
+        const { entry, repeated } = manager.startSend({
           userId, toPhone: body.to_phone, toWaId: body.to_wa_id, text: body.text || '', files: body.files || [],
+          requestId: body.request_id || null, dealId: body.deal_id ?? null,
         })
-        return send(res, 200, result)
+        // the CRM went away before the answer: the send is recorded in the CRM by the service when it is out
+        res.on('close', () => { if (!res.writableEnded) manager.abandonSend(entry) })
+        const PENDING = Symbol('pending')
+        let timer
+        const outcome = await Promise.race([
+          entry.promise.then((result) => ({ result }), (error) => ({ error })),
+          new Promise((resolve) => { timer = setTimeout(() => resolve(PENDING), sendWaitMs) }),
+        ])
+        clearTimeout(timer)
+        if (outcome === PENDING) {
+          manager.abandonSend(entry)
+          return send(res, 504, { error: 'pending', message: 'WhatsApp ещё отправляет сообщение', pending: true, message_ids: [] })
+        }
+        if (outcome.error) throw outcome.error
+        return send(res, 200, repeated ? { ...outcome.result, repeated: true } : outcome.result)
       }
       return fail(res, 404, 'not found', 'Нет такого адреса')
     } catch (error) {

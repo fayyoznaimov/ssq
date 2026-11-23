@@ -16,12 +16,15 @@ import { Deal } from '../deal/deal.entity';
 import { Task } from '../task/task.entity';
 import { Notification } from 'src/notification/notification.entity';
 
+// the name is unique among the companies that are not deleted, and the last 9 digits of the phone are
+// indexed for the lookups by phone (partial / expression indexes, migration 1795230000000-people-phones)
+@Index('IDX_company_name_live', { synchronize: false })
+@Index('IDX_company_phone_key', { synchronize: false })
 @Entity()
 export class Company {
   @PrimaryGeneratedColumn()
   id: number;
 
-  @Index({ unique: true })
   @Column({ type: 'varchar', length: 255 })
   name: string;
 

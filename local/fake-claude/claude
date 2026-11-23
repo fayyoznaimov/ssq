@@ -69,6 +69,10 @@ process.stdin.on('end', () => {
                mfo: null, oked: null, director: null, phone: null, email: 'not-an-email' },
     contacts: [], unclear_fields: [], notes: null,
   };
+  // A check can make the card's ИНН its own by putting "AUDIT-INN:<9 digits>" into the file: a stand
+  // with real data may already have a company with the canned ИНН (the CRM then says "already in the CRM")
+  const ownInn = doc ? /AUDIT-INN:(\d{9})/.exec(Buffer.from(doc.source.data, 'base64').toString('latin1')) : null;
+  if (ownInn) good.company.inn = ownInn[1].replace(/^(\d{3})(\d{3})(\d{3})$/, '$1 $2 $3');
   const answer = size < 200 ? bad : good;
   // Real models sometimes wrap JSON in a fence: the CRM must cope with it
   const final = 'Готово.\n```json\n' + JSON.stringify(answer) + '\n```';

@@ -1,7 +1,7 @@
 <template>
     <div class="flex flex-col space-y-8">
         <div class="flex flex-wrap items-center justify-between gap-3">
-            <div>
+            <div class="flex flex-wrap items-center gap-3">
                 <TairoPopover orientation="start" class="start-0 z-20">
                     <template #default="{open}">
                         <BaseButton :loading="collectionsLoading">
@@ -40,6 +40,20 @@
                         </ul>
                     </template>
                 </TairoPopover>
+                <!-- where a deal goes when nobody chose its stage: Telegram, WhatsApp, calls, mail, the bot -->
+                <div class="flex items-center gap-2 text-sm text-muted-600 dark:text-muted-300">
+                    <span class="whitespace-nowrap">Этап для новых сделок:</span>
+                    <BaseListbox
+                        class="w-56"
+                        :items="defaultStageOptions"
+                        :properties="{ label: 'name', value: 'id' }"
+                        :model-value="selectedDefaultStage"
+                        :disabled="!isAdmin || defaultStageSaving"
+                        :loading="defaultStageSaving"
+                        placeholder="Не выбран"
+                        @update:model-value="onDefaultStageChange"
+                    />
+                </div>
             </div>
             <div class="flex gap-3">
                 <NuxtLink :to="route.query.from">
@@ -102,7 +116,15 @@
                                     <Icon v-if="trigger.type === TriggerType.CreateDeal" name="ph:currency-circle-dollar" class="size-8 text-primary-600 dark:text-primary-200 shrink-0" />
                                     <Icon v-if="trigger.type === TriggerType.SendEmail" name="ph:paper-plane" class="size-8 text-primary-600 dark:text-primary-200 shrink-0" />
                                     <div class="flex flex-col">
-                                        <span class="text-[13px] text-muted-600 dark:text-muted-200">{{ describeWhen(trigger.apply_when_data) }}</span>
+                                        <span class="text-[13px] text-muted-600 dark:text-muted-200">{{ describeWhen(trigger.apply_when_data, trigger.type) }}</span>
+                                        <span
+                                            v-if="trigger.id && triggerHealth[trigger.id]"
+                                            class="text-[12px] text-rose-600 dark:text-rose-400"
+                                            :title="triggerHealth[trigger.id]?.last_error ?? ''"
+                                        >
+                                            <Icon name="ph:warning-circle" class="size-3.5 -mt-0.5" />
+                                            Ошибок за 7 дней: {{ triggerHealth[trigger.id]?.failed }} — подробности в «Истории запусков»
+                                        </span>
                                         <div class="text-sm font-semibold text-muted-900 dark:text-white">
                                             <p v-if="trigger.type === TriggerType.CreateTask">Создать задачу: </p>
                                             <p v-if="trigger.type === TriggerType.ChangeAgent">Сменить ответственного: </p>
@@ -249,30 +271,90 @@ const fileSourceMap: Record<FileSource, string> = {
 const WEEK_DAYS = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье'];
 const MONTHS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
 
-/** When a trigger fires, for the stage list. */
-function describeWhen(when: any): string {
+/** When a trigger fires, for the stage list (with how often it may act for one deal). */
+function describeWhen(when: any, type?: TriggerType): string {
     if (!when) return 'После перехода в этап';
     const dir = when.outgoing === true ? 'исходящем' : when.outgoing === false ? 'входящем' : 'любом';
+    const dirCall = when.outgoing === true ? 'исходящего' : when.outgoing === false ? 'входящего' : 'любого';
+    const repeat = describeRepeat(when, type);
     switch (when.when) {
         case 'at_exact_time': return `${String(when.date ?? '').slice(0, 10).split('-').reverse().join('.')} в ${when.time}`;
         case 'every_day': return `Ежедневно в ${when.time}`;
         case 'every_week': return `Еженедельно, ${WEEK_DAYS[(when.week_day ?? 1) - 1]} в ${when.time}`;
         case 'every_month': return `Ежемесячно, ${when.day}-го в ${when.time}`;
         case 'every_year': return `Ежегодно, ${when.day} ${MONTHS[(when.month ?? 1) - 1]} в ${when.time}`;
-        case 'tg_message_received': return `При ${dir} сообщении Telegram`;
-        case 'email_received': return `При ${dir} письме`;
-        default: {
+        case 'tg_message_received': return `При ${dir} сообщении Telegram${repeat}`;
+        case 'wa_message_received': return `При ${dir} сообщении WhatsApp${repeat}`;
+        case 'email_received': return `При ${dir} письме${repeat}`;
+        case 'call_recorded': return `При записи ${dirCall} звонка${repeat}`;
+        case 'right_away':
+        case undefined:
+        case null: {
             const m = Number(when.after_minutes ?? 0);
-            if (!m) return 'Сразу после создания или перехода в этап';
+            if (!m) return `Сразу после создания или перехода в этап${repeat}`;
             const text = m % 1440 === 0 ? `${m / 1440} дн.` : m % 60 === 0 ? `${m / 60} ч` : `${m} мин`;
-            return `Через ${text} после перехода в этап`;
+            return `Через ${text} после перехода в этап${repeat}`;
+        }
+        default: return `Условие «${when.when}»`;
+    }
+}
+
+/** «, один раз для сделки» / «, не чаще раза в сутки»: the API's defaults when the trigger does not say. */
+function describeRepeat(when: any, type?: TriggerType): string {
+    const once = typeof when.once_per_deal === 'boolean' ? when.once_per_deal : type === TriggerType.CreateDeal;
+    if (once) return ', один раз для сделки';
+    const set = when.cooldown_minutes !== undefined && when.cooldown_minutes !== null;
+    const m = set ? Number(when.cooldown_minutes) || 0 : type === TriggerType.SendEmail ? 1440 : 0;
+    if (!m) return '';
+    const text = m === 1440 ? 'сутки' : m % 1440 === 0 ? `${m / 1440} дн.` : m % 60 === 0 ? `${m / 60} ч` : `${m} мин`;
+    return `, не чаще раза в ${text}`;
+}
+
+// failed runs of the last 7 days per trigger (GET /stages/:id/triggers): a trigger that does not work is seen here
+const triggerHealth = ref<Record<number, { failed: number; last_error: string | null }>>({});
+async function loadTriggerHealth() {
+    const saved = (stages.value ?? []).filter((stage) => stage.id && stage.status !== 'new' && stage.triggers?.length);
+    const answers = await Promise.all(saved.map((stage) => promiseResult(stagesService.get(`${stage.id}/triggers`).exec())));
+    const health: Record<number, { failed: number; last_error: string | null }> = {};
+    for (const answer of answers) {
+        if (!answer.ok || !Array.isArray(answer.value)) continue;
+        for (const trigger of answer.value as any[]) {
+            if (trigger?.runs?.failed) health[trigger.id] = { failed: trigger.runs.failed, last_error: trigger.runs.last_error ?? null };
         }
     }
+    triggerHealth.value = health;
 }
 
 const activeCollection = computed(() => {
     return collections.value.find((c) => c.is_active);
 });
+
+// «Этап для новых сделок»: a working (not closing) saved stage of the active pipeline; admins change it
+const currentUser = useState<User>('user');
+const isAdmin = computed(() => currentUser.value?.role === 'admin');
+const defaultStage = ref<Stage | null>(null);
+const defaultStageSaving = ref(false);
+const defaultStageOptions = computed(() => (stages.value || []).filter((stage: any) => !stage.is_closing && stage.status !== 'new'));
+const selectedDefaultStage = computed(() => defaultStageOptions.value.find((stage) => stage.id === defaultStage.value?.id) ?? defaultStage.value);
+
+async function fetchDefaultStage() {
+    const result = await promiseResult(stagesService.get('default').exec());
+    defaultStage.value = result.ok ? ((result.value as Stage | null) || null) : null;
+}
+
+async function onDefaultStageChange(stage: Stage | null) {
+    if (!stage?.id || stage.id === defaultStage.value?.id) return;
+    const previous = defaultStage.value;
+    defaultStage.value = stage;
+    defaultStageSaving.value = true;
+    const result = await promiseResult(stagesService.patch('default', { stage_id: stage.id }).exec());
+    defaultStageSaving.value = false;
+    if (!result.ok) {
+        defaultStage.value = previous;
+        return toast.show({type: 'error', message: [result.error.message].flat().join('; '), timeout: 5000});
+    }
+    toast.show({type: 'success', message: `Новые сделки без выбранного этапа попадают в «${stage.name}»`, timeout: 3000});
+}
 
 function addStage(index: number) {
     let order = index === stages.value.length  ? index + 1 : index;
@@ -373,8 +455,18 @@ async function onSave(formData: FormData) {
     const triggerPromises = [];
     for (const stage of stages.value) {
         for (const stageTrigger of stage.triggers) {
-            if (stageTrigger.status === 'new') triggerPromises.push(stagesService.post(`/${stage.id}/triggers`, toTrigger(stageTrigger)).exec());
-            else triggerPromises.push(stagesService.patch(`${stage.id}/triggers/${stageTrigger.id}`, toTrigger(stageTrigger)).exec());
+            // only what was added or changed: a PATCH of every trigger on each save used to void the
+            // planned runs of all of them; a saved one is not sent again by the next «Сохранить»
+            if (stageTrigger.status === 'new') {
+                triggerPromises.push(stagesService.post(`/${stage.id}/triggers`, toTrigger(stageTrigger)).exec().then((created: any) => {
+                    if (created?.id) stageTrigger.id = created.id;
+                    stageTrigger.status = undefined;
+                }));
+            } else if (stageTrigger.status === 'changed') {
+                triggerPromises.push(stagesService.patch(`${stage.id}/triggers/${stageTrigger.id}`, toTrigger(stageTrigger)).exec().then(() => {
+                    stageTrigger.status = undefined;
+                }));
+            }
         }
     }
 
@@ -411,6 +503,8 @@ async function onActivate(id: number, close: Function) {
     const result = await promiseResult(collectionService.patch(id + '/activate', {}).exec());
     if (!result.ok) return toast.show({type: 'error', message: result.error.message, timeout: 3000});
     run(stagesService.find().exec());
+    // the stage for new deals moved to the new pipeline (the same name or «Неразобранное»)
+    fetchDefaultStage();
 }
 
 async function onSubmit(e: Event) {
@@ -469,6 +563,7 @@ watch(stages, () => {
     }
     sortedStages.value = (stages.value?.sort((a, b) => a.order - b.order) || []).map((s) => !s.color ? ({...s, color: colors[Math.floor(Math.random() * colors.length)] || '#D5D8DB'}) : s);
     nextTick(adjustColumnHeights);
+    void loadTriggerHealth();
 });
 
 onMounted(() => {
@@ -476,6 +571,7 @@ onMounted(() => {
     runUsers(userService.find({limit: 1000}).exec());
     runFillers(fillerService.find().exec());
     runCollections(collectionService.find({limit: 1000}).exec());
+    fetchDefaultStage();
 });
 
 </script>

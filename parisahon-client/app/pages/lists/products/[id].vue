@@ -20,6 +20,41 @@
                         :error="errors.name"
                         @input="(e: Event) => onChange('name', (e.target as HTMLInputElement).value)"
                     />
+                    <!-- the catalogue: the deal suggests the price of one unit instead of asking every time -->
+                    <BaseInput
+                        v-model="product.sku"
+                        type="text"
+                        label="Артикул"
+                        name="sku"
+                        placeholder="пр.: PR-1024"
+                        icon="ph:barcode"
+                        :loading="productLoading"
+                        :error="errors.sku"
+                    />
+                    <div class="flex gap-3">
+                        <BaseInput
+                            v-model="product.unit"
+                            type="text"
+                            label="Единица"
+                            name="unit"
+                            placeholder="м, кг, шт"
+                            :classes="{wrapper: 'w-1/3'}"
+                            :loading="productLoading"
+                            :error="errors.unit"
+                        />
+                        <BaseInput
+                            v-model="priceText"
+                            type="text"
+                            inputmode="decimal"
+                            label="Цена за единицу"
+                            name="price"
+                            placeholder="пр.: 12500.50"
+                            :classes="{wrapper: 'w-2/3'}"
+                            :loading="productLoading"
+                            :error="errors.price"
+                            @input="(e: Event) => onChange('price', (e.target as HTMLInputElement).value)"
+                        />
+                    </div>
                     <ul class="flex flex-col gap-3">
                         <li class="flex items-end gap-2" v-for="(filler, idx) in product.product_fillers">
                             <input type="hidden" name="fillers" :value="filler.id">
@@ -122,7 +157,8 @@ import { useValidation } from '~/composables/useValidation';
 import type { Filler, FillerValue } from '~/types/filler';
 import type { Product } from '~/types/product';
 import { type User, UserRole } from '~/types/user';
-import { required, type Schema } from '~/utils/validation';
+import { confirmFillerDelete } from '~/components/company/fillerDelete';
+import { optional, required, type Schema, validPattern } from '~/utils/validation';
 
 definePageMeta({
     authRoute: true,
@@ -150,7 +186,19 @@ const { runWithId, isLoadingMap } = useAsync();
 
 const schema: Schema<string> = {
     name: [required('Обязательное поле')],
+    // "12 500,50" or 12500.5: a number with at most 2 decimals
+    price: [optional(validPattern(/^\d[\d\s]*([.,]\d{1,2})?$/, 'Число, не больше 2 знаков после запятой'))],
 };
+
+// the price as typed; the API gets a number (or null: no price)
+const priceText = ref('');
+watch(() => product.value.price, (price) => {
+    priceText.value = price === null || price === undefined ? '' : String(price);
+}, { immediate: true });
+function priceValue(): number | null {
+    const text = priceText.value.replace(/\s/g, '').replace(',', '.');
+    return text === '' ? null : Number(text);
+}
 
 const {onChange, validate, errors} = useValidation(schema);
 
@@ -203,6 +251,8 @@ async function onFillerDelete(e: Event) {
         return;
     }
 
+    // deleting a field deletes its value in every product: say how many, and ask
+    if (!(await confirmFillerDelete(fillersService, id))) return;
     const result = await promiseResult(runWithId(fillersService.remove(id).exec(), actionId));
     if (!result.ok) return toast.show({ message: result.error.message, type: 'error', timeout: 3000 });
     fillers.value.product = fillers.value.product.filter((f) => f.id !== id);
@@ -228,12 +278,17 @@ async function onSubmit(e: Event) {
         fieldsMap[tempId] = value;
     }
 
-    const validationResult = validate({name, ...fieldsMap});
+    const validationResult = validate({name, price: priceText.value, ...fieldsMap});
     if (!validationResult.valid) return;
 
+    const catalogue = {
+        sku: (product.value.sku ?? '').trim() || null,
+        unit: (product.value.unit ?? '').trim() || null,
+        price: priceValue(),
+    };
     let promise;
-    if (id) promise = productService.patch(id, { name, fillers, fillers_create: fillersCreate }).exec();
-    else promise = productService.create({ name, fillers: fillersCreate }).exec();
+    if (id) promise = productService.patch(id, { name, ...catalogue, fillers, fillers_create: fillersCreate }).exec();
+    else promise = productService.create({ name, ...catalogue, fillers: fillersCreate }).exec();
 
     const result = await promiseResult(runWithId(promise, 'save'));
     if (!result.ok) return toast.show({ message: result.error.message, type: 'error', timeout: 3000 });
@@ -241,6 +296,8 @@ async function onSubmit(e: Event) {
 }
 
 async function onDelete() {
+    // one click used to delete the product
+    if (!confirm(`Удалить товар «${product.value.name}»? Он пропадёт из каталога и из выбора товара в сделках.`)) return;
     const result = await promiseResult(runWithId(productService.remove(product.value.id).exec(), 'delete'));
     if (!result.ok) return toast.show({ message: result.error.message, type: 'error', timeout: 3000 });
     navigateTo('/lists/products');

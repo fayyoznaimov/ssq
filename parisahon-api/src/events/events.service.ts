@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { In } from 'typeorm';
 import { AuthUser } from '../auth/auth.guard';
+import { Access } from '../auth/access';
 import { RoleEnum } from '../user/user.entity';
 import { WhichFiles } from '../trigger/dto/assign.trigger.dto';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -26,6 +27,7 @@ import { Group } from '../group/group.entity';
 import { User } from '../user/user.entity';
 import { EventBuilder } from './event.builder';
 import { EventWrapper } from './event.wrapper';
+import { EventListener } from './listeners/event.listener';
 import { Task } from '../task/task.entity';
 import {
   ChatTypes,
@@ -37,6 +39,28 @@ import { RemapEventDto } from './dto/remap.event.dto';
 import { Email } from '../email/email.entity';
 import { Company } from '../company/company.entity';
 import { COMPANY_DEALS_SQL } from '../deal/client-history.service';
+
+/**
+ * The people of a feed row: who did it and to whom, by name. Not the whole account (an agent
+ * reading a deal feed got the rights, goals and Telegram id of every colleague in it), and also a
+ * deleted employee or contact: the feed shows them as deleted instead of "—" (AUDIT-7).
+ */
+const FEED_PERSON = ['id', 'username', 'avatar', 'role', 'deleted_at'];
+
+/** What a task change shows in the history; nothing of it changed: no "Задача изменена" event. */
+const TASK_FIELDS = (data: any) =>
+  JSON.stringify([
+    data?.label ?? null,
+    data?.start_time ? new Date(data.start_time).getTime() : null,
+    data?.end_time ? new Date(data.end_time).getTime() : null,
+    !!data?.allDay,
+    data?.type?.id ?? null,
+    data?.agent?.id ?? null,
+    data?.group?.id ?? null,
+    data?.deal?.id ?? null,
+    data?.company?.id ?? null,
+    data?.ctr_agent?.id ?? null,
+  ]);
 
 @Injectable()
 export class EventsService {
@@ -60,60 +84,128 @@ export class EventsService {
       .createQueryBuilder('t0')
       .where('t0.deal_id = :deal_id', { deal_id });
 
-    const page = await this.applyEventFilters(query, qb);
-    if (!canReadMail) {
-      // the "mail" switch of the user card is off: an e-mail stays in the history, its text does not
-      for (const event of page.data ?? []) {
-        if (event.type === EventTypes.NEW_EMAIL) {
-          event.after_state = { hidden: true, reason: 'no_mail_access' };
-          event.before_state = null;
-        }
-      }
+    return EventsService.hideMail(await this.applyEventFilters(query, qb), canReadMail);
+  }
+
+  /**
+   * The "mail" switch of the user card is off: an e-mail stays in the feed (when, which way),
+   * its subject, addresses, text and files do not. The shape of a letter stays (empty), the web
+   * client of before this change reads its fields.
+   */
+  static hideMail<T extends { data?: Event[] }>(page: T, canReadMail: boolean): T {
+    if (canReadMail) return page;
+    for (const event of page.data ?? []) {
+      if (event.type !== EventTypes.NEW_EMAIL) continue;
+      const mail = event.after_state?.data ?? {};
+      event.after_state = {
+        hidden: true,
+        reason: 'no_mail_access',
+        data: {
+          id: mail.id ?? null,
+          outgoing: mail.outgoing ?? event.outgoing,
+          sent_at: mail.sent_at ?? event.created_at,
+          subject: '',
+          from: '',
+          to: [],
+          cc: [],
+          body: '',
+          files: [],
+        },
+      };
+      event.before_state = null;
     }
     return page;
   }
 
+  /** Deals of the alias `d` the user may see (no `access`: every deal, as for internal callers). */
+  private static visibleDeals(access?: Access): { sql: string; params: Record<string, any> } {
+    return access ? access.dealSql('d', 'view') : { sql: 'TRUE', params: {} };
+  }
+
   /**
-   * The feed of a company: everything that happened in all of its deals
-   * (not only the field changes of the first deal, as before). A company
-   * without deals has an empty feed, not a 404.
+   * The feed of a company: everything that happened in all of its deals the user may see (an agent
+   * with "own deals" read the chats, letters and comments of colleagues' deals here, ACL-4), and the
+   * tasks of the company itself (no deal). A company without deals has an empty feed, not a 404.
    */
   async fetchCompanyEvents(
     company_id: number,
     query: SearchEventDto,
+    access?: Access,
   ): Promise<PaginationResponseDto<Event[]>> {
     await this.helperService.getById(Company, company_id);
 
+    const deals = EventsService.visibleDeals(access);
     const qb = this.eventRepository
       .createQueryBuilder('t0')
       .where(
-        `t0.deal_id IN (SELECT d.id FROM deal d WHERE d.deleted_at IS NULL AND ${COMPANY_DEALS_SQL})`,
-        { company_id },
+        `(t0.deal_id IN (SELECT d.id FROM deal d WHERE d.deleted_at IS NULL AND ${COMPANY_DEALS_SQL} AND ${deals.sql})
+          OR (t0.deal_id IS NULL AND t0.task_id IN (SELECT ct.id FROM task ct WHERE ct.company_id = :company_id)))`,
+        { company_id, ...deals.params },
       );
 
-    return this.applyEventFilters(query, qb);
+    const page = await this.applyEventFilters(query, qb, { withDeal: true });
+    return EventsService.hideMail(page, access ? access.canReadMail : true);
   }
 
+  /**
+   * The card of a contact: what they wrote and got, everything in their deals the user may see, and
+   * the tasks of the contact (no deal). The card of an employee: their own history (admin and
+   * manager: anyone's), as GET /users/:id/events always was.
+   */
   async fetchUserEvents(
     user_id: number,
     query: SearchEventDto,
+    access?: Access,
   ): Promise<PaginationResponseDto<Event[]>> {
+    await this.assertUserFeedAccess(user_id, access);
+
+    const deals = EventsService.visibleDeals(access);
     const qb = this.eventRepository
       .createQueryBuilder('t0')
-      // a contact's card: what they wrote / got, and everything in their deals
       .where(
-        `(t0.user_id = :user_id OR t0.target_user_id = :user_id OR t0.deal_id IN (
-          SELECT du."dealId" FROM deal_user du JOIN deal d ON d.id = du."dealId"
-          WHERE du."userId" = :user_id AND d.deleted_at IS NULL))`,
+        `(t0.user_id = :user_id OR t0.target_user_id = :user_id
+          OR t0.deal_id IN (SELECT du."dealId" FROM deal_user du WHERE du."userId" = :user_id)
+          OR (t0.deal_id IS NULL AND t0.task_id IN (SELECT ut.id FROM task ut WHERE ut.ctr_agent_id = :user_id)))`,
         { user_id },
+      )
+      // a deal in the trash or out of the user's scope: not its events either
+      .andWhere(
+        `(t0.deal_id IS NULL OR t0.deal_id IN (SELECT d.id FROM deal d WHERE d.deleted_at IS NULL AND ${deals.sql}))`,
+        deals.params,
       );
 
-    return this.applyEventFilters(query, qb);
+    const page = await this.applyEventFilters(query, qb, { withDeal: true });
+    return EventsService.hideMail(page, access ? access.canReadMail : true);
+  }
+
+  /**
+   * GET /users/:id/events and /deals: a contact by the contact rules (RecordAccess('contact') on
+   * the route), a staff account only by themselves or admin / manager (a colleague's history).
+   */
+  async assertUserFeedAccess(user_id: number, access?: Access): Promise<void> {
+    if (!access || access.isManager || user_id === access.id) return;
+    const row = (await this.eventRepository.query(`SELECT role FROM "user" WHERE id = $1`, [user_id]))[0];
+    if (row && row.role !== RoleEnum.CTR_AGENT) {
+      throw new ForbiddenException('Only your own data');
+    }
+  }
+
+  /** sort absent, or newest first by id / created_at: the order of a feed. */
+  private static isNewestFirst(sort: unknown): boolean {
+    if (sort === undefined || sort === null) return true;
+    if (typeof sort !== 'object' || Array.isArray(sort)) return false;
+    const keys = Object.keys(sort);
+    return keys.every(
+      (key) =>
+        (key === 'id' || key === 'created_at') &&
+        ['-1', 'desc'].includes(String((sort as Record<string, unknown>)[key]).trim().toLowerCase()),
+    );
   }
 
   async applyEventFilters(
     query: SearchEventDto,
     qb: SelectQueryBuilder<Event>,
+    options: { withDeal?: boolean } = {},
   ): Promise<PaginationResponseDto<Event[]>> {
     const eventTypesToExclude = [];
 
@@ -156,6 +248,10 @@ export class EventsService {
 
     if (query.exclude_event_types && query.exclude_event_types.length > 0) {
       eventTypesToExclude.push(...query.exclude_event_types);
+      // the filter «Новая задача» of the deal page: the changes of tasks are tasks too
+      if (query.exclude_event_types.map(Number).includes(EventTypes.NEW_TASK)) {
+        eventTypesToExclude.push(EventTypes.NEW_TASK_UPDATE);
+      }
     }
 
     if (eventTypesToExclude.length > 0) {
@@ -164,42 +260,74 @@ export class EventsService {
       });
     }
 
-    return this.helperService.withPagination(
-      this.helperService.withRelations(qb, [
-        'originated_by',
-        'target_user',
-        'target_group',
-      ]),
-      query,
-    );
+    // withDeleted: the joined author / addressee / group may be deleted since (the event has no deleted_at)
+    qb = qb
+      .withDeleted()
+      .leftJoin('t0.originated_by', 'ev_by')
+      .addSelect(FEED_PERSON.map((column) => `ev_by.${column}`))
+      .leftJoin('t0.target_user', 'ev_to')
+      .addSelect(FEED_PERSON.map((column) => `ev_to.${column}`))
+      .leftJoin('t0.target_group', 'ev_group')
+      .addSelect(['ev_group.id', 'ev_group.name']);
+
+    // a company's or a contact's feed spans several deals: which one an event is of
+    if (options.withDeal) {
+      qb = qb
+        .leftJoin('t0.deal', 'ev_deal')
+        .addSelect(['ev_deal.id', 'ev_deal.label', 'ev_deal.display_id']);
+    }
+
+    // newest first by the time of the event (a call synced later, a letter fetched later stand
+    // where they happened), the id among events of the same moment; pages do not overlap
+    const newestFirst = EventsService.isNewestFirst(query.sort);
+    if (newestFirst) {
+      qb = qb.orderBy('t0.created_at', 'DESC').addOrderBy('t0.id', 'DESC');
+    }
+
+    return this.helperService.withPagination(qb, query, 't0', null, false, newestFirst);
   }
 
-  async updateTaskEvent(saved_task: Task): Promise<void> {
-    const event = await this.eventRepository.findOneBy({
-      type: EventTypes.NEW_TASK,
-      task: { id: saved_task.id },
+  /**
+   * PATCH /tasks/:id: the change is a new history entry ("Задача изменена": who, the version
+   * before and after). The entry of the task's creation stays as it was written (AUDIT-12: the edit
+   * used to overwrite it, the author of the change was lost and the older versions too).
+   */
+  async updateTaskEvent(saved_task: Task, editorId?: number): Promise<void> {
+    const previous = await this.eventRepository.findOne({
+      where: [
+        { type: EventTypes.NEW_TASK_UPDATE, task: { id: saved_task.id } },
+        { type: EventTypes.NEW_TASK, task: { id: saved_task.id } },
+      ],
+      order: { id: 'DESC' },
     });
 
-    if (!event) {
+    const after = EventListener.taskState(saved_task);
+    const before = previous?.after_state ?? null;
+    if (before && TASK_FIELDS(before.data) === TASK_FIELDS(after.data)) {
       return;
     }
 
-    event.before_state = event.after_state;
-    event.after_state = EventWrapper.fromEntity(saved_task);
+    const event = EventBuilder.fromType(EventTypes.NEW_TASK_UPDATE)
+      .originatedBy(editorId ? ({ id: editorId } as User) : null)
+      .addTask(saved_task)
+      .linkToDeal(saved_task.deal ?? null)
+      .addBeforeState(before)
+      .addAfterState(after);
+    if (saved_task.group) event.addTargetGroup(saved_task.group);
+    else if (saved_task.agent) event.addTargetUser(saved_task.agent);
 
     await this.eventRepository.save(event);
   }
 
   /**
-   * Remaps event to different deal.
-   * Only works with events of type EventTypes.NEW_EMAIL and EventTypes.NEW_TELEGRAM_MESSAGE.
-   */
-  /**
-   * Moves an email or a Telegram message (with its files) from one deal to another,
+   * Moves an email or a Telegram / WhatsApp message (with its files) from one deal to another,
    * e.g. a message that the inbox put into the contact's latest deal but belongs to an
-   * older one. Allowed when the user may edit both deals (the "update" deal permission:
-   * admin and a user with "all" every deal, "responsible" only their own deals; without
-   * stored permissions a manager every deal, an agent their own).
+   * older one. Allowed when the user may edit both deals (the "update" deal right of the API,
+   * src/auth/access.ts: admin and manager every deal; an agent by the levels of the user card,
+   * their own deals when none is stored).
+   *
+   * Not silently (AUDIT-12): the deal it leaves gets an EVENT_MOVED entry (what, where to, who),
+   * and the message keeps where it came from (after_state.moved).
    */
   async remapEventToDifferentDeal(data: RemapEventDto, user?: AuthUser): Promise<void> {
     const event = await this.helperService.getById(Event, data.event_id, ['deal']);
@@ -253,7 +381,11 @@ export class EventsService {
         });
 
         const savedEmail = await this.emailRepository.save(email);
+        const moved = event.after_state?.moved;
         event.after_state = EventWrapper.fromEntity(savedEmail);
+        // the deals of the files are links, not a part of the letter in the history
+        for (const file of event.after_state?.data?.files ?? []) delete file.deals;
+        if (moved) event.after_state.moved = moved;
       }
     }
 
@@ -276,18 +408,33 @@ export class EventsService {
       }
     }
 
+    const at = new Date();
+    const by = user ? { id: user.sub, username: user.username ?? null } : null;
+    const dealRef = (deal: Deal) => (deal ? { id: deal.id, label: deal.label ?? null, display_id: deal.display_id ?? null } : null);
+    event.after_state = {
+      ...(event.after_state ?? {}),
+      moved: [...(event.after_state?.moved ?? []), { from_deal: dealRef(oldDeal), to_deal: dealRef(targetDeal), by, at }],
+    };
+
     await this.eventRepository.save(event);
+
+    if (oldDeal) {
+      await this.eventRepository.save(
+        EventBuilder.fromType(EventTypes.EVENT_MOVED)
+          .originatedBy(user ? ({ id: user.sub } as User) : null)
+          .linkToDeal(oldDeal)
+          .addCreatedAt(at)
+          .addAfterState(
+            // what and where to, not the content: the old deal may be read by someone without mail
+            EventWrapper.fromEntity({ event_id: event.id, type: event.type, to_deal: dealRef(targetDeal) }),
+          ),
+      );
+    }
   }
 
+  /** The "update" deal right of the API (src/auth/access.ts): admin and manager every deal, an agent by the card. */
   private canEditDeal(user: AuthUser, deal: Deal): boolean {
-    if (user.role === RoleEnum.ADMIN) return true;
-    const level = (user.permissions as any)?.deal?.update;
-    const own = deal.agent?.id === user.sub;
-    if (typeof level !== 'number') return user.role === RoleEnum.MANAGER || own;
-    if (level === 3) return true; // allowed
-    if (level === 2) return own || (user.group_id != null && deal.agent?.group?.id === user.group_id);
-    if (level === 1) return own; // responsible
-    return false;
+    return new Access(user).allowsDeal('update', deal.agent?.id ?? null, deal.agent?.group?.id ?? null);
   }
 
   async markAsReplied(event_id: number, deal_id?: number): Promise<void> {
@@ -333,6 +480,10 @@ export class EventsService {
     );
   }
 
+  /**
+   * An edited comment says so (after_state.data.edited_at) and keeps every earlier text
+   * (before_state.data.versions), not only the last one (AUDIT-12).
+   */
   async updateComment(
     deal_id: number,
     event_id: number,
@@ -363,10 +514,16 @@ export class EventsService {
       );
     }
 
-    commentEvent.before_state = commentEvent.after_state;
+    const previous = commentEvent.after_state?.data ?? {};
+    const versions = [
+      ...((commentEvent.before_state?.data?.versions as any[]) ?? []),
+      { comment: previous.comment ?? '', at: previous.edited_at ?? commentEvent.created_at },
+    ];
+    commentEvent.before_state = EventWrapper.fromEntity({ ...previous, versions });
     commentEvent.after_state = EventWrapper.fromEntity({
       comment: data.comment,
-      files: [...commentEvent.after_state.data.files, ...files],
+      files: [...(previous.files ?? []), ...files],
+      edited_at: new Date(),
     });
 
     await this.eventRepository.save(commentEvent);

@@ -4,7 +4,12 @@
 // number then come into the deals (parisahon-whatsapp-service → POST /whatsapp/incoming).
 import { renderSVG } from 'uqr';
 
-type State = { status: 'none' | 'starting' | 'qr' | 'code' | 'connected' | 'logged_out'; qr?: string; code?: string; phone?: string; name?: string; passkey?: boolean };
+// linked + since + reconnects: a linked number that lost the connection and reconnects by itself
+type State = {
+    status: 'none' | 'starting' | 'qr' | 'code' | 'connected' | 'logged_out';
+    qr?: string; code?: string; phone?: string; name?: string; passkey?: boolean;
+    linked?: boolean; since?: string; reconnects?: number; error?: string;
+};
 
 const service = useService('whatsapp', { auth: true });
 const state = ref<State | null>(null);
@@ -15,9 +20,23 @@ const me = useState<any>('user');
 const byPhone = ref(false);
 const profilePhone = computed(() => (me.value?.phone ?? '').trim());
 const phone = ref<string>(me.value?.phone ?? '');
+// a QR / code was shown: 'starting' after it means the phone linked the device; 'none' means it expired
+const waitedForPhone = ref(false);
+const expired = ref(false);
 let timer: ReturnType<typeof setInterval> | undefined;
 
 const qrSvg = computed(() => (state.value?.status === 'qr' && state.value.qr ? renderSVG(state.value.qr, { border: 2 }) : ''));
+const reconnecting = computed(() => state.value?.status === 'starting' && Boolean(state.value.linked));
+const sinceText = computed(() => {
+    const since = state.value?.since ? new Date(state.value.since) : null;
+    if (!since || Number.isNaN(since.getTime())) return '';
+    return since.toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+});
+// reconnecting for 10 minutes and more: the manager is told it does not work
+const longDown = computed(() => {
+    const since = state.value?.since ? new Date(state.value.since).getTime() : NaN;
+    return reconnecting.value && Number.isFinite(since) && Date.now() - since >= 10 * 60 * 1000;
+});
 
 function message(e: any) {
     return e?.data?.message || e?.message || 'WhatsApp-сервис недоступен';
@@ -25,16 +44,22 @@ function message(e: any) {
 
 async function load() {
     try {
+        const previous = state.value?.status;
         state.value = await service.get<State>('status').exec();
         error.value = '';
+        const now = state.value?.status;
+        if (now === 'qr' || now === 'code') waitedForPhone.value = true;
+        if ((previous === 'qr' || previous === 'code') && now === 'none') expired.value = true;
+        if (now === 'connected' || now === 'logged_out') waitedForPhone.value = false;
+        if (now && now !== 'none') expired.value = false;
     } catch (e) {
         error.value = message(e);
     } finally {
         loading.value = false;
     }
-    // keep polling while the QR is shown or the session is starting
+    // keep polling while the QR is shown or the session is starting (a reconnecting number: less often)
     const waiting = ['qr', 'code', 'starting'].includes(state.value?.status ?? '');
-    if (waiting && !timer) timer = setInterval(load, 2000);
+    if (waiting && !timer) timer = setInterval(load, reconnecting.value ? 10000 : 2000);
     if (!waiting && timer) {
         clearInterval(timer);
         timer = undefined;
@@ -43,6 +68,7 @@ async function load() {
 
 async function connect(withPhone = false) {
     busy.value = true;
+    expired.value = false;
     try {
         state.value = await service.post<State>('connect', withPhone ? { phone: phone.value } : {}).exec();
         error.value = '';
@@ -55,10 +81,13 @@ async function connect(withPhone = false) {
 }
 
 async function disconnect() {
-    if (state.value?.status === 'connected' && !confirm('Отключить WhatsApp от CRM? Сообщения перестанут приходить в сделки.')) return;
+    const linked = state.value?.status === 'connected' || reconnecting.value;
+    if (linked && !confirm('Отключить WhatsApp от CRM? Устройство отвяжется на телефоне, сообщения перестанут приходить в сделки.')) return;
     busy.value = true;
     try {
         state.value = await service.remove<State>('session').exec();
+        waitedForPhone.value = false;
+        expired.value = false;
     } catch (e) {
         error.value = message(e);
     } finally {
@@ -101,11 +130,29 @@ onUnmounted(() => timer && clearInterval(timer));
                     <BaseButton variant="pastel" :loading="busy" @click="disconnect">Отменить</BaseButton>
                 </div>
             </template>
+            <template v-else-if="reconnecting">
+                <p class="text-sm" :class="longDown ? 'text-red-500' : 'text-amber-600'">
+                    WhatsApp{{ state.phone ? ` ${state.phone}` : '' }} переподключается{{ sinceText ? ` с ${sinceText}` : '' }}{{ state.reconnects ? `, попытка ${state.reconnects}` : '' }}:
+                    пока связи нет, сообщения клиентов в CRM не приходят.
+                </p>
+                <p v-if="state.error" class="text-xs text-gray-500">Причина: {{ state.error }}</p>
+                <div class="flex flex-wrap gap-2">
+                    <BaseButton color="primary" :loading="busy" @click="connect(false)">Переподключить</BaseButton>
+                    <BaseButton color="danger" variant="pastel" :disabled="busy" @click="disconnect">Отключить</BaseButton>
+                </div>
+                <p class="text-xs text-gray-500">Если не помогает: «Отключить», затем подключите заново по QR-коду или номеру.</p>
+            </template>
             <template v-else-if="state.status === 'starting'">
-                <p class="text-sm text-gray-500">Готовим QR-код…</p>
+                <p class="text-sm text-gray-500">{{ waitedForPhone ? 'Телефон привязал устройство, подключаемся…' : 'Готовим QR-код…' }}</p>
+                <div>
+                    <BaseButton variant="pastel" :loading="busy" @click="disconnect">Отменить</BaseButton>
+                </div>
             </template>
             <template v-else>
-                <p v-if="state.status === 'logged_out'" class="text-sm text-amber-600">WhatsApp отключил это устройство. Подключите заново.</p>
+                <p v-if="state.status === 'logged_out'" class="text-sm text-red-500">
+                    WhatsApp{{ state.phone ? ` ${state.phone}` : '' }} отвязан на телефоне{{ sinceText ? ` ${sinceText}` : '' }}: сообщения клиентов не приходят в CRM. Подключите заново.
+                </p>
+                <p v-else-if="expired" class="text-sm text-amber-600">Время на привязку истекло (QR-код или код действует около 2 минут) — нажмите ещё раз.</p>
                 <div class="flex flex-wrap gap-2">
                     <!-- the manager's number from the profile: one click, the code comes at once (like Telegram) -->
                     <!-- on a phone the label takes two lines: the button grows instead of the text spilling out -->

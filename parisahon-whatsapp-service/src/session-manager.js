@@ -4,15 +4,21 @@
 //   qr          waiting for the QR to be scanned (qr = the latest QR string, it rotates)
 //   code        waiting for the pairing code to be entered on the phone (linking by phone number)
 //   connected   linked and online (phone, name)
-//   logged_out  the device was unlinked on the phone (the stored session is deleted)
+//   logged_out  the device was unlinked on the phone (the stored session is deleted); remembered across
+//               restarts (stores.js SessionMarks) until the manager links again or the CRM disconnects it
 // A QR or code not used within QR_TIMEOUT_SEC (WhatsApp itself ends it after ~160 s) stops the
 // session (status none).
+// A linked number that lost the connection is 'starting' with linked: true, since (when it went down),
+// reconnects and error: the CRM shows it, tells the manager when it lasts, and may ask to reconnect at once.
+// Incoming messages are written to the inbox journal before they are handled (stores.js InboxJournal) and
+// handled again after a restart or a crash. Sends carry a request_id: the same id is never sent twice, and a
+// send the CRM stopped waiting for is recorded in the CRM by the service when it is out.
 import { EventEmitter } from 'node:events'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { DisconnectReason, buildAckStanza, downloadMediaMessage, generateMessageIDV2, jidNormalizedUser } from '@whiskeysockets/baileys'
 import { openAuthStore, listStoredSessions, setAsideUnreadable, sessionFile } from './auth-store.js'
-import { buildPayload, chatKind, describeMessage, phoneFromJid, reasonToSkip, resolveChat, timestampSec, userOf } from './message-map.js'
+import { buildPayload, chatKind, describeMessage, isoWithOffset, phoneFromJid, reasonToSkip, resolveChat, timestampSec, userOf } from './message-map.js'
 import { saveMedia, removeFiles, EXT_MIME } from './media.js'
 import { maskPhone, shortId, quietPrePairingAckErrors } from './log.js'
 
@@ -28,6 +34,14 @@ export const SendError = ServiceError
 const RECONNECT_SEC = [2, 5, 10, 30, 60, 120, 300]
 const TERMINAL = new Set([DisconnectReason.loggedOut, DisconnectReason.forbidden, DisconnectReason.multideviceMismatch])
 const PAIRING_REPLY_MS = 8000
+const SEND_KEEP_MS = 15 * 60 * 1000
+
+/** 428 -> 'connectionClosed 428': why a linked number is down, for the CRM. */
+export function disconnectText(code) {
+  if (code === null || code === undefined) return 'error'
+  const name = Object.entries(DisconnectReason).find(([, value]) => value === code)?.[0]
+  return name ? `${name} ${code}` : String(code)
+}
 
 class BoundedSet {
   constructor(max) { this.max = max; this.map = new Map() }
@@ -54,6 +68,10 @@ class Session {
     this.qrTimer = null
     this.reconnectTimer = null
     this.reconnects = 0
+    this.downSince = null // ms: when a linked number lost the connection (null while it works)
+    this.lastError = null
+    this.loggedOutAt = null
+    this.pending = 0 // messages in the queue
     this.sinceSec = 0
     this.ownIds = new BoundedSet(2000)
     this.seen = new BoundedSet(5000)
@@ -99,8 +117,11 @@ export class SessionManager {
    * socketFactory({auth, logger, config}) -> socket (wa-socket.js in production, a fake in tests);
    * download(msg, sock) -> Readable (media; Baileys in production).
    */
-  constructor({ config, key, outbox, logger, baileysLogger, socketFactory, download, photos }) {
+  constructor({ config, key, outbox, logger, baileysLogger, socketFactory, download, photos, marks, journal, sent }) {
     Object.assign(this, { config, key, outbox, logger, baileysLogger: quietPrePairingAckErrors(baileysLogger || logger), socketFactory, photos })
+    // stores.js (optional in tests): numbers unlinked on the phone, the inbox journal, the sent messages
+    Object.assign(this, { marks: marks || null, journal: journal || null, sent: sent || null })
+    this.sends = new Map() // request_id -> a send of POST /send (see startSend)
     this.download = download || ((msg, sock) => downloadMediaMessage(msg, 'stream', {}, {
       logger: this.baileysLogger, reuploadRequest: sock.updateMediaMessage,
     }))
@@ -113,18 +134,62 @@ export class SessionManager {
 
   state(userId) {
     const s = this.sessions.get(userId)
-    if (!s) return { status: 'none' }
+    if (!s) {
+      // unlinked on the phone before a restart: still not working, the manager has to link it again
+      const mark = this.marks?.get(userId)
+      if (mark?.status === 'logged_out') {
+        return { status: 'logged_out', ...(mark.phone ? { phone: mark.phone } : {}), ...(mark.name ? { name: mark.name } : {}), since: mark.at }
+      }
+      return { status: 'none' }
+    }
     const out = { status: s.status }
     if (s.status === 'qr' && s.qr) out.qr = s.qr
     if (s.status === 'code' && s.code) out.code = s.code
     if (s.phone) out.phone = s.phone
     if (s.name) out.name = s.name
     if (s.passkey && s.status !== 'connected') out.passkey = true
+    if (s.status === 'starting' && s.downSince) {
+      out.linked = true
+      out.since = new Date(s.downSince).toISOString()
+      out.reconnects = s.reconnects
+      if (s.lastError) out.error = s.lastError
+    }
+    if (s.status === 'logged_out' && s.loggedOutAt) out.since = new Date(s.loggedOutAt).toISOString()
     return out
   }
 
   list() {
-    return [...this.sessions.values()].map((s) => ({ user_id: s.userId, status: s.status, phone: s.phone || null }))
+    const rows = [...this.sessions.values()].map((s) => {
+      const { qr, code, passkey, status, ...rest } = this.state(s.userId)
+      return { user_id: s.userId, status, phone: s.phone || null, ...rest }
+    })
+    for (const [userId] of this.marks?.entries() || []) {
+      if (!this.sessions.has(userId)) {
+        const { status, ...rest } = this.state(userId)
+        if (status !== 'none') rows.push({ user_id: userId, status, phone: null, ...rest })
+      }
+    }
+    return rows
+  }
+
+  /** GET /health: every number's state; the ones that do not feed the CRM (unlinked, reconnecting) as problems. */
+  health() {
+    const rows = this.list()
+    const states = {}
+    const problems = []
+    for (const row of rows) {
+      states[row.user_id] = row.status
+      if (row.status === 'logged_out' || (row.status === 'starting' && row.linked)) {
+        problems.push({ user_id: row.user_id, status: row.linked ? 'reconnecting' : row.status, since: row.since || null, reconnects: row.reconnects ?? null, error: row.error || null })
+      }
+    }
+    return {
+      sessions: rows.length,
+      connected: rows.filter((r) => r.status === 'connected').length,
+      states,
+      problems,
+      inbox: this.journal?.size ?? 0,
+    }
   }
 
   /** At service start: every stored, linked session is connected again. */
@@ -168,6 +233,13 @@ export class SessionManager {
     let s = this.sessions.get(userId)
     if (s && ['starting', 'qr', 'code', 'connected'].includes(s.status)) {
       const replace = digits && s.store && !s.linked() && s.pairPhone !== digits
+      if (!replace && s.status === 'starting' && s.linked() && !s.sock && s.reconnectTimer) {
+        // a linked number waiting for its next reconnect: «Переподключить» in the CRM tries now
+        clearTimeout(s.reconnectTimer)
+        s.reconnectTimer = null
+        this.logger.info(`user ${userId}: reconnect asked by the CRM`)
+        this.openSocket(s).catch((error) => this.socketFailed(s, error))
+      }
       if (!replace) {
         if (s.status === 'starting') await this.waitForState(s, this.config.startWaitMs)
         return this.state(userId)
@@ -234,6 +306,12 @@ export class SessionManager {
       auth: s.store.state,
       logger: this.baileysLogger.child({ user: s.userId }),
       config: this.config,
+      // a client's phone that could not decrypt a message sent from the CRM asks for it again (WA-15)
+      getMessage: async (key) => {
+        const message = this.sent?.get(key)
+        this.logger.info(`user ${s.userId}: WhatsApp asks to resend message ${shortId(key?.id)}: ${message ? 'found' : 'not kept'}`)
+        return message
+      },
     })
     if (gen !== s.gen || this.sessions.get(s.userId) !== s) {
       try { sock.end(undefined) } catch { /* already closed */ }
@@ -248,11 +326,7 @@ export class SessionManager {
     sock.ev.on('connection.update', (update) => this.onConnection(s, gen, update))
     sock.ev.on('messages.upsert', ({ messages }) => {
       if (gen !== s.gen) return
-      for (const msg of messages || []) {
-        s.queue = s.queue.then(() => this.handleMessage(s, msg)).catch((error) => {
-          this.logger.error({ err: error }, `user ${s.userId}: message ${shortId(msg?.key?.id)} not processed`)
-        })
-      }
+      for (const msg of messages || []) this.enqueue(s, msg)
     })
     const remember = (list) => {
       for (const c of list || []) {
@@ -344,7 +418,10 @@ export class SessionManager {
 
   socketFailed(s, error) {
     this.logger.error({ err: error }, `user ${s.userId}: WhatsApp socket could not be opened`)
-    if (s.linked()) this.scheduleReconnect(s, null)
+    if (s.linked()) {
+      s.lastError = String(error?.message || 'socket error').slice(0, 200)
+      this.scheduleReconnect(s, null)
+    }
     else this.abandon(s, 'socket failed').catch(() => {})
   }
 
@@ -380,6 +457,9 @@ export class SessionManager {
       s.pairPhone = null
       s.passkey = false
       s.reconnects = 0
+      s.downSince = null
+      s.lastError = null
+      s.loggedOutAt = null
       const me = s.store.state.creds.me || s.sock?.user || {}
       s.phone = phoneFromJid(me.id) || s.phone
       const name = me.name && me.name !== '~' ? me.name : me.notify || me.verifiedName || s.sock?.user?.name
@@ -389,7 +469,12 @@ export class SessionManager {
       }
       s.sinceSec = s.store.meta.linked_at
       this.logger.info(`user ${s.userId}: WhatsApp connected ${maskPhone(s.phone)}`)
+      this.marks?.clear(s.userId)
       s.setStatus('connected')
+      // messages WhatsApp handed over before a restart or a crash and the CRM has not got yet
+      const old = this.journal?.takeOld(s.userId) || []
+      if (old.length) this.logger.info(`user ${s.userId}: ${old.length} message(s) of the last run handled again`)
+      for (const msg of old) this.enqueue(s, msg, true)
     }
     if (connection === 'close') {
       if (s.closing || this.stopping) return
@@ -401,6 +486,10 @@ export class SessionManager {
         clearTimeout(s.reconnectTimer)
         this.removeStore(s)
         s.qr = null
+        s.downSince = null
+        s.loggedOutAt = Date.now()
+        // remembered across restarts: the number has to be linked again (WA-1)
+        this.marks?.set(s.userId, { status: 'logged_out', phone: s.phone || null, name: s.name || null, at: new Date(s.loggedOutAt).toISOString() })
         s.setStatus('logged_out')
         return
       }
@@ -431,6 +520,9 @@ export class SessionManager {
     // 440: the same session was opened elsewhere; do not fight over it every few seconds
     const pause = code === DisconnectReason.connectionReplaced ? Math.max(base, 60) : base
     s.reconnects += 1
+    if (!s.downSince) s.downSince = Date.now()
+    if (code !== null && code !== undefined) s.lastError = disconnectText(code)
+    else if (!s.lastError) s.lastError = 'error'
     this.logger.warn(`user ${s.userId}: WhatsApp connection closed (${code ?? 'error'}), reconnect in ${pause}s`)
     s.setStatus('starting')
     s.reconnectTimer = setTimeout(() => {
@@ -479,8 +571,19 @@ export class SessionManager {
     }
     await this.removals.get(userId)
     await fs.rm(sessionFile(this.config.sessionsDir, userId), { force: true })
+    // disconnected in the CRM: nobody waits for this number any more
+    await this.marks?.clear(userId)
+    await this.journal?.forgetUser(userId)
     if (s) this.logger.info(`user ${userId}: WhatsApp session deleted`)
     return { status: 'none' }
+  }
+
+  /** Before the process stops: the messages in hand are handled (at most `ms`); the rest stay in the journal. */
+  async drain(ms) {
+    const queues = [...this.sessions.values()].filter((s) => s.pending > 0).map((s) => s.queue)
+    if (!queues.length) return
+    this.logger.info(`waiting up to ${Math.round(ms / 1000)}s for ${queues.length} message queue(s)`)
+    await withTimeout(Promise.all(queues), ms)
   }
 
   async stopAll() {
@@ -495,6 +598,28 @@ export class SessionManager {
   }
 
   // ---------------------------------------------------------------- incoming
+
+  /**
+   * Into the session's queue (one message at a time, in order). A message for the CRM is written to the
+   * inbox journal first and removed when it is handed over (to the API, its outbox or the rejected list):
+   * WhatsApp does not deliver it again, so a restart in between must not lose it (WA-9).
+   */
+  enqueue(s, msg, fromJournal = false) {
+    const journaled = Boolean(this.journal) && (fromJournal ||
+      !reasonToSkip(msg, { sinceSec: s.sinceSec, ownIds: s.ownIds, selfUsers: s.selfUsers() }))
+    if (journaled && !fromJournal) this.journal.add(s.userId, msg)
+    s.pending += 1
+    s.queue = s.queue
+      .then(() => this.handleMessage(s, msg))
+      .catch((error) => {
+        this.logger.error({ err: error }, `user ${s.userId}: message ${shortId(msg?.key?.id)} not processed`)
+      })
+      .finally(() => {
+        s.pending -= 1
+        if (journaled) return this.journal.done(s.userId, msg)
+        return undefined
+      })
+  }
 
   async handleMessage(s, msg) {
     const reason = reasonToSkip(msg, { sinceSec: s.sinceSec, ownIds: s.ownIds, selfUsers: s.selfUsers() })
@@ -562,8 +687,73 @@ export class SessionManager {
 
   // ---------------------------------------------------------------- outgoing
 
-  /** POST /send. Returns { message_ids } or throws SendError. */
-  async send({ userId, toPhone, toWaId, text, files }) {
+  /**
+   * POST /send with a request_id: the same id again is not sent a second time (the first send's answer, or
+   * the same send while it is still going). abandonSend(entry) = the CRM stopped waiting: when the send is
+   * out, it is recorded in the CRM by the service itself (with the deal it was written from).
+   * Returns { entry, repeated }: entry.promise settles with the answer of send().
+   */
+  startSend(args) {
+    const id = String(args.requestId || '').slice(0, 64)
+    const now = Date.now()
+    for (const [key, old] of this.sends) if (old.done && now - old.at > SEND_KEEP_MS) this.sends.delete(key)
+    let known = id ? this.sends.get(id) : null
+    // a send that failed before anything went out is tried again (e.g. after the number was reconnected)
+    if (known?.done && known.error && !known.error?.extra?.message_ids?.length) {
+      this.sends.delete(id)
+      known = null
+    }
+    if (known && Number(known.args.userId) === Number(args.userId)) return { entry: known, repeated: true }
+    const entry = { at: now, args, ctx: {}, done: false, abandoned: false, recorded: false, result: null, error: null }
+    entry.promise = this.send(args, entry.ctx).then(
+      (result) => { entry.result = result; return result },
+      (error) => { entry.error = error; throw error },
+    ).finally(() => {
+      entry.done = true
+      entry.at = Date.now()
+      if (entry.abandoned) this.recordLate(entry).catch(() => {})
+    })
+    entry.promise.catch(() => {})
+    if (id) this.sends.set(id, entry)
+    return { entry, repeated: false }
+  }
+
+  abandonSend(entry) {
+    if (entry.abandoned) return
+    entry.abandoned = true
+    if (entry.done) this.recordLate(entry).catch(() => {})
+  }
+
+  /** A send the CRM stopped waiting for: what went out is posted to the CRM like a message written on the phone. */
+  async recordLate(entry) {
+    if (entry.recorded) return
+    const ids = entry.result?.message_ids || entry.error?.extra?.message_ids || []
+    const jid = entry.ctx.jid
+    if (!ids.length || !jid) return
+    entry.recorded = true
+    const a = entry.args
+    const files = (Array.isArray(a.files) ? a.files : []).slice(0, ids.length)
+    const textSent = ids.length > files.length && String(a.text || '').trim() !== ''
+    const s = this.sessions.get(a.userId)
+    const dealId = Number(a.dealId)
+    const chatId = jidNormalizedUser(jid)
+    const payload = {
+      agent_id: Number(a.userId),
+      agent_phone: s?.phone || null,
+      chat: { wa_id: chatId, phone: phoneFromJid(chatId) || entry.ctx.phone || null, name: null, photo: null },
+      wa_message_id: ids[ids.length - 1],
+      text: textSent ? String(a.text) : '',
+      outgoing: true,
+      date: isoWithOffset(Math.floor(Date.now() / 1000)),
+      files: files.map((f) => ({ name: String(f.name || f.path), path: String(f.path), type: String(f.type || 'document'), caption: null })),
+      ...(Number.isInteger(dealId) && dealId > 0 ? { deal_id: dealId } : {}),
+    }
+    const result = await this.outbox.deliver(payload)
+    this.logger.info(`user ${a.userId}: late send ${shortId(payload.wa_message_id)} recorded in the CRM: ${result ? result.status || 'ok' : 'queued'}`)
+  }
+
+  /** POST /send. Returns { message_ids } or throws SendError. `ctx.jid` = the chat it went to. */
+  async send({ userId, toPhone, toWaId, text, files }, ctx = {}) {
     const s = this.sessions.get(userId)
     if (!s || s.status !== 'connected' || !s.sock) {
       throw new ServiceError(400, 'not connected', 'Ваш WhatsApp не подключён (Профиль → WhatsApp)')
@@ -590,7 +780,10 @@ export class SessionManager {
 
     let jid
     const digits = String(toPhone || '').replace(/\D/g, '')
-    if (digits) {
+    if (toWaId && chatKind(String(toWaId)) === 'user') {
+      // the chat WhatsApp already knows (the client wrote from it): no number check, no wrong number in the card
+      jid = jidNormalizedUser(String(toWaId))
+    } else if (digits) {
       if (digits.length < 7 || digits.length > 15) throw new ServiceError(400, 'bad phone', 'Неверный номер телефона')
       let found
       try {
@@ -606,6 +799,8 @@ export class SessionManager {
     } else {
       throw new ServiceError(400, 'no recipient', 'Не указан получатель')
     }
+    ctx.jid = jid
+    if (digits) ctx.phone = `+${digits}`
 
     const ids = []
     const sendOne = async (content) => {
@@ -615,6 +810,7 @@ export class SessionManager {
       const id = sent?.key?.id || messageId
       s.ownIds.add(id)
       ids.push(id)
+      if (sent?.message) this.sent?.remember(id, sent.message)
     }
     try {
       for (const f of prepared) await sendOne(mediaContent(f))

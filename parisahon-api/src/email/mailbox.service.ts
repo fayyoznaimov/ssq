@@ -4,8 +4,9 @@ import {
   Injectable,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { AuthGuard } from '../auth/auth.guard';
+import { DataSource, Repository } from 'typeorm';
+import { Access } from '../auth/access';
+import { AuthGuard, AuthUser } from '../auth/auth.guard';
 import { PaginationResponseDto } from '../helper/dto/pagination.dto';
 import { HelperService } from '../helper/helper.service';
 import { LoggerService } from '../helper/logger.service';
@@ -16,11 +17,33 @@ import { Email } from './email.entity';
 import { EmailTo } from './email_to.entity';
 import { EmailTransporter } from './email.transporter.entity';
 import { MailConnectionService } from './mail-connection.service';
+import { addressesIn } from './mail-text';
+
+/** A deal whose history a letter is in, as the mail list shows it. */
+export interface LetterDeal {
+  id: number;
+  label: string;
+  display_id: number;
+  stage: string | null;
+  stage_color: string | null;
+  closed: boolean;
+}
+
+/** Who a letter is with: the contact and / or the company of the sender (received) or the recipients (sent). */
+export interface LetterClient {
+  contact: { id: number; username: string } | null;
+  company: { id: number; name: string } | null;
+}
+
+/** NEW_EMAIL entries of the letter `t0` in deals that are not in the trash (SQL, for EXISTS). */
+const IN_DEALS = `SELECT 1 FROM event eh JOIN deal dh ON dh.id = eh.deal_id AND dh.deleted_at IS NULL
+  WHERE eh.type = 9 AND (eh.after_state -> 'data') ->> 'id' = t0.id::text`;
 
 /**
  * The stored emails as the staff work with them: list, open (marks read),
- * spam, delete. Admin and manager see every email, an agent only the emails
- * of their own mailboxes.
+ * spam, delete. Admin and manager see every email, an agent the emails of their own
+ * mailboxes (their address, a mailbox the mail server accepted the password of), the replies
+ * to letters they sent and the letters of the deals they are responsible for.
  */
 @Injectable()
 export class MailboxService {
@@ -31,6 +54,7 @@ export class MailboxService {
     private emailToRepository: Repository<EmailTo>,
     @InjectRepository(EmailTransporter)
     private emailTransporterRepository: Repository<EmailTransporter>,
+    private dataSource: DataSource,
     private connection: MailConnectionService,
     private helperService: HelperService,
     private loggerService: LoggerService,
@@ -39,9 +63,10 @@ export class MailboxService {
   async fetchLocalEmails(
     query: SearchEmailDto,
     user: User = null,
+    authUser: AuthUser = null,
   ): Promise<PaginationResponseDto<Email[]>> {
     const qb = this.emailRepository.createQueryBuilder('t0');
-    const relations = ['to', 'cc'];
+    const relations = ['to', 'cc', 'from_user'];
 
     // An agent sees only the emails of their own mailboxes; admin and manager see all.
     if (user && user.role == RoleEnum.AGENT) {
@@ -49,7 +74,9 @@ export class MailboxService {
       qb.leftJoin('t0.to', 't4')
         .leftJoin('t0.cc', 't5')
         .andWhere(
-          '(t0.sent_by_id = :user_id OR LOWER(t0.from) IN (:...own) OR t4.value ~* :own_re OR t5.value ~* :own_re)',
+          `(t0.sent_by_id = :user_id OR LOWER(t0.from) IN (:...own) OR t4.value ~* :own_re OR t5.value ~* :own_re
+            OR t0.in_reply_to IN (SELECT o.message_id FROM email o WHERE o.sent_by_id = :user_id AND o.message_id IS NOT NULL)
+            OR EXISTS (${IN_DEALS} AND dh.agent_id = :user_id))`,
           {
             user_id: user.id,
             // IN () is a syntax error; the pattern never matches an empty list
@@ -59,8 +86,8 @@ export class MailboxService {
         );
     }
 
-    if (user && user.role == RoleEnum.ADMIN && query.email_to) {
-      qb.leftJoin('t0.to', 't4').andWhere('t4.value = :email_to', {
+    if (user && AuthGuard.MANAGER_LEVEL.includes(user.role) && query.email_to) {
+      qb.leftJoin('t0.to', 't6').andWhere('t6.value = :email_to', {
         email_to: query.email_to,
       });
     }
@@ -75,37 +102,35 @@ export class MailboxService {
       });
     }
 
-    if (query.is_spam) {
-      qb.andWhere('t0.is_spam = :is_spam', { is_spam: query.is_spam });
+    if (query.deleted?.toLowerCase() === 'true') {
+      // «Удалённые»: what was deleted in the CRM or lies in the Trash mailbox
+      qb.withDeleted().andWhere('t0.deleted_at IS NOT NULL');
+    } else if (query.is_spam?.toLowerCase() === 'true') {
+      qb.andWhere('t0.is_spam = true');
     } else {
       qb.andWhere('t0.is_spam = false');
     }
 
-    if (query.deal_label || query.with_deal || query.stages) {
-      qb.leftJoinAndSelect('t0.from_user', 't1');
-      qb.leftJoinAndSelect('t1.linked_deals', 't2');
+    // The deals of a letter are the deals whose history it is in (it used to be the deals of the
+    // sender's contact, closed ones too, and never for letters we sent)
+    if (query.deal_label) {
+      qb.andWhere(`EXISTS (${IN_DEALS} AND dh.label ILIKE :deal_label)`, {
+        deal_label: `%${query.deal_label}%`,
+      });
+    }
 
-      if (query.deal_label) {
-        qb.andWhere('t2.label ILIKE :deal_label', {
-          deal_label: `%${query.deal_label}%`,
-        });
-      }
+    if (query.with_deal?.toLowerCase() === 'true') {
+      qb.andWhere(`EXISTS (${IN_DEALS})`);
+    }
 
-      if (query.with_deal?.toLowerCase() === 'true') {
-        qb.andWhere('t2.id IS NOT NULL');
-      }
+    if (query.with_deal?.toLowerCase() === 'false') {
+      qb.andWhere(`NOT EXISTS (${IN_DEALS})`);
+    }
 
-      if (query.with_deal?.toLowerCase() === 'false') {
-        qb.andWhere('t2.id IS NULL');
-      }
-
-      if (query.stages) {
-        qb.andWhere('t2.stage_id IN (:...stage_ids)', {
-          stage_ids: query.stages,
-        });
-      }
-    } else {
-      relations.push('from_user', 'from_user.linked_deals');
+    if (query.stages?.length) {
+      qb.andWhere(`EXISTS (${IN_DEALS} AND dh.stage_id IN (:...stage_ids))`, {
+        stage_ids: query.stages,
+      });
     }
 
     if (query.from_date) {
@@ -142,13 +167,15 @@ export class MailboxService {
       });
     }
 
-    return this.helperService.withPagination(
-      this.helperService.withRelations(qb, relations, 't0', 5),
+    const page = await this.helperService.withPagination(
+      this.helperService.withRelations(qb, relations, 't0', 6),
       query,
     );
+    await this.describe(page.data ?? [], authUser ?? toAuthUser(user));
+    return page;
   }
 
-  async fetchOneLocalEmail(id: number, user: User): Promise<Email> {
+  async fetchOneLocalEmail(id: number, user: User, authUser: AuthUser = null): Promise<Email> {
     let email = await this.getAccessibleEmail(id, user, ['files']);
 
     if (email.email_id && email.read === false) {
@@ -163,37 +190,90 @@ export class MailboxService {
         this.loggerService.error('Error adding \\Seen flag:', error.stack);
       }
 
+      await this.emailRepository.update(email.id, { read: true });
       email.read = true;
-      email = await this.emailRepository.save(email);
     }
 
     // The relation only served the access check
     delete email.sent_by;
 
+    email.html = await this.htmlOf(email.id);
+    await this.describe([email], authUser ?? toAuthUser(user));
+
+    // whom a reply goes to: the sender, or for a letter we sent its recipients; «Ответить всем»
+    // adds the others of To / Cc. Our own addresses (the shared mailbox, the user's) are left out.
+    const ours = new Set(
+      [...(await this.ownAddresses(user)), String(process.env.EMAIL_DEFAULT_USER ?? '').toLowerCase()].filter(Boolean),
+    );
+    const replyTo = (email.outgoing ? addressesIn((email.to ?? []).map((r) => r.value)) : addressesIn([email.from])).filter(
+      (address) => !email.outgoing || !ours.has(address),
+    );
+    const others = addressesIn([...(email.to ?? []).map((r) => r.value), ...(email.cc ?? []).map((r) => r.value)]).filter(
+      (address) => !ours.has(address) && !replyTo.includes(address),
+    );
+    (email as any).reply = { to: replyTo, cc_all: others };
     return email;
   }
 
+  /**
+   * Deletes a letter in the CRM: it is moved to the Trash mailbox of the server (it used to be
+   * erased there for good, EXPUNGE) and hidden here; who and when stay on the row (deleted_by,
+   * deleted_at). «Удалённые» shows it and «Восстановить» brings it back.
+   */
   async deleteEmail(id: number, user: User): Promise<void> {
     const email = await this.getAccessibleEmail(id, user);
+    const trash = this.connection.mailboxes.trash;
 
-    // A copy that is no longer on the server (UIDVALIDITY changed) is only local
-    if (!email.email_id) {
-      await this.emailRepository.softDelete(email.id);
-      return;
+    if (email.email_id && trash && email.from_mailbox !== trash) {
+      try {
+        await this.connection.withMailbox(email.from_mailbox, async (imap) => {
+          const moved = await imap.messageMove(`${email.email_id}`, trash, { uid: true });
+          if (!moved) {
+            throw new BadRequestException('Почтовый сервер не переместил письмо в корзину');
+          }
+          const validity = moved.uidValidity ?? (await imap.status(trash, { uidValidity: true })).uidValidity;
+          // without UIDPLUS the new uid is unknown: the next sync of Trash finds the row by Message-ID
+          await this.emailRepository.update(email.id, {
+            email_id: moved.uidMap?.get(+email.email_id) ?? null,
+            from_mailbox: moved.destination ?? trash,
+            uidvalidity: validity ? String(validity) : null,
+          });
+        });
+      } catch (error) {
+        this.loggerService.error(`Error deleting email ${id}`, error.stack);
+        throw error;
+      }
     }
 
-    try {
+    await this.emailRepository.update(email.id, { deleted_by: { id: user.id } as User });
+    await this.emailRepository.softDelete(email.id);
+    this.loggerService.log(`mail: letter ${email.id} "${email.subject ?? ''}" deleted by user ${user.id}`);
+  }
+
+  /** «Восстановить»: a deleted letter goes back to INBOX (one we sent: to Sent) and is shown again. */
+  async restoreEmail(id: number, user: User): Promise<void> {
+    const email = await this.getAccessibleEmail(id, user, [], true);
+    if (!email.deleted_at) return;
+    const { inbox, sent } = this.connection.mailboxes;
+    const target = email.outgoing ? sent : inbox;
+
+    if (email.email_id && target && email.from_mailbox !== target) {
       await this.connection.withMailbox(email.from_mailbox, async (imap) => {
-        if (!(await imap.messageDelete([+email.email_id], { uid: true }))) {
-          throw new BadRequestException('Could not delete email!');
+        const moved = await imap.messageMove(`${email.email_id}`, target, { uid: true });
+        if (!moved) {
+          throw new BadRequestException('Почтовый сервер не вернул письмо из корзины');
         }
-
-        await this.emailRepository.softDelete(email.id);
+        const validity = moved.uidValidity ?? (await imap.status(target, { uidValidity: true })).uidValidity;
+        await this.emailRepository.update(email.id, {
+          email_id: moved.uidMap?.get(+email.email_id) ?? null,
+          from_mailbox: moved.destination ?? target,
+          uidvalidity: validity ? String(validity) : null,
+        });
       });
-    } catch (error) {
-      this.loggerService.error(`Error deleting email ${id}`, error.stack);
-      throw error;
     }
+
+    await this.emailRepository.restore(email.id);
+    await this.emailRepository.update(email.id, { deleted_by: null, is_spam: false });
   }
 
   /** Flags the message \Junk and moves it to the spam mailbox. */
@@ -202,8 +282,7 @@ export class MailboxService {
     delete email.sent_by;
 
     if (!email.email_id) {
-      email.is_spam = true;
-      await this.emailRepository.save(email);
+      await this.emailRepository.update(email.id, { is_spam: true });
       return;
     }
 
@@ -221,17 +300,18 @@ export class MailboxService {
           );
         }
 
-        // Without UIDPLUS the server does not tell the new uid: the copy is
-        // then found again by Message-ID on the next sync of the spam folder.
+        // Without UIDPLUS the server does not tell the new uid: the row waits in
+        // the spam mailbox without one, and the next sync of it finds it by Message-ID.
         const spamUidValidity =
           moved.uidValidity ??
           (await imap.status(spam, { uidValidity: true })).uidValidity;
 
-        email.is_spam = true;
-        email.email_id = moved.uidMap?.get(+email.email_id) ?? null;
-        email.from_mailbox = moved.destination;
-        email.uidvalidity = spamUidValidity ? String(spamUidValidity) : null;
-        await this.emailRepository.save(email);
+        await this.emailRepository.update(email.id, {
+          is_spam: true,
+          email_id: moved.uidMap?.get(+email.email_id) ?? null,
+          from_mailbox: moved.destination,
+          uidvalidity: spamUidValidity ? String(spamUidValidity) : null,
+        });
       });
     } catch (error) {
       this.loggerService.error(
@@ -243,39 +323,176 @@ export class MailboxService {
     }
   }
 
+  /** «Не спам»: back to INBOX, without the \Junk flag. */
+  async markAsNotSpam(id: number, user: User): Promise<void> {
+    const email = await this.getAccessibleEmail(id, user);
+    const inbox = this.connection.mailboxes.inbox;
+
+    if (email.email_id && inbox && email.from_mailbox !== inbox) {
+      await this.connection.withMailbox(email.from_mailbox, async (imap) => {
+        const uid = `${email.email_id}`;
+        await imap.messageFlagsRemove(uid, ['\\Junk'], { uid: true }).catch(() => undefined);
+        const moved = await imap.messageMove(uid, inbox, { uid: true });
+        if (!moved) {
+          throw new BadRequestException('Почтовый сервер не переместил письмо во «Входящие»');
+        }
+        const validity = moved.uidValidity ?? (await imap.status(inbox, { uidValidity: true })).uidValidity;
+        await this.emailRepository.update(email.id, {
+          email_id: moved.uidMap?.get(+email.email_id) ?? null,
+          from_mailbox: moved.destination ?? inbox,
+          uidvalidity: validity ? String(validity) : null,
+        });
+      });
+    }
+
+    await this.emailRepository.update(email.id, { is_spam: false });
+  }
+
   async getEmailFolders(): Promise<any> {
     return (await this.connection.client()).list();
   }
 
+  /**
+   * The recipients' addresses of all letters, for the admin's filter «Почты агентов». Others get an
+   * empty list: an agent must not learn whom the company writes to.
+   */
   async fetchEmailTo(
     query: FetchEmailToDto,
+    user: User = null,
   ): Promise<PaginationResponseDto<EmailTo[]>> {
     const qb = this.emailToRepository.createQueryBuilder('t0');
 
+    if (!user || !AuthGuard.MANAGER_LEVEL.includes(user.role)) {
+      qb.where('FALSE');
+    }
+
     if (query.search) {
-      qb.where('t0.value ILIKE :value', { value: `%${query.search}%` });
+      qb.andWhere('t0.value ILIKE :value', { value: `%${query.search}%` });
     }
 
     return this.helperService.withPagination(qb, query);
   }
 
+  /** Letters the user may work with, with their addresses, files and people (403 for any other). */
+  async accessibleLetters(ids: number[], user: User): Promise<Email[]> {
+    const letters: Email[] = [];
+    for (const id of [...new Set(ids.map(Number))]) {
+      const email = await this.getAccessibleEmail(id, user, ['files', 'from_user', 'from_user.company']);
+      letters.push(email);
+    }
+    return letters;
+  }
+
+  /** One letter the user may read, with its HTML part (the letter answered, the assistant's context). */
+  async accessibleLetter(id: number, user: User): Promise<Email> {
+    const email = await this.getAccessibleEmail(id, user, ['from_user']);
+    email.html = await this.htmlOf(email.id);
+    return email;
+  }
+
+  private async htmlOf(id: number): Promise<string | null> {
+    const row = await this.emailRepository
+      .createQueryBuilder('t0')
+      .select('t0.id')
+      .addSelect('t0.html')
+      .withDeleted()
+      .where('t0.id = :id', { id })
+      .getOne();
+    return row?.html ?? null;
+  }
+
+  /**
+   * Adds to each letter its deals (the deals whose history it is in, those the user may see) and its
+   * client (the contact / company of the sender, or of the recipients of a letter we sent).
+   */
+  private async describe(emails: Email[], authUser: AuthUser | null): Promise<void> {
+    if (!emails.length) return;
+    const access = authUser ? new Access(authUser) : null;
+
+    const rows: any[] = await this.dataSource.query(
+      `SELECT DISTINCT (e.after_state -> 'data') ->> 'id' AS email_id, d.id, d.label, d.display_id, d.agent_id,
+              a.group_id, s.name AS stage, s.color AS stage_color, (d.closed_at IS NOT NULL) AS closed
+         FROM event e
+         JOIN deal d ON d.id = e.deal_id AND d.deleted_at IS NULL
+         LEFT JOIN "user" a ON a.id = d.agent_id
+         LEFT JOIN deal_stage s ON s.id = d.stage_id
+        WHERE e.type = 9 AND (e.after_state -> 'data') ->> 'id' = ANY($1)`,
+      [emails.map((e) => String(e.id))],
+    );
+
+    const counterparts = new Map<number, string[]>();
+    for (const email of emails) {
+      const addresses = email.outgoing
+        ? addressesIn([...(email.to ?? []).map((r) => r.value), ...(email.cc ?? []).map((r) => r.value)])
+        : addressesIn([email.from]);
+      counterparts.set(email.id, addresses);
+    }
+    const all = [...new Set([...counterparts.values()].flat())];
+    const contacts: any[] = all.length
+      ? await this.dataSource.query(
+          `SELECT u.id, u.username, lower(u.email) AS email, c.id AS company_id, c.name AS company_name
+             FROM "user" u LEFT JOIN company c ON c.id = u.company_id AND c.deleted_at IS NULL
+            WHERE u.role = $2 AND u.deleted_at IS NULL AND lower(u.email) = ANY($1)
+            ORDER BY u.id`,
+          [all, RoleEnum.CTR_AGENT],
+        )
+      : [];
+    const companies: any[] = all.length
+      ? await this.dataSource.query(
+          `SELECT c.id, c.name, lower(c.email) AS email FROM company c WHERE c.deleted_at IS NULL AND lower(c.email) = ANY($1) ORDER BY c.id`,
+          [all],
+        )
+      : [];
+
+    for (const email of emails) {
+      const deals: LetterDeal[] = rows
+        .filter((row) => row.email_id === String(email.id))
+        .filter((row) => !access || access.allowsDeal('view', row.agent_id ?? null, row.group_id ?? null))
+        .filter((row, i, list) => list.findIndex((other) => other.id === row.id) === i)
+        .map((row) => ({
+          id: Number(row.id),
+          label: row.label,
+          display_id: Number(row.display_id),
+          stage: row.stage ?? null,
+          stage_color: row.stage_color ?? null,
+          closed: !!row.closed,
+        }));
+      (email as any).deals = deals;
+
+      const addresses = counterparts.get(email.id) ?? [];
+      const contact = addresses.map((a) => contacts.find((c) => c.email === a)).find(Boolean);
+      const company = contact?.company_id
+        ? { id: Number(contact.company_id), name: contact.company_name }
+        : addresses.map((a) => companies.find((c) => c.email === a)).find(Boolean);
+      const client: LetterClient = {
+        contact: contact ? { id: Number(contact.id), username: contact.username } : null,
+        company: company ? { id: Number(company.id), name: company.name } : null,
+      };
+      (email as any).client = client;
+    }
+  }
+
   /**
    * Loads an email and checks that `user` may work with it: admin and manager
    * may with every email, an agent only with the emails of their own
-   * mailboxes (their address or one of their sender accounts in From/To/Cc,
-   * or sent by them from the CRM).
+   * mailboxes (their address or one of their checked sender accounts in From/To/Cc,
+   * or sent by them from the CRM), the replies to their letters and the letters
+   * of the deals they are responsible for.
    */
   private async getAccessibleEmail(
     id: number,
     user: User,
     relations: string[] = [],
+    withDeleted = false,
   ): Promise<Email> {
-    const email = await this.helperService.getById(Email, id, [
-      'to',
-      'cc',
-      'sent_by',
-      ...relations,
-    ]);
+    let qb = this.emailRepository.createQueryBuilder('t0');
+    qb = this.helperService.withRelations(qb, ['to', 'cc', 'sent_by', ...relations]);
+    if (withDeleted) qb = qb.withDeleted();
+    const email = await qb.where('t0.id = :id', { id }).getOne();
+    if (!email) {
+      // getById's message, as before
+      await this.helperService.getById(Email, id);
+    }
 
     if (!(await this.canAccessEmail(email, user))) {
       throw new ForbiddenException('Это письмо принадлежит другому сотруднику');
@@ -303,17 +520,33 @@ export class MailboxService {
     }
 
     const pattern = new RegExp(addressPattern(own), 'i');
-    return [...(email.to ?? []), ...(email.cc ?? [])].some((recipient) =>
-      pattern.test(recipient.value ?? ''),
+    if (
+      [...(email.to ?? []), ...(email.cc ?? [])].some((recipient) =>
+        pattern.test(recipient.value ?? ''),
+      )
+    ) {
+      return true;
+    }
+
+    // a reply to a letter they sent; a letter of a deal they are responsible for
+    const rows = await this.dataSource.query(
+      `SELECT
+         EXISTS (SELECT 1 FROM email o WHERE $2::text IS NOT NULL AND o.message_id = $2 AND o.sent_by_id = $3) AS reply,
+         EXISTS (SELECT 1 FROM event eh JOIN deal dh ON dh.id = eh.deal_id AND dh.deleted_at IS NULL
+                  WHERE eh.type = 9 AND (eh.after_state -> 'data') ->> 'id' = $1 AND dh.agent_id = $3) AS deal`,
+      [String(email.id), email.in_reply_to ?? null, user.id],
     );
+    return !!(rows[0]?.reply || rows[0]?.deal);
   }
 
-  /** Lower-cased addresses of the user: their own and their sender accounts. */
+  /** Lower-cased addresses of the user: their own and their checked sender accounts. */
   private async ownAddresses(user: User): Promise<string[]> {
     const transporters = await this.emailTransporterRepository
       .createQueryBuilder('t0')
       .select('t0.email', 'email')
       .where('t0.user_id = :user_id', { user_id: user.id })
+      // a mailbox saved before the password check gives no access to letters
+      .andWhere('t0.verified_at IS NOT NULL')
       .getRawMany<{ email: string }>();
 
     const addresses = new Set<string>();
@@ -323,6 +556,18 @@ export class MailboxService {
 
     return [...addresses];
   }
+}
+
+/** The access of a user loaded from the database (the request's token carries the same). */
+function toAuthUser(user: User | null): AuthUser | null {
+  if (!user) return null;
+  return {
+    sub: user.id,
+    username: user.username,
+    role: user.role,
+    permissions: user.permissions ?? null,
+    group_id: (user as any).group?.id ?? (user as any).group_id ?? null,
+  };
 }
 
 /**

@@ -12,6 +12,7 @@ export class SearchTrackingDto extends PaginationRequestDto {
   @IsNumberString(undefined, { each: true })
   types: number[];
 
+  // a date (the last day of the period, inclusive) or a moment
   @IsOptional()
   @IsDateString()
   created_before: Date;
@@ -27,4 +28,9 @@ export class SearchTrackingDto extends PaginationRequestDto {
   @IsOptional()
   @IsEnum(FieldsOf, { each: true })
   entities: FieldsOf[];
+
+  // the history of one deal
+  @IsOptional()
+  @IsNumberString()
+  deal_id: number;
 }

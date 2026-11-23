@@ -130,7 +130,7 @@ def main():
     users = {}
     try:
         print("== setup")
-        for key in ("a", "b"):
+        for key in ("a", "b", "c"):
             person = {"email": f"audit-wa-{RUN}-{key}@example.test", "password": secrets.token_urlsafe(12),
                       "username": f"{TAG}-{key}", "role": "agent", "group_id": groups[0], "permissions": perms,
                       "phone": f"+99890{random.randint(1000000, 9999999)}"}
@@ -140,15 +140,16 @@ def main():
             person["id"] = created["id"]
             person["token"] = api("POST", "/auth/login", {"email": person["email"], "password": person["password"]})[1]["access_token"]
             users[key] = person
-        A, B = users["a"], users["b"]
+        A, B, C = users["a"], users["b"], users["c"]
         digits = f"99893{random.randint(1000000, 9999999)}"
         lid = f"{random.randint(10**13, 10**14)}@lid"
 
-        def incoming(agent, msg_id, text="", outgoing=False, chat=None, files=None):
+        def incoming(agent, msg_id, text="", outgoing=False, chat=None, files=None, **extra):
             payload = {"agent_id": agent["id"], "agent_phone": agent["phone"],
                        "chat": chat or {"wa_id": f"{digits}@s.whatsapp.net", "phone": "+" + digits, "name": f"{TAG} Клиент"},
                        "wa_message_id": msg_id, "text": text, "outgoing": outgoing,
                        "date": "2026-11-19T10:00:00+05:00", "files": files or []}
+            payload.update(extra)
             return api("POST", "/whatsapp/incoming", payload, headers=headers)
 
         print("== receiver: token")
@@ -229,6 +230,51 @@ def main():
         st, b = multipart("/whatsapp/send-message", {"to_user": str(contact_id), "message": "Salom"}, [], B["token"])
         check("B, whose WhatsApp the client wrote to, may answer from that deal (reaches the service: not connected / 503)",
               (st == 400 and "подключ" in message_of((st, b))) or st == 503, (st, b))
+        r = incoming(B, f"WA{RUN}1", "Assalomu alaykum, narx qancha?")
+        check("the same WhatsApp message id in another manager's chat is another message (not a duplicate)", r[1].get("status") == "saved", r)
+
+        print("== one deal per message, numbers typed in a local form (WA-4, WA-6, WA-7)")
+        psql(f"update deal set closed_at = null where id = {other_deal}")
+        local = f"99895{random.randint(1000000, 9999999)}"
+        local_id = int(psql(f"insert into \"user\" (username, role, phone, created_by) values ('{TAG} местный', 'ctr_agent', '{local[3:5]} {local[5:8]} {local[8:10]} {local[10:]}', {A['id']}) returning id"))
+        r = incoming(A, f"WA{RUN}L1", "Salom", chat={"wa_id": f"{local}@s.whatsapp.net", "phone": "+" + local, "name": "x"})
+        check("a contact whose phone was typed without the country code is found (the last 9 digits), no duplicate contact",
+              r[1].get("contact_id") == local_id and not r[1].get("created_contact"), r)
+        local_deal = (r[1].get("deal_ids") or [None])[0]
+        psql(f"insert into deal_user (\"dealId\", \"userId\") values ({other_deal}, {local_id})")  # a second open deal of A with this client
+        r = incoming(A, f"WA{RUN}L2", "Yana", chat={"wa_id": f"{local}@s.whatsapp.net", "phone": "+" + local, "name": "x"})
+        n = psql(f"select count(*) from event where type = 16 and external_id = 'WA{RUN}L2'")
+        check("with two open deals a message is saved once (not copied into every deal)", len(r[1].get("deal_ids") or []) == 1 and n == "1", (r, n))
+        r = incoming(A, f"WA{RUN}L3", "Javob", outgoing=True, deal_id=other_deal, chat={"wa_id": f"{local}@s.whatsapp.net", "phone": "+" + local, "name": "x"})
+        check("a message written from a deal (deal_id) is recorded in that deal", r[1].get("deal_ids") == [other_deal], r)
+        st, b = multipart("/whatsapp/send-message", {"to_user": str(local_id), "message": "x", "deal_id": "999999999"}, [], A["token"])
+        check("send from a deal the user cannot write from -> 400", st == 400, (st, b))
+        st, b = multipart("/whatsapp/send-message", {"to_user": str(local_id), "message": " "}, [], A["token"])
+        check("send with neither text nor files -> 400", st == 400, (st, b))
+
+        print("== not for the CRM: colleagues, «Не клиент», messages from the phone (WA-2)")
+        r = incoming(A, f"WA{RUN}s1", "Salom", chat={"wa_id": "x@s.whatsapp.net", "phone": B["phone"], "name": "Коллега"})
+        check("a colleague's number -> ignored (staff), no contact", r[1].get("status") == "ignored" and r[1].get("reason") == "staff", r)
+        friend = f"99891{random.randint(1000000, 9999999)}"
+        friend_chat = {"wa_id": f"{friend}@s.whatsapp.net", "phone": "+" + friend, "name": f"{TAG} друг"}
+        r = incoming(A, f"WA{RUN}s2", "Tug'ilgan kuning bilan!", outgoing=True, chat=friend_chat)
+        n = psql(f"select count(*) from \"user\" where wa_id = '{friend}@s.whatsapp.net'")
+        check("a message from the phone to somebody not in the CRM -> ignored, no contact", r[1].get("reason") == "outgoing_unknown" and n == "0", (r, n))
+        st, item = api("POST", "/messenger/ignored", {"phone": "+" + friend, "channel": "whatsapp"}, A["token"])
+        check("«Не клиент» for WhatsApp only -> 201", st == 201 and item.get("channel") == "whatsapp", (st, item))
+        r = incoming(A, f"WA{RUN}s3", "Salom", chat=friend_chat)
+        n = psql(f"select count(*) from \"user\" where wa_id = '{friend}@s.whatsapp.net'")
+        check("the person writes -> ignored (not_client), no contact, no deal", r[1].get("reason") == "not_client" and n == "0", (r, n))
+        api("DELETE", f"/messenger/ignored/{item.get('id', 0)}", token=A["token"])
+        st, _ = api("POST", "/messenger/ignored", {"phone": "12"}, A["token"])
+        check("«Не клиент» with a number shorter than 9 digits -> 400", st == 400, st)
+
+        print("== a manager who is not a staff user any more (WA-10)")
+        st, _ = api("DELETE", f"/users/{C['id']}", token=admin)
+        r = incoming(C, f"WA{RUN}c1", "Salom")
+        check("a message for a deleted staff user -> 410 (the service keeps it aside)", st == 200 and r[0] == 410, (st, r))
+        st, b = api("DELETE", f"/whatsapp/session?user_id={C['id']}", token=admin)
+        check("admin may disconnect a deleted user's WhatsApp (200, or 503 without the service)", st in (200, 503), (st, b))
 
         print("== people: connect, state, send")
         st, _ = api("GET", f"/whatsapp/status?user_id={A['id']}", token=B["token"])
@@ -245,6 +291,9 @@ def main():
         check("own state answers (none without a session; 503 without the service)", (st == 200 and s.get("status") in ("none", "logged_out")) or st == 503, (st, s))
         st, s = api("GET", "/whatsapp/sessions", token=admin)
         check("admin sees the sessions (list; 503 without the service)", (st == 200 and isinstance(s, list)) or st == 503, (st, s))
+        if st == 200:
+            row = next((x for x in s if x.get("user_id") == A["id"]), None)
+            check("... every staff user with the state in words (also those who never connected)", bool(row and row.get("text") and row.get("status")), row)
         st, b = multipart("/whatsapp/send-message", {"to_user": str(lid_contact), "message": "Salom"}, [], B["token"])
         check("write to another manager's client who never wrote to you -> 400", st == 400 and "сделки" in message_of((st, b)), (st, b))
         st, b = multipart("/whatsapp/send-message", {"to_user": str(B["id"]), "message": "Salom"}, [], A["token"])
@@ -259,10 +308,12 @@ def main():
         ids = ",".join(str(u["id"]) for u in users.values()) or "0"
         contacts = f"select id from \"user\" where (username like '{TAG}%' or wa_id like '%@lid' and created_by in ({ids})) and role = 'ctr_agent'"
         deals = f"select id from deal where agent_id in ({ids})"
+        tasks = f"select id from task where deal_id in ({deals})"
         psql(";".join([
             "begin",
             f"create temp table _c as {contacts}",
-            f"delete from event where deal_id in ({deals}) or user_id in ({ids}) or user_id in (select id from _c) or target_user_id in (select id from _c) or target_user_id in ({ids})",
+            f"delete from event where deal_id in ({deals}) or user_id in ({ids}) or user_id in (select id from _c) or target_user_id in (select id from _c) or target_user_id in ({ids}) or task_id in ({tasks})",
+            f"delete from task where id in ({tasks})",
             f"delete from deal_file where \"dealId\" in ({deals})",
             f"delete from file where path = 'wa_{RUN}.pdf' or uploaded_by in (select id from _c) or uploaded_by in ({ids})",
             f"delete from deal_stage_record where deal_id in ({deals})",

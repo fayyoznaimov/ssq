@@ -25,8 +25,8 @@ export async function waVersion(config, logger) {
   return undefined
 }
 
-/** socketFactory for SessionManager: ({ auth, logger, config }) -> Baileys socket. */
-export async function createWaSocket({ auth, logger, config }) {
+/** socketFactory for SessionManager: ({ auth, logger, config, getMessage }) -> Baileys socket. */
+export async function createWaSocket({ auth, logger, config, getMessage }) {
   const version = await waVersion(config, logger)
   return makeWASocket({
     ...(version ? { version } : {}),
@@ -46,6 +46,8 @@ export async function createWaSocket({ auth, logger, config }) {
     // messages sent through POST /send are not echoed back as upserts
     emitOwnEvents: false,
     generateHighQualityLinkPreview: false,
-    getMessage: async () => undefined,
+    // a client's device that could not decrypt a message asks for it again: the messages sent through
+    // POST /send are kept for 7 days (stores.js SentStore); Baileys' own short cache answers first
+    getMessage: async (key) => (getMessage ? getMessage(key) : undefined),
   })
 }

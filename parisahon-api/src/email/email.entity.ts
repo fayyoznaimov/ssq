@@ -81,6 +81,32 @@ export class Email {
   @JoinColumn({ name: 'sent_by_id' })
   sent_by: User;
 
+  /** The display name of the sender ("Ivan Petrov" of `Ivan Petrov <ivan@x>`): the name of a contact made from the letter. */
+  @Column({ type: 'varchar', length: 255, nullable: true, default: null })
+  from_name: string;
+
+  /**
+   * In-Reply-To / References: the Message-IDs of the letters this one answers. A reply finds its
+   * thread through them (the deals of the letter answered, the agent who wrote it).
+   */
+  @Column({ type: 'varchar', length: 998, nullable: true, default: null })
+  in_reply_to: string;
+
+  @Column({ type: 'text', nullable: true, default: null })
+  reference_ids: string;
+
+  /**
+   * The HTML part of a received letter as it came (the client cleans it before showing it); `body`
+   * keeps the text. Not selected by default: lists and the deal history do not carry it.
+   */
+  @Column({ type: 'text', nullable: true, default: null, select: false })
+  html: string;
+
+  /** Who deleted the letter in the CRM (moved it to the Trash mailbox); deleted_at says when. */
+  @ManyToOne(() => User, { nullable: true, onDelete: 'SET NULL' })
+  @JoinColumn({ name: 'deleted_by_id' })
+  deleted_by: User;
+
   @Column({ type: 'text', nullable: true })
   subject: string;
 

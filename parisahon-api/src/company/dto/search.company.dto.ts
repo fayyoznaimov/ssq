@@ -3,6 +3,7 @@ import {
   IsDateString, IsEnum,
   IsOptional,
   IsString,
+  MaxLength,
 } from 'class-validator';
 import { PaginationRequestDto } from '../../helper/dto/pagination.dto';
 
@@ -30,9 +31,21 @@ export enum CompareDealCountPeriod {
 }
 
 export class SearchCompanyDto extends PaginationRequestDto {
+  // the name only (the pickers of the deal and contact forms)
   @IsOptional()
   @IsString()
   name: string;
+
+  // the search of the list: name, ИНН, phone, e-mail, and the contacts' names, phones and e-mails
+  @IsOptional()
+  @IsString()
+  @MaxLength(255)
+  q?: string;
+
+  // no_deals=true: companies without any deal (their own or their contacts')
+  @IsOptional()
+  @IsBooleanString()
+  no_deals?: string;
 
   @IsOptional()
   @IsDateString()

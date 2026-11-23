@@ -74,4 +74,10 @@ export class IncomingWhatsAppDto {
   @ValidateNested({ each: true })
   @Type(() => IncomingFileDto)
   files?: IncomingFileDto[];
+
+  // the deal a message from the CRM was written from (the service echoes it when it records a send
+  // the API stopped waiting for)
+  @IsOptional()
+  @IsInt()
+  deal_id?: number;
 }

@@ -1,12 +1,26 @@
 <template>
-    <section class="col-span-12 lg:col-span-8 flex flex-col relative min-h-[60vh]">
+    <section
+        class="col-span-12 lg:col-span-8 flex flex-col relative"
+        :class="isNew ? 'mb-6 lg:mb-0' : 'min-h-[60vh]'"
+    >
+        <!-- a company that is not saved yet has no feed and no one to write to -->
+        <div
+            v-if="isNew"
+            class="flex flex-1 items-center justify-center rounded-md border border-dashed border-muted-300 p-6 text-center text-sm text-muted-500 dark:border-muted-700 dark:text-muted-400"
+        >
+            Лента событий, задачи и сообщения появятся после сохранения компании
+        </div>
         <EventsList
+            v-if="!isNew"
             :events="events"
             :events-loading="eventsLoading"
             :intersected="onIntersect"
-            :start-observer="!!route.params.id"
+            :start-observer="!isNew"
         />
-        <div class="mb-8 my-4 space-y-2">
+        <div
+            v-if="!isNew"
+            class="mb-8 my-4 space-y-2"
+        >
             <form
                 id="compose-form"
                 class="flex flex-wrap lg:flex-nowrap gap-2"
@@ -193,6 +207,9 @@ const task = ref<Partial<Task>>({
     allDay: false,
 });
 
+// /lists/companies/new: nothing to load until the company is saved
+const isNew = computed(() => !route.params.id || route.params.id === "new");
+
 async function fetchEvents() {
     const query = {
         sort: {
@@ -213,7 +230,7 @@ async function fetchEvents() {
 
 // Live: new events of the company's deals appear without reloading the page
 useLive(async (changes) => {
-    if (!liveTouches(changes, "events")) return;
+    if (isNew.value || !liveTouches(changes, "events")) return;
     const result = await promiseResult(
         companiesService
             .get(`${route.params.id as string}/events`, { sort: { id: -1 }, skip: 0, limit })
@@ -225,7 +242,7 @@ useLive(async (changes) => {
 // The feed of the company: events of all its deals, loaded page by page
 // while scrolling (GET /companies/:id/events). Was switched off.
 async function onIntersect() {
-    if (eventsEnded.value || eventsLoading.value) return;
+    if (isNew.value || eventsEnded.value || eventsLoading.value) return;
     const result = await fetchEvents();
     if (!result.ok) return;
     if (result.value.current_page >= result.value.last_page)

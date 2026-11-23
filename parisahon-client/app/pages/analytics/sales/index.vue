@@ -1,4 +1,6 @@
 <script lang="ts" setup>
+import moment from 'moment';
+import DatePicker from '@vuepic/vue-datepicker';
 import BaseButton from '~/components/base/BaseButton.vue';
 import Money from '~/components/common/Money.vue';
 import type { DealStats } from '~/types/stats';
@@ -6,11 +8,11 @@ import type { DealStats } from '~/types/stats';
 definePageMeta({
     authRoute: true,
     layout: 'account',
-    verbose: 'Цели'
+    verbose: 'Анализ продаж'
 });
 
 useHead({
-    title: 'Цели'
+    title: 'Анализ продаж'
 });
 
 enum Status {
@@ -28,6 +30,29 @@ const route = useRoute();
 const status = ref(route.query.status || Status.Active);
 const by = ref(route.query.by || By.Budget);
 const analyticsService = useService('analytics/deals', {auth: true});
+const colorMode = useColorMode();
+// deals created in the period; by default all of them
+const ALL_TIME = [moment().set('year', 2020).startOf('year'), moment().set('year', 2100).endOf('year')];
+const dateRange = ref([ALL_TIME[0].format('YYYY-MM-DD'), ALL_TIME[1].format('YYYY-MM-DD')]);
+const presetDates = ref([
+    { label: 'За этот месяц', value: [moment().startOf('month'), moment().endOf('month')] },
+    { label: 'За прошлый месяц', value: [moment().subtract(1, 'month').startOf('month'), moment().subtract(1, 'month').endOf('month')] },
+    { label: 'За квартал', value: [moment().startOf('quarters'), moment().endOf('quarters')] },
+    { label: 'За этот год', value: [moment().startOf('year'), moment().endOf('year')] },
+    { label: 'За прошлый год', value: [moment().subtract(1, 'year').startOf('year'), moment().subtract(1, 'year').endOf('year')] },
+    { label: 'За все время', value: ALL_TIME },
+]);
+
+function format(dates: Date[]) {
+    const fromStr = moment(dates[0]).format('YYYY-MM-DD');
+    const toStr = moment(dates[1]).format('YYYY-MM-DD');
+    for (const preset of presetDates.value) {
+        if (preset.value[0].format('YYYY-MM-DD') === fromStr && preset.value[1].format('YYYY-MM-DD') === toStr) {
+            return preset.label;
+        }
+    }
+    return `${fromStr} - ${toStr}`;
+}
 const {data: deals, run: runDeals} = useAsync<DealStats>({
     stages: [],
     average_deal_duration_in_minutes: "0",
@@ -41,6 +66,10 @@ function fetchStats() {
     }
     if (status.value === Status.Closed) {
         query.is_active = false;
+    }
+    if (dateRange.value?.[0] && dateRange.value?.[1]) {
+        query.from_date = dateRange.value[0];
+        query.till_date = dateRange.value[1];
     }
     runDeals(analyticsService.find(query).exec())
 }
@@ -97,12 +126,33 @@ watchEffect(() => {
     by.value = Number(route.query.by) || By.Budget;
 });
 
-watch(status, fetchStats);
+watch([status, dateRange], fetchStats);
 onMounted(fetchStats);
 </script>
 <template>
     <div class="flex flex-col gap-8">
-        <h1 class="text-xl whitespace-nowrap">Анализ продаж</h1>
+        <div class="flex flex-wrap items-center gap-4">
+            <h1 class="text-xl whitespace-nowrap">Анализ продаж</h1>
+            <div class="max-w-xs w-full shrink-0">
+                <DatePicker
+                    v-model="dateRange"
+                    :format="format"
+                    range
+                    text-input
+                    vertical
+                    :preset-dates="presetDates"
+                    auto-apply
+                    :enable-time-picker="false"
+                    model-type="yyyy-MM-dd"
+                    :teleport="true"
+                    :dark="colorMode.value === 'dark'"
+                >
+                    <template #dp-input="{ onInput, value, onBlur, onPaste }">
+                        <BaseInput :value="value" @input="onInput" @blur="onBlur" @paste="onPaste" placeholder="Сделки, созданные за все время" />
+                    </template>
+                </DatePicker>
+            </div>
+        </div>
         <div class="flex justify-between">
             <BaseButtonGroup>
                 <BaseButton color="default" :to="{path: '/analytics/sales', query: {...route.query, status: Status.All}}" 

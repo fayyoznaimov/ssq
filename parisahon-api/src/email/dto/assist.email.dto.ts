@@ -11,4 +11,7 @@ export class AssistEmailDto {
   @IsOptional() @IsString() @MaxLength(20000) body?: string;
 
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) deal_id?: number;
+
+  /** the letter being answered (Mail): «Ответ клиенту» without a deal, and its text for «Проверить» */
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) reply_to_email_id?: number;
 }

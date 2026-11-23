@@ -44,16 +44,24 @@ const periodTranslationMap: Record<Period, string> = {
     [Period.Custom]: 'Период'
 };
 
-const periodDatesMap: Record<Period, [string, string]> = {
-    [Period.Today]: [moment().subtract(1, 'day').format('YYYY-MM-DD'), moment().add(1, 'day').format('YYYY-MM-DD')],
-    [Period.Yesterday]: [moment().subtract(2, 'day').format('YYYY-MM-DD'), moment().format('YYYY-MM-DD')],
-    [Period.Week]: [moment().subtract(1, 'week').format('YYYY-MM-DD'), moment().format('YYYY-MM-DD')],
-    [Period.Month]: [moment().subtract(31, 'day').format('YYYY-MM-DD'), moment().add(1, 'day').format('YYYY-MM-DD')],
-    [Period.Custom]: [moment().format('YYYY-MM-DD'), moment().format('YYYY-MM-DD')]
-}; 
+/**
+ * First and last day of a period, both included (the API counts the last day in full): "Сегодня" is
+ * today only (it was yesterday and today), "Неделя" the last 7 days with today (today was left out).
+ * Computed at each load, so a page left open overnight moves on to the new day.
+ */
+function periodDates(p: Period): [string, string] {
+    const day = (shift: number) => moment().subtract(shift, 'day').format('YYYY-MM-DD');
+    switch (p) {
+        case Period.Yesterday: return [day(1), day(1)];
+        case Period.Week: return [day(6), day(0)];
+        case Period.Month: return [day(29), day(0)];
+        default: return [day(0), day(0)];
+    }
+}
 
 const fileService = useService('files', {auth: true});
 const userService = useService('users', {auth: true});
+const staffService = useService('users/staff', {auth: true});
 const userAnalyticsService = useService('analytics/users', {auth: true});
 const desktopServie = useService('desktop', {auth: true});
 const objectiveResultService = useService('analytics/objectives/results');
@@ -103,19 +111,28 @@ const period = ref(route.query.period as Period || Period.Today);
 const sel = ref(ownOnly.value ? Selector.Mine : (route.query.sel as Selector || Selector.All));
 const selectedUsers = ref<User[]>([]);
 
+// the people picked in "Мои ▾": their numbers (the API filters by user_ids)
+const picked = computed(() => !ownOnly.value && sel.value === Selector.Custom && selectedUsers.value.length > 0);
+
 function fetchStats() {
-    let [fromDate, tillDate] = periodDatesMap[period.value];
-    if (period.value === Period.Custom) {
+    let [fromDate, tillDate] = periodDates(period.value);
+    if (period.value === Period.Custom && date.value?.length === 2) {
         [fromDate, tillDate] = date.value;
     }
 
-    runStats(desktopServie.find({from_date: fromDate, till_date: tillDate, my_stats: ownOnly.value || sel.value === Selector.Mine}).exec());
+    runStats(desktopServie.find({
+        from_date: fromDate,
+        till_date: tillDate,
+        my_stats: ownOnly.value || sel.value === Selector.Mine,
+        ...(picked.value ? {user_ids: selectedUsers.value.map((u) => u.id)} : {}),
+    }).exec());
     // the newest files of the period (an agent: own ones, like the numbers); the list
-    // of files is behind the "files" switch of the staff card (403 otherwise)
+    // of files is behind the "files" switch of the staff card (403 otherwise);
+    // the files list takes the end exclusive: the day after the last one
     if (ability.can('read', 'File')) {
         runFiles(fileService.find({
             created_at_from: fromDate,
-            created_at_till: tillDate,
+            created_at_till: moment(tillDate).add(1, 'day').format('YYYY-MM-DD'),
             limit: 10,
             ...(ownOnly.value ? {uploaded_by: currentUser.value?.id} : {}),
         }).exec());
@@ -146,9 +163,31 @@ async function download(file: FileStat) {
     if (!result.ok) toast.show({message: result.error.message, type: 'error', timeout: 3000});
 }
 
+/** The staff accounts for "Мои ▾" (GET /users/staff, no page limit); an older API: users minus the contacts. */
+async function staffUsers(): Promise<PaginatedResponse<User>> {
+    try {
+        return await staffService.find<PaginatedResponse<User>>().exec();
+    } catch (e) {
+        return await userService.find<PaginatedResponse<User>>({limit: 1000}).exec();
+    }
+}
+
 const employees = computed(() => {
     return users.value.data.filter((u) => u.role !== UserRole.CtrAgent);
 });
+
+// "Сделки по менеджерам": the people of the numbers above (me for "Мои", the picked ones)
+const shownUserStats = computed(() => {
+    if (sel.value === Selector.Mine) return userStats.value.filter((u) => u.id === currentUser.value?.id);
+    if (picked.value) return userStats.value.filter((u) => selectedUsers.value.some((s) => s.id === u.id));
+    return userStats.value;
+});
+
+// a counter opens the task list with the same tasks: mine, the picked people's or everybody's
+function tasksLink(status: 'overdue' | 'open' | 'closed') {
+    if (picked.value) return {path: '/tasks', query: {status, user_id: selectedUsers.value.map((u) => String(u.id))}};
+    return {path: '/tasks', query: {status, scope: ownOnly.value || sel.value === Selector.Mine ? 'mine' : 'all'}};
+}
 
 
 const objectiveResult = computed(() => {
@@ -244,6 +283,8 @@ watch(employees, () => {
 });
 
 watch([period, sel], fetchStats);
+// a new choice of people in "Мои ▾" (the route keeps sel=custom)
+watch(selectedUsers, () => { if (sel.value === Selector.Custom) fetchStats(); });
 // live: the numbers follow new deals, tasks, files and calls (at most every 2 s)
 useLive((changes) => {
     if (["deals", "tasks", "events", "files", "calls"].some((t) => liveTouches(changes, t))) fetchStats();
@@ -251,7 +292,7 @@ useLive((changes) => {
 
 onMounted(() => {
     fetchStats();
-    if (!ownOnly.value) run(userService.find({limit: 1000}).exec());
+    if (!ownOnly.value) run(staffUsers());
 });
 
 </script>
@@ -334,7 +375,7 @@ onMounted(() => {
                             lead="tight"
                             class="text-muted-500 dark:text-white uppercase"
                         >
-                            <span>Просреченные задачи</span>
+                            <span>Просроченные задачи</span>
                         </BaseHeading>
                     </div>
                     <div class="mb-2">
@@ -345,13 +386,14 @@ onMounted(() => {
                             lead="tight"
                             class="text-purple-600"
                         >
-                            <span>{{ stats.task_stats?.tasks_overdue }}</span>
+                            <NuxtLink :to="tasksLink('overdue')" class="hover:underline">{{ stats.task_stats?.tasks_overdue }}</NuxtLink>
                         </BaseHeading>
                     </div>
                     <hr class="border border-muted-200 dark:border-muted-600" />
+                    <!-- overdue is a state: every task overdue now, whatever the period -->
                     <div class="text-green-500 flex flex-col font-sans text-2xl mt-2">
                         <span>{{ stats.task_stats?.tasks_overdue }}</span>
-                        <span class="text-muted-400 text-xs"> за {{ periodDisplay(period) }}</span>
+                        <span class="text-muted-400 text-xs"> на сейчас</span>
                     </div>
                 </BaseCard>
                 <BaseCard class="p-4 col-span-2 sm:col-span-1">
@@ -374,7 +416,7 @@ onMounted(() => {
                             lead="tight"
                             class="text-green-500"
                         >
-                            <span>{{ stats.task_stats?.tasks_closed }}</span>
+                            <NuxtLink :to="tasksLink('closed')" class="hover:underline">{{ stats.task_stats?.tasks_closed }}</NuxtLink>
                         </BaseHeading>
                         <span class="text-muted-400 text-xs mt-2"> за {{ periodDisplay(period) }}</span>
                     </div>
@@ -399,7 +441,7 @@ onMounted(() => {
                             lead="tight"
                             class="text-purple-600"
                         >
-                            <span>{{ stats.task_stats?.active_tasks }}</span>
+                            <NuxtLink :to="tasksLink('open')" class="hover:underline">{{ stats.task_stats?.active_tasks }}</NuxtLink>
                         </BaseHeading>
                     </div>
                     <hr class="border border-muted-200 dark:border-muted-600" />
@@ -484,11 +526,11 @@ onMounted(() => {
                 </div>
                 <hr class="border border-muted-200 dark:border-muted-600" />
                 <ul class="flex flex-col mt-2">
-                    <li v-for="user in userStats" class="text-[15px] text-muted-700 dark:text-white flex items-center justify-between border-t-2 border-t-amber-500 first:border-t-0 py-1.5">
+                    <li v-for="user in shownUserStats" class="text-[15px] text-muted-700 dark:text-white flex items-center justify-between border-t-2 border-t-amber-500 first:border-t-0 py-1.5">
                         <p>{{ user.username }} <span class="font-medium">{{ user.deal_count }} сделок</span></p>
                         <Money class="text-green-500" :value="Number(user.deal_budget)" />
                     </li>
-                    <li v-if="!userStats.length && !userStatsLoading" class="text-sm text-muted-400 py-1.5">Нет сделок за период</li>
+                    <li v-if="!shownUserStats.length && !userStatsLoading" class="text-sm text-muted-400 py-1.5">Нет сделок за период</li>
                 </ul>
             </BaseCard>
             <BaseCard v-if="!ownOnly" class="col-span-12 md:col-span-6 xl:col-span-4 p-4 h-full">

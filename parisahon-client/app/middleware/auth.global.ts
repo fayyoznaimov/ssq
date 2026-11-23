@@ -1,5 +1,20 @@
 import type { User } from '~/types/user';
-import { ability } from '~/utils/casl';
+import { type AccessModel, ability, abilityFor } from '~/utils/casl';
+
+/**
+ * GET /auth/access: the user's rights by the API's own rules (src/auth/access.ts).
+ * null when the API does not answer it (an older API): the rules are then built from the user card.
+ * A 401 is passed on: useService() has already ended the session.
+ */
+function loadAccess(): Promise<AccessModel | null> {
+    return useService('auth', { auth: true })
+        .get<AccessModel>('access')
+        .exec()
+        .catch((e: any) => {
+            if ((e?.statusCode ?? e?.status) === 401) throw e;
+            return null;
+        });
+}
 
 export default defineNuxtRouteMiddleware(async (to) => {
     if (!to.meta.authRoute)
@@ -11,14 +26,16 @@ export default defineNuxtRouteMiddleware(async (to) => {
     }
 
     const user = useState<User>('user');
+    const access = useState<AccessModel | null>('access', () => null);
 
     // Loaded once per page load, then refreshed in the background on every
     // navigation so that a role / permission change shows up without a re-login.
     // A 401 here (token rejected by the API) is handled inside useService():
     // the token is cleared and the browser goes to /login.
-    const refresh = useUser().exec().then((u) => {
+    const refresh = Promise.all([useUser().exec(), loadAccess()]).then(([u, rights]) => {
         user.value = u;
-        ability.update(abilityFor(u));
+        access.value = rights;
+        ability.update(abilityFor(u, rights));
         return u;
     });
 

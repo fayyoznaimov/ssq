@@ -119,7 +119,7 @@ def main():
     users = {}
     try:
         print("== setup")
-        for key in ("a", "b"):
+        for key in ("a", "b", "c"):
             person = {"email": f"audit-tg-{RUN}-{key}@example.test", "password": secrets.token_urlsafe(12),
                       "username": f"{TAG}-{key}", "role": "agent", "group_id": groups[0], "permissions": perms,
                       "phone": f"+99890{random.randint(1000000, 9999999)}"}
@@ -130,7 +130,7 @@ def main():
             person["token"] = api("POST", "/auth/login", {"email": person["email"], "password": person["password"]})[1]["access_token"]
             person["tg"] = 6_000_000_000 + random.randint(1, 900_000_000)
             users[key] = person
-        A, B = users["a"], users["b"]
+        A, B, C = users["a"], users["b"], users["c"]
         client_tg = 7_000_000_000 + random.randint(1, 900_000_000)
         client_phone_digits = f"99893{random.randint(1000000, 9999999)}"
 
@@ -210,8 +210,17 @@ def main():
         check("the same client writes to manager B -> no second deal: the client's open deal (A's) gets it", r[1].get("status") == "saved" and r[1].get("contact_id") == contact_id
               and not r[1].get("created_deal") and r[1].get("deal_ids") == [deal_id], r)
         psql(f"update deal set closed_at = now() where id = {deal_id}")
-        r = incoming(A, 1005, "Новый заказ")
-        check("after the deal is closed a new message opens a new deal", r[1].get("created_deal") is True and r[1].get("deal_ids") != [deal_id], r)
+        r = incoming(A, 1005, "Спасибо, получили")
+        check("a client's message right after the deal was closed goes into that deal, no new deal (TG-9)",
+              r[1].get("status") == "saved" and r[1].get("deal_ids") == [deal_id] and not r[1].get("created_deal"), r)
+        n = psql(f"select count(*) from task where deal_id = {deal_id} and closed_at is null and label like 'Авто: клиент написал после закрытия%'")
+        check("... and the manager gets one task to look at it", n == "1", n)
+        r = incoming(A, 1006, "Поздравляем с праздником!", outgoing=True)
+        check("a message the manager sends from the phone never opens a deal: it goes into the client's latest deal",
+              r[1].get("status") == "saved" and r[1].get("deal_ids") == [deal_id] and not r[1].get("created_deal"), r)
+        psql(f"update deal set closed_at = now() - interval '3 days' where id = {deal_id}")
+        r = incoming(A, 1007, "Новый заказ")
+        check("days after the close a client's message opens a new deal", r[1].get("created_deal") is True and r[1].get("deal_ids") != [deal_id], r)
         new_deal = r[1]["deal_ids"][0]
         row = psql(f"select repeat_of_id from deal where id = {new_deal}")
         check("the new deal is a repeat request of the client's previous deal", row == str(deal_id), row)
@@ -230,7 +239,7 @@ def main():
         status, events = api("GET", f"/deals/{deal_id}/events?page=1&limit=50", token=admin)
         items = events.get("data", events) if isinstance(events, dict) else events
         tg = [e for e in (items or []) if e.get("type") == 12] if isinstance(items, list) else []
-        check("GET /deals/:id/events lists the Telegram messages (4 to A, 1 that the client wrote to B)", status == 200 and len(tg) == 5, (status, len(tg)))
+        check("GET /deals/:id/events lists the Telegram messages (6 of A, 1 that the client wrote to B)", status == 200 and len(tg) == 7, (status, len(tg)))
         first = next((e for e in tg if e.get("tg_message_id") in (1001, "1001")), None) or (tg[-1] if tg else {})
         check("an incoming message shows the contact as its author and the manager as the target",
               first.get("originated_by", {}).get("id") == contact_id and (first.get("target_user") or {}).get("id") == A["id"], first)
@@ -258,6 +267,95 @@ def main():
         row = psql(f"select deal_id from event where id = {ev_file}")
         check("admin moves it back -> 200", r[0] == 200 and row == str(deal_id), (r, row))
 
+        print("== one deal per message (TG-10), edits, files without a name (TG-5), duplicates per manager")
+        psql(f"update deal set closed_at = null where id = {deal_id}")  # A has two open deals with the client now
+        r = incoming(A, 8001, "Один раз", date="2026-11-20T10:00:00+05:00")
+        n = psql("select count(*) from event where type = 12 and tg_message_id = 8001")
+        check("with two open deals a message is saved once, in the deal the conversation goes on in",
+              r[1].get("status") == "saved" and r[1].get("deal_ids") == [new_deal] and n == "1", (r, n))
+        ev = psql(f"select id from event where type = 12 and tg_message_id = 8001")
+        api("PATCH", "/deals/events/remap", {"event_id": int(ev or 0), "replace_with_deal_id": deal_id}, token=A["token"])
+        r = incoming(A, 8002, "За ним", date="2026-11-20T11:00:00+05:00")
+        check("a message moved by hand to the other deal pulls the next ones there", r[1].get("deal_ids") == [deal_id], r)
+        r = incoming(A, 8003, "Из сделки", outgoing=True, deal_id=new_deal, date="2026-11-20T12:00:00+05:00")
+        check("a message written from a deal (deal_id) is recorded in that deal", r[1].get("deal_ids") == [new_deal], r)
+        psql(f"update deal set closed_at = now() - interval '3 days' where id = {deal_id}")
+        r = incoming(A, 1002, "Ещё вопрос (исправлено)", edited=True)
+        row = psql(f"select after_state->>'message', after_state->>'original_message', after_state->>'edited', "
+                   f"(select count(*) from event e2 where e2.type = 12 and e2.tg_message_id = 1002) from event where type = 12 and tg_message_id = 1002 and user_id = {contact_id}")
+        check("an edit in Telegram replaces the recorded text (the first one is kept), nothing new is created",
+              r[1].get("status") == "updated" and row == "Ещё вопрос (исправлено)|Ещё вопрос|true|1", (r, row))
+        r = incoming(A, 99999, "правка", edited=True)
+        check("an edit of a message the CRM does not have creates nothing", r[1].get("status") == "ignored", r)
+        r = incoming(A, 8004, "", files=[{"name": None, "path": f"video_{RUN}.mp4", "type": "video", "caption": "брак"}])
+        row = psql(f"select name, extension from file where path = 'video_{RUN}.mp4'")
+        check("a phone video without a file name is saved (named by its kind), not refused with the caption",
+              r[0] == 201 and r[1].get("status") == "saved" and row == "Видео|.mp4", (r, row))
+        r = incoming(B, 1001, "Здравствуйте, нужен текстиль")
+        check("the same Telegram message id in another manager's chat is another message (not a duplicate)", r[1].get("status") == "saved", r)
+
+        print("== not for the CRM: colleagues, «Не клиент», messages from the phone, known contacts only (TG-4)")
+        r = incoming(A, 7001, "Привет, коллега", chat={"tg_id": B["tg"], "first_name": "Коллега"})
+        check("a chat with a colleague's Telegram account -> ignored (staff), no contact", r[0] == 201 and r[1].get("status") == "ignored" and r[1].get("reason") == "staff", r)
+        r = incoming(A, 7002, "Привет", chat={"tg_id": 7_000_000_000 + random.randint(1, 900_000_000), "phone": B["phone"], "first_name": "Коллега"})
+        check("... and by the colleague's phone", r[1].get("status") == "ignored" and r[1].get("reason") == "staff", r)
+        stranger_phone = f"99891{random.randint(1000000, 9999999)}"
+        stranger = {"tg_id": 7_000_000_000 + random.randint(1, 900_000_000), "phone": "+" + stranger_phone, "first_name": TAG, "last_name": "Друг"}
+        r = incoming(A, 7003, "С днём рождения!", outgoing=True, chat=stranger)
+        n = psql(f"select count(*) from \"user\" where tg_id = {stranger['tg_id']}")
+        check("a message from the phone to somebody who is not in the CRM -> ignored, no contact",
+              r[1].get("status") == "ignored" and r[1].get("reason") == "outgoing_unknown" and n == "0", (r, n))
+        st, item = api("POST", "/messenger/ignored", {"phone": "+" + stranger_phone, "label": TAG + " друг"}, A["token"])
+        check("POST /messenger/ignored with a phone -> 201, in the manager's own list",
+              st == 201 and item.get("agent_id") == A["id"] and item.get("phone_key") == stranger_phone[-9:], (st, item))
+        r = incoming(A, 7004, "Привет!", chat=stranger)
+        n = psql(f"select count(*) from \"user\" where tg_id = {stranger['tg_id']}")
+        check("«Не клиент»: the person writes -> ignored, no contact, no deal", r[1].get("reason") == "not_client" and n == "0", (r, n))
+        r = incoming(B, 7005, "Привет!", chat=stranger)
+        check("the list is per manager: for B the same person is a new client", r[1].get("status") == "saved" and r[1].get("created_contact") is True, r)
+        r = incoming(A, 7006, "Ещё раз", chat=stranger)
+        check("... and for A stays «Не клиент» although the person is a contact now", r[1].get("reason") == "not_client", r)
+        st, _ = api("GET", f"/messenger/ignored?user_id={A['id']}", token=B["token"])
+        check("an agent cannot read another manager's list -> 403", st == 403, st)
+        st, _ = api("DELETE", f"/messenger/ignored/{item.get('id', 0)}", token=B["token"])
+        check("an agent cannot remove from another manager's list -> 403", st == 403, st)
+        st, lst = api("GET", "/messenger/ignored", token=A["token"])
+        check("GET /messenger/ignored: the own list", st == 200 and any(i.get("id") == item.get("id") for i in lst or []), (st, lst))
+        st, _ = api("DELETE", f"/messenger/ignored/{item.get('id', 0)}", token=A["token"])
+        r = incoming(A, 7007, "Теперь клиент", chat=stranger)
+        check("removed from the list -> the next message is recorded", st == 200 and r[1].get("status") == "saved", (st, r))
+        # B's deal rights are «own» for view and update: A's deal is not visible to B, so it answers 404
+        # (as every deal route of the CRM does; 403 is for a deal one sees but may not change), nothing is listed
+        st, _ = api("POST", "/messenger/ignored", {"contact_id": contact_id, "deal_id": new_deal}, B["token"])
+        n = psql(f"select count(*) from messenger_ignore where contact_id = {contact_id}")
+        check("«Не клиент» from someone else's deal the user cannot see -> 404, nothing added to any list", st == 404 and n == "0", (st, n))
+        st, item2 = api("POST", "/messenger/ignored", {"contact_id": contact_id, "deal_id": new_deal}, A["token"])
+        check("«Не клиент» from the deal: the contact's Telegram id goes to the deal manager's list",
+              st == 201 and item2.get("agent_id") == A["id"] and str(item2.get("tg_id")) == str(client_tg) and item2.get("contact_id") == contact_id, (st, item2))
+        r = incoming(A, 7008, "Ещё")
+        n = psql(f"select count(*) from deal where id in (select \"dealId\" from deal_user where \"userId\" = {contact_id}) and deleted_at is null")
+        check("... its messages are not recorded any more; the contact and its deals stay", r[1].get("reason") == "not_client" and int(n or 0) >= 2, (r, n))
+        api("DELETE", f"/messenger/ignored/{item2.get('id', 0)}", token=A["token"])
+        st, s = api("GET", "/messenger/settings", token=A["token"])
+        default_known = bool((s or {}).get("default_known_only")) if st == 200 else True
+        st, s = api("PATCH", "/messenger/settings", {"channel": "telegram", "known_only": True}, A["token"])
+        check("PATCH /messenger/settings: «только известные контакты» of the manager", st == 200 and s.get("known_only", {}).get("telegram") is True, (st, s))
+        lead = {"tg_id": 7_000_000_000 + random.randint(1, 900_000_000), "first_name": TAG, "last_name": "Лид"}
+        r = incoming(A, 7009, "Новый лид", chat=lead)
+        check("known contacts only: an unknown person -> ignored for this manager", r[1].get("reason") == "unknown_contact", r)
+        if not default_known:
+            r = incoming(B, 7010, "Новый лид", chat=lead)
+            check("... another manager without the setting gets the new client", r[1].get("status") == "saved" and r[1].get("created_contact") is True, r)
+        st, s = api("PATCH", "/messenger/settings", {"channel": "telegram", "known_only": None}, A["token"])
+        check("known_only: null -> back to the server default", st == 200 and s.get("known_only", {}).get("telegram") is default_known, (st, s))
+        st, _ = api("PATCH", "/messenger/settings", {"user_id": B["id"], "known_only": True}, A["token"])
+        check("an agent cannot change another manager's settings -> 403", st == 403, st)
+
+        print("== a manager who is not a staff user any more (TG-14)")
+        st, _ = api("DELETE", f"/users/{C['id']}", token=admin)
+        r = incoming(C, 9001, "Клиент пишет уволенному")
+        check("a message for a deleted staff user -> 410 (the service keeps it aside, the CRM disconnects the session)", st == 200 and r[0] == 410, (st, r))
+
         print("== people: rights on /telegram/*")
         r = api("POST", "/telegram/send-code", {"user_id": A["id"]}, token=B["token"])
         check("send-code for another user's account as an agent -> 403", r[0] == 403, r)
@@ -279,24 +377,45 @@ def main():
         check("send-message to a client without a common open deal, as the wrong user -> 403 first", r[0] == 403, r)
         r = api("POST", "/telegram/send-message", {"from_user": str(B["id"]), "to_user": str(known_id), "message": "x"}, token=B["token"])
         check("send-message to a client without a common open deal -> 400", r[0] == 400 and "сделки" in message_of(r), r)
+        # the client's deals already hold outgoing messages (from the phone, and 8003 written from new_deal): count the new ones
+        outgoing_sql = (f"select count(*) from event where type = 12 and outgoing and deal_id in "
+                        f"(select \"dealId\" from deal_user where \"userId\" = {contact_id})")
+        before = psql(outgoing_sql)
         r = api("POST", "/telegram/send-message", {"from_user": str(A["id"]), "to_user": str(contact_id), "message": "Привет"}, token=A["token"])
         check("send-message with an open deal reaches the Telegram service: 400 'нет подключённого Telegram' from the dev service or 503 without one",
               (r[0] == 400 and "Telegram" in message_of(r)) or r[0] == 503, r)
-        n = psql(f"select count(*) from event where deal_id = {new_deal} and type = 12 and outgoing")
-        check("a message Telegram did not accept is not written to the history", n == "0", n)
+        after = psql(outgoing_sql)
+        check("a message Telegram did not accept is not written to the history", after == before, (before, after))
         r = api("GET", "/telegram/active-sessions", token=A["token"])
         check("GET /telegram/active-sessions answers (list, or 503 without the service)", (r[0] == 200 and isinstance(r[1], list)) or r[0] == 503, r)
+        r = api("POST", "/telegram/send-message", {"from_user": str(A["id"]), "to_user": str(contact_id), "message": "x", "deal_id": "999999999"}, token=A["token"])
+        check("send-message from a deal the user cannot write from -> 400", r[0] == 400, r)
+        r = api("POST", "/telegram/send-message", {"from_user": str(A["id"]), "to_user": str(contact_id), "message": "  "}, token=A["token"])
+        check("send-message with neither text nor files -> 400", r[0] == 400, r)
+        r = api("DELETE", f"/telegram/session?user_id={A['id']}", token=B["token"])
+        check("disconnect another user's Telegram as an agent -> 403", r[0] == 403, r)
+        r = api("DELETE", "/telegram/session", token=A["token"])
+        check("disconnect the own Telegram passes the rights check (200, or 503 without the service)", r[0] in (200, 503), r)
+        r = api("DELETE", f"/telegram/session?user_id={C['id']}", token=admin)
+        check("admin may disconnect a deleted user's Telegram (200, or 503 without the service)", r[0] in (200, 503), r)
+        r = api("GET", "/messenger/status", token=A["token"])
+        check("GET /messenger/status: the own Telegram and WhatsApp in words",
+              r[0] == 200 and all(isinstance((r[1] or {}).get(k), dict) and (r[1] or {})[k].get("text") for k in ("telegram", "whatsapp")), r)
+        r = api("GET", f"/messenger/status?user_id={A['id']}", token=B["token"])
+        check("another user's messenger state -> 403 for an agent", r[0] == 403, r)
 
     finally:
         print("== cleanup")
         ids = ",".join(str(u["id"]) for u in users.values()) or "0"
         contacts = f"select id from \"user\" where username like '{TAG}%' and role = 'ctr_agent'"
         deals = f"select id from deal where agent_id in ({ids}) or id in (select \"dealId\" from deal_user where \"userId\" in ({contacts}))"
+        tasks = f"select id from task where deal_id in ({deals})"
         psql(";".join([
             "begin",
-            f"delete from event where deal_id in ({deals}) or user_id in ({ids}) or user_id in ({contacts}) or target_user_id in ({contacts}) or target_user_id in ({ids})",
+            f"delete from event where deal_id in ({deals}) or user_id in ({ids}) or user_id in ({contacts}) or target_user_id in ({contacts}) or target_user_id in ({ids}) or task_id in ({tasks})",
+            f"delete from task where id in ({tasks})",
             f"delete from deal_file where \"dealId\" in ({deals})",
-            f"delete from file where uploaded_by in ({contacts}) or uploaded_by in ({ids}) or path like 'document_{RUN}.pdf'",
+            f"delete from file where uploaded_by in ({contacts}) or uploaded_by in ({ids}) or path like 'document_{RUN}.pdf' or path like 'video_{RUN}.mp4'",
             f"delete from deal_stage_record where deal_id in ({deals})",
             f"delete from deal_user where \"dealId\" in ({deals})",
             f"delete from deal where id in ({deals})",

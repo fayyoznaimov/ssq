@@ -34,6 +34,7 @@ import { FetchEmailToDto } from './dto/fetch.email.to.dto';
 import { MailAccessGuard } from './mail-access.guard';
 import { MailAssistService } from './mail-assist.service';
 import { AssistEmailDto } from './dto/assist.email.dto';
+import { CreateDealsFromLettersDto, LinkLetterContactsDto } from './dto/create.deals.dto';
 
 @UseGuards(AuthGuard, MailAccessGuard)
 @Controller('emails')
@@ -53,6 +54,12 @@ export class EmailController {
       this.emailService.syncEmailsFromAllMailBoxes(query, request),
     );
   }
+  /** How the copying of the mailboxes went: the last successful run, failing mailboxes and letters. */
+  @Get('sync-status')
+  syncStatus(): Record<string, any> {
+    return this.emailService.syncStatus();
+  }
+
   /** Writing assistant: check spelling and meaning, rewrite, translate, draft or reply (suggestions only). */
   @Post('assist')
   @HttpCode(200)
@@ -67,14 +74,16 @@ export class EmailController {
     @Req() request: Request,
   ): Promise<Record<string, any>> {
     const user = await this.helperService.extractUserFromRequest(request);
-    return instanceToPlain(this.emailService.fetchLocalEmails(query, user));
+    return instanceToPlain(this.emailService.fetchLocalEmails(query, user, request['user']));
   }
 
+  /** The user's own sender mailboxes; ?all=true: the admin sees everybody's, with the owner. */
   @Get('transporters')
   async fetchTransporters(
     @Req() request: Request,
+    @Query('all') all?: string,
   ): Promise<Record<string, any>> {
-    return instanceToPlain(this.emailService.fetchTransporters(request));
+    return instanceToPlain(this.emailService.fetchTransporters(request, all === 'true'));
   }
 
   @Get('templates')
@@ -89,11 +98,16 @@ export class EmailController {
     return this.emailService.fetchUsersWithSigns();
   }
 
+  /** Recipients of all letters (the filter «Почты агентов»): admin and manager only, an empty list for others. */
   @Get('agents-email')
   async fetchEmailTo(
     @Query() query: FetchEmailToDto,
+    @Req() request: Request,
   ): Promise<PaginationResponseDto<EmailTo[]>> {
-    return this.emailService.fetchEmailTo(query);
+    return this.emailService.fetchEmailTo(
+      query,
+      await this.helperService.extractUserFromRequest(request),
+    );
   }
 
   @Patch('signs')
@@ -143,6 +157,26 @@ export class EmailController {
     return instanceToPlain(this.emailService.createTransporter(data, request));
   }
 
+  /** «доб.сделку»: a deal with the client of the letters (found or made), the letters in its history. */
+  @Post('deals')
+  async createDealsFromLetters(
+    @Body() data: CreateDealsFromLettersDto,
+    @Req() request: Request,
+  ): Promise<Record<string, any>> {
+    return this.emailService.createDealsFromLetters(
+      data,
+      await this.helperService.extractUserFromRequest(request),
+      request['user'],
+    );
+  }
+
+  /** «доб.контакты»: contacts made from letters; their stored letters point to them. */
+  @Post('contacts')
+  @HttpCode(200)
+  async linkLetterContacts(@Body() data: LinkLetterContactsDto): Promise<{ letters: number; history: number }> {
+    return this.emailService.linkLetterContacts(data.user_ids);
+  }
+
   @Post('templates')
   async createTemplate(
     @Req() request: Request,
@@ -161,6 +195,7 @@ export class EmailController {
     return this.emailService.fetchOneLocalEmail(
       id,
       await this.helperService.extractUserFromRequest(request),
+      request['user'],
     );
   }
 
@@ -175,6 +210,31 @@ export class EmailController {
     );
   }
 
+  /** «Не спам»: back to the inbox. */
+  @Patch(':id/not-spam')
+  async markAsNotSpam(
+    @Param('id', ParseIntPipe) id: number,
+    @Req() request: Request,
+  ): Promise<void> {
+    return this.emailService.markAsNotSpam(
+      id,
+      await this.helperService.extractUserFromRequest(request),
+    );
+  }
+
+  /** «Восстановить» a deleted letter (it is in the Trash mailbox of the server). */
+  @Patch(':id/restore')
+  async restoreEmail(
+    @Param('id', ParseIntPipe) id: number,
+    @Req() request: Request,
+  ): Promise<void> {
+    return this.emailService.restoreEmail(
+      id,
+      await this.helperService.extractUserFromRequest(request),
+    );
+  }
+
+  /** Moves the letter to the Trash mailbox (it is no longer erased on the server for good). */
   @Delete(':id')
   async deleteEmail(
     @Param('id', ParseIntPipe) id: number,
@@ -194,8 +254,8 @@ export class EmailController {
     @UploadedFiles() files: Array<Express.Multer.File>,
     @Body() data: SendEmailDto,
     @Req() request: Request,
-  ): Promise<void> {
-    return this.emailService.sendEmail(
+  ): Promise<Record<string, any>> {
+    return this.emailService.sendFromForm(
       data,
       await this.helperService.extractUserFromRequest(request),
       files,

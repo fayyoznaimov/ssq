@@ -4,6 +4,7 @@ import {
   IsEnum,
   IsNumber,
   IsObject,
+  IsOptional,
   IsString,
   Length,
   ValidateNested,
@@ -75,8 +76,10 @@ export class CreateTaskDto {
   @Length(3, 255)
   label: string;
 
+  // without a type the task gets the default one (DEFAULT_TASK_TYPE, see task_type/default-task-type.ts)
+  @IsOptional()
   @IsNumber()
-  type_id: number;
+  type_id?: number;
 
   @IsObject()
   @ValidateNested()
@@ -96,4 +99,45 @@ export class CreateTaskDto {
 
   @IsBoolean()
   allDay: boolean;
+}
+
+/**
+ * PATCH /tasks/:id: only what is sent changes. A drag in the calendar or on the board sends the
+ * times; the task keeps its type, assignee and links (a deal stays linked when the client sends
+ * the company of that deal, as older clients do).
+ */
+export class UpdateTaskDto {
+  @IsOptional()
+  @Trim()
+  @IsString()
+  @Length(3, 255)
+  label?: string;
+
+  @IsOptional()
+  @IsNumber()
+  type_id?: number;
+
+  @IsOptional()
+  @IsObject()
+  @ValidateNested()
+  @TypeDecorator(() => AssignToDto)
+  assign_to?: AssignToDto;
+
+  @IsOptional()
+  @IsObject()
+  @ValidateNested()
+  @TypeDecorator(() => LinkToDto)
+  link_to?: LinkToDto;
+
+  @IsOptional()
+  @IsDateString()
+  start_time?: Date;
+
+  @IsOptional()
+  @IsDateString()
+  end_time?: Date;
+
+  @IsOptional()
+  @IsBoolean()
+  allDay?: boolean;
 }

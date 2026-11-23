@@ -25,7 +25,7 @@ import { instanceToPlain } from 'class-transformer';
 import { EventsService } from '../events/events.service';
 import { CreateCommentDto } from '../events/dto/create.comment.dto';
 import { CreateChatMessageDto } from '../events/dto/create.chat.message.dto';
-import { SearchDealDto } from './dto/search.deal.dto';
+import { SearchDealBoardDto, SearchDealDto } from './dto/search.deal.dto';
 import { SearchEventDto } from '../events/dto/search.event.dto';
 import { PaginationRequestDto } from '../helper/dto/pagination.dto';
 import { FileService } from '../file/file.service';
@@ -56,6 +56,18 @@ export class DealController {
     return instanceToPlain(this.dealService.fetchDealStats(query, request['user']));
   }
 
+  /**
+   * The kanban: the totals of every column counted by the database and the first cards of
+   * every column (`per_stage`), `before_id` for «Показать ещё» of one column (`stages`).
+   */
+  @Get('board')
+  async fetchBoard(
+    @Query() query: SearchDealBoardDto,
+    @Req() request: Request,
+  ): Promise<Record<string, any>> {
+    return instanceToPlain(await this.dealService.fetchBoard(query, request['user']));
+  }
+
   @Get('available-filters')
   async getAvailableFilters(): Promise<DealFilter[]> {
     return this.dealService.getDealFilters();
@@ -64,8 +76,9 @@ export class DealController {
   /** "Клиент" block of the deal card: the client's contacts, company and other deals. */
   @Get(':id/client-history')
   @DealAccess('view')
-  async clientHistoryOf(@Param('id', ParseIntPipe) id: number) {
-    return this.clientHistory.forDeal(id);
+  async clientHistoryOf(@Param('id', ParseIntPipe) id: number, @Req() request: Request) {
+    // the client's other deals: only those the user may see
+    return this.clientHistory.forDeal(id, new Access(request['user']));
   }
 
   @Get(':id')
@@ -269,12 +282,16 @@ export class DealController {
     );
   }
 
+  /** The file goes off the deal; the history of the deal says who removed which file. */
   @Delete(':id/files/:file_id')
   @DealAccess('update')
-  deleteSingleFile(
+  async deleteSingleFile(
     @Param('id', ParseIntPipe) deal_id: number,
     @Param('file_id', ParseIntPipe) file_id: number,
+    @Req() request: Request,
   ): Promise<void> {
-    return this.fileService.deleteUploadedFile(deal_id, file_id);
+    const file = await this.fileService.fetchSingleSavedFile(deal_id, file_id);
+    await this.fileService.deleteUploadedFile(deal_id, file_id);
+    await this.dealService.noteFileRemoved(deal_id, file.name, request);
   }
 }

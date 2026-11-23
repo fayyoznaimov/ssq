@@ -56,6 +56,11 @@ export class SearchEmailDto extends PaginationRequestDto {
   @IsBooleanString()
   is_spam: string;
 
+  /** "true": the letters deleted in the CRM and those in the Trash mailbox («Удалённые») */
+  @IsOptional()
+  @IsBooleanString()
+  deleted: string;
+
   @IsOptional()
   @IsString()
   email_to: string;

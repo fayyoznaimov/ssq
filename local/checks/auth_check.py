@@ -111,10 +111,11 @@ def read_env(path, key):
 
 # -------------------------------------------------------------------------- http
 
-def http(method, path, token=None, body=None, raw_token=None, timeout=60):
+def http(method, path, token=None, body=None, raw_token=None, timeout=60, extra_headers=None):
     """Returns (status, parsed json | text | None). Retries while the API restarts."""
     url = path if path.startswith('http') else BASE + path
     headers = {'Accept': 'application/json'}
+    headers.update(extra_headers or {})
     data = None
     if body is not None:
         data = json.dumps(body).encode()
@@ -475,6 +476,8 @@ def main():
             ('POST', '/groups', {'name': TAG + '-g'}),
             ('PATCH', '/groups/%d' % MISSING_ID, {'name': TAG + '-g'}),
             ('DELETE', '/groups/%d' % MISSING_ID, None),
+            ('GET', '/groups/%d/usage' % MISSING_ID, None),
+            ('POST', '/auth/logout/%d' % MISSING_ID, None),
             ('PATCH', '/settings', {}),
             ('POST', '/fillers', {}),
             ('PATCH', '/fillers/%d' % MISSING_ID, {}),
@@ -491,7 +494,7 @@ def main():
             ('DELETE', '/users/%d' % agent2['id'], None),
         ]
         manager_only_gets = [
-            '/analytics/deals', '/analytics/calls', '/analytics/users',
+            '/analytics/deals', '/analytics/calls', '/analytics/users', '/analytics/managers',
             '/analytics/consolidated-report', '/analytics/objectives', '/analytics/control',
             '/analytics/objectives/results', '/logs', '/users/manager-statistics',
             '/desktop?from_date=2026-01-01&till_date=2026-12-31&my_stats=false',
@@ -690,10 +693,16 @@ def main():
         check('too short new password -> 400', status == 400, 'status %s' % status)
         status, _, _ = login(agent['email'], agent['password'])
         check('failed attempts did not change the password', status == 200, 'status %s' % status)
+        bot_linked = link_bot(agent['id'])
         status, _ = http('PATCH', '/users/me/password', token=agent['token'], body={
             'old_password': agent['password'], 'new_password': new_password,
             'role': 'admin', 'group_id': group_ids[-1], 'id': admin_id, 'user_id': admin_id})
         check('agent changes own password (old + new) -> 200', status == 200, 'status %s' % status)
+        if bot_linked:
+            check('a new password also unlinks the CRM bot of the account (bot_account row gone)',
+                  bot_links(agent['id']) == '0', 'rows left: %s' % bot_links(agent['id']))
+        else:
+            skip('a new password also unlinks the CRM bot of the account', 'docker/psql not available')
         status, _, _ = login(agent['email'], agent['password'])
         check('old password stops working -> 401', status == 401, 'status %s' % status)
         status, token, _ = login(agent['email'], new_password)
@@ -867,6 +876,17 @@ def main():
         if contact_id:
             status, _ = http('DELETE', '/users/%d' % contact_id, token=agent_token)
             check('agent can delete a contact -> 200', status == 200, 'status %s' % status)
+            # user.email is unique among the accounts that exist (migration 1795240000000-user-email-active)
+            status, body = http('POST', '/users', token=agent_token, body={
+                'email': contact_email, 'username': TAG + '-contact3', 'role': 'ctr_agent',
+                'company_id': company_id, 'fillers': required_fillers('user')})
+            again = body.get('id') if isinstance(body, dict) else None
+            if again:
+                created_user_ids.append(again)
+            check('the e-mail of a deleted contact can be used again -> 201 (not 500)',
+                  status == 201 and bool(again), 'status %s %s' % (status, str(body)[:200]))
+
+        access_checks(admin_token, group_ids, people, created_user_ids)
 
     finally:
         cleanup(admin_token or (login('admin@gmail.com', admin_password)[1]),
@@ -875,6 +895,149 @@ def main():
     print()
     print('RESULT: %d passed, %d failed, %d skipped' % (results['PASS'], results['FAIL'], results['SKIP']))
     return 1 if results['FAIL'] else 0
+
+
+def link_bot(user_id):
+    """A bot_account row for the user (a Telegram chat linked to the CRM bot); False without psql."""
+    chat = 990000000000 + secrets.randbelow(10 ** 9)
+    out = psql("insert into bot_account (user_id, chat_id, tg_username) values (%d, %d, '%s') "
+               "on conflict (user_id) do update set chat_id = excluded.chat_id returning user_id" % (user_id, chat, TAG))
+    return bool(out and out.strip().startswith(str(user_id)))
+
+
+def bot_links(user_id):
+    return (psql('select count(*) from bot_account where user_id = %d' % user_id) or '').strip()
+
+
+def access_checks(admin_token, group_ids, people, created_user_ids):
+    """GET /auth/access (the rights the web client builds its menu from), signing out everywhere
+    (POST /auth/logout, POST /auth/logout/:id) with the CRM bot, the lock of failed logins, the e-mail index."""
+    print('== 11. the rights of the web client come from the API (GET /auth/access)')
+    zero = {'view': 0, 'create': 0, 'update': 0, 'delete': 0, 'export': 0}
+    full = {'view': 3, 'create': 3, 'update': 3, 'delete': 3, 'export': 0}
+    scoped_rights = {
+        'deal': {'view': 1, 'create': 3, 'update': 2, 'delete': 0, 'export': 0},
+        'contact': dict(zero),
+        'company': {'view': 2, 'create': 3, 'update': 1, 'delete': 0, 'export': 0},
+        'task': {'update': 1, 'delete': 0},
+        'mail': False,
+        'file': True,
+    }
+    no_rights = {'deal': dict(zero), 'contact': dict(zero), 'company': dict(zero),
+                 'task': {'update': 0, 'delete': 0}, 'mail': False, 'file': False}
+    full_rights = {'deal': dict(full), 'contact': dict(full), 'company': dict(full),
+                   'task': {'update': 3, 'delete': 3}, 'mail': True, 'file': True}
+    extra = {}
+    for key, role, rights in (('scoped', 'agent', scoped_rights), ('mgr0', 'manager', no_rights),
+                              ('locked', 'agent', full_rights)):
+        person = {'email': 'audit-auth-%s-%s@example.test' % (RUN, key), 'password': secrets.token_urlsafe(12),
+                  'username': '%s-%s' % (TAG, key)}
+        status, body = http('POST', '/users', token=admin_token, body={
+            'email': person['email'], 'password': person['password'], 'username': person['username'],
+            'role': role, 'group_id': group_ids[0], 'permissions': rights})
+        if status != 201 or not isinstance(body, dict):
+            check('admin creates test user %s' % key, False, 'status %s %s' % (status, str(body)[:200]))
+            return
+        person['id'] = body['id']
+        created_user_ids.append(body['id'])
+        status, person['token'], _ = login(person['email'], person['password'])
+        if status != 200:
+            check('test user %s logs in' % key, False, 'status %s' % status)
+            return
+        extra[key] = person
+    scoped, mgr0, locked = extra['scoped'], extra['mgr0'], extra['locked']
+    agent, manager = people['agent'], people['manager']
+
+    status, body = http('GET', '/auth/access', token=scoped['token'])
+    scopes = body.get('scopes', {}) if isinstance(body, dict) else {}
+    check('agent with levels 1/2: GET /auth/access -> 200 with the scopes of every action',
+          status == 200 and scopes.get('deal') == {'view': 'own', 'create': 'all', 'update': 'group', 'delete': 'none'}
+          and scopes.get('company') == {'view': 'group', 'create': 'all', 'update': 'own', 'delete': 'none'}
+          and scopes.get('contact') == {'view': 'none', 'create': 'none', 'update': 'none', 'delete': 'none'}
+          and scopes.get('task') == {'view': 'all', 'create': 'all', 'update': 'own', 'delete': 'none'},
+          'status %s %s' % (status, json.dumps(body)[:400]))
+    check('... the mail / file switches, the role flags and the group of the user',
+          isinstance(body, dict) and body.get('mail') is False and body.get('file') is True
+          and body.get('admin') is False and body.get('manager') is False
+          and body.get('user_id') == scoped['id'] and body.get('group_id') == group_ids[0],
+          json.dumps(body)[:400])
+    members = body.get('group_user_ids') if isinstance(body, dict) else None
+    check('... group_user_ids: the staff of the group (the level "for the group"), the user included',
+          isinstance(members, list) and {scoped['id'], agent['id'], manager['id']} <= set(members), members)
+    status, body = http('GET', '/auth/access', token=mgr0['token'])
+    scopes = body.get('scopes', {}) if isinstance(body, dict) else {}
+    check('manager with every level 0 in the card: everything (the matrix does not apply to a manager)',
+          status == 200 and isinstance(body, dict) and body.get('manager') is True and body.get('admin') is False
+          and all(v == 'all' for entity in ('deal', 'company', 'contact', 'task') for v in scopes.get(entity, {}).values())
+          and len(scopes.get('deal', {})) == 4 and body.get('mail') is True and body.get('file') is True,
+          json.dumps(body)[:400])
+    status, body = http('GET', '/auth/access', token=admin_token)
+    check('admin: GET /auth/access -> admin and manager', status == 200 and isinstance(body, dict)
+          and body.get('admin') is True and body.get('manager') is True, 'status %s' % status)
+
+    # the product catalogue: everybody reads it, admin and manager change it (as the client shows it)
+    status, _ = http('POST', '/products', token=scoped['token'], body={'name': TAG + '-product', 'fillers': []})
+    status2, _ = http('PATCH', '/products/%d' % MISSING_ID, token=scoped['token'], body={'name': TAG + '-product'})
+    status3, _ = http('GET', '/products?limit=1', token=scoped['token'])
+    check('agent: POST / PATCH /products -> 403, GET /products -> 200', (status, status2, status3) == (403, 403, 200),
+          (status, status2, status3))
+    status, _ = http('PATCH', '/products/%d' % MISSING_ID, token=mgr0['token'], body={'name': TAG + '-product'})
+    check('manager: PATCH /products/:id passes the role check (a missing product -> 404 / 400, not 403)',
+          status in (400, 404), 'status %s' % status)
+
+    print('== 12. signing out everywhere ends every session and unlinks the CRM bot')
+    status, _ = http('POST', '/auth/logout/%d' % MISSING_ID, token=admin_token)
+    check('admin: POST /auth/logout/:id of a missing account -> 404', status == 404, 'status %s' % status)
+    linked = link_bot(scoped['id'])
+    status, _ = http('POST', '/auth/logout/%d' % scoped['id'], token=admin_token)
+    status2, _ = http('GET', '/deals?limit=1', token=scoped['token'])
+    check('admin signs an employee out everywhere -> 204, the tokens issued before stop working (401)',
+          status == 204 and status2 == 401, 'logout %s, old token %s' % (status, status2))
+    if linked:
+        check('... and the CRM bot of the employee is unlinked', bot_links(scoped['id']) == '0', bot_links(scoped['id']))
+    else:
+        skip('... and the CRM bot of the employee is unlinked', 'docker/psql not available')
+    status, _, _ = login(scoped['email'], scoped['password'])
+    check('... the password stays: the employee signs in again -> 200', status == 200, 'status %s' % status)
+    linked = link_bot(mgr0['id'])
+    status, _ = http('POST', '/auth/logout', token=mgr0['token'])
+    status2, _ = http('GET', '/deals?limit=1', token=mgr0['token'])
+    check('POST /auth/logout (sign out on every device) -> 204, the token stops working (401)',
+          status == 204 and status2 == 401, 'logout %s, token %s' % (status, status2))
+    if linked:
+        check('... and the own CRM bot is unlinked', bot_links(mgr0['id']) == '0', bot_links(mgr0['id']))
+    else:
+        skip('... and the own CRM bot is unlinked', 'docker/psql not available')
+
+    print('== 13. login: the e-mail in any case, failed attempts locked per e-mail and address')
+    status, _, _ = login(locked['email'].upper(), locked['password'])
+    check('the e-mail in other case signs in -> 200', status == 200, 'status %s' % status)
+    statuses = [login(locked['email'], 'wrong-' + secrets.token_hex(4))[0] for _ in range(8)]
+    check('8 wrong passwords -> 401 each', statuses == [401] * 8, statuses)
+    status, _, body = login(locked['email'], locked['password'])
+    message = body.get('message') if isinstance(body, dict) else body
+    check('... then even the right password from the same address -> 429 with the wait in minutes',
+          status == 429 and 'мин' in str(message), 'status %s %s' % (status, str(message)[:200]))
+    status, body = http('POST', '/auth/login', body={'email': locked['email'], 'password': locked['password']},
+                        extra_headers={'X-Real-IP': '203.0.113.%d' % (1 + secrets.randbelow(250))})
+    if status == 200:
+        check('... while from another address the right password works (the lock is not per e-mail alone)', True)
+    elif status == 429:
+        skip('... while from another address the right password works',
+             'the API is reached through a proxy that sets X-Real-IP itself: another address cannot be simulated')
+    else:
+        check('... while from another address the right password works', False, 'status %s' % status)
+
+    print('== 14. user.email is unique among the accounts that are not deleted')
+    out = psql("select indexdef from pg_indexes where tablename = 'user' and indexname = 'IDX_user_email_active'")
+    full_unique = psql("select count(*) from pg_indexes where tablename = 'user' "
+                       "and indexdef like 'CREATE UNIQUE INDEX %' and indexdef like '%(email)'")
+    if out is None or full_unique is None:
+        skip('the e-mail index is partial (WHERE deleted_at IS NULL)', 'docker/psql not available')
+    else:
+        check('the e-mail index is unique and partial (WHERE deleted_at IS NULL), no index over every row is left',
+              'UNIQUE' in out and 'deleted_at IS NULL' in out and full_unique.strip() == '0',
+              '%s / full unique indexes: %s' % (out.strip(), full_unique.strip()))
 
 
 def cleanup(admin_token, user_ids, task_ids, company_ids, group_ids):

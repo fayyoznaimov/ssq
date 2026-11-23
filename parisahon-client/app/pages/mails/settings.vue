@@ -7,6 +7,24 @@
                 >
                     Подключенные ящики
                 </h2>
+                <!-- the user's own sender mailboxes: open one to change its password or remove it -->
+                <Spinner v-if="transportersLoading" class="w-6 h-6"/>
+                <ul v-if="transporters.length" class="flex flex-col gap-2">
+                    <li v-for="transporter in transporters" :key="transporter.id">
+                        <BaseButton
+                            variant="pastel"
+                            class="w-full justify-start"
+                            :to="`/settings/transporters/${transporter.id}?from=/mails/settings`"
+                        >
+                            <Icon name="ph:envelope-simple" class="size-4 mr-1" />
+                            <span class="truncate">{{ transporter.email }}</span>
+                            <Icon v-if="!transporter.verified_at" name="ph:warning" class="size-4 ms-1 text-amber-500" title="Пароль не проверен: введите его заново" />
+                        </BaseButton>
+                    </li>
+                </ul>
+                <p v-else-if="!transportersLoading" class="text-xs text-muted-500 dark:text-muted-400">
+                    Своего ящика нет: письма уходят с общего ящика компании.
+                </p>
                 <BaseButton class="max-w-fit" to="/settings/transporters/new?from=/mails/settings">
                     <Icon name="ph:plus" class="size-4 mr-1" />
                     Добавить почту
@@ -118,7 +136,7 @@ import Spinner from '~/components/common/Spinner.vue';
 import TemplateModal from '~/components/mail/TemplateModal.vue';
 import { useValidation } from '~/composables/useValidation';
 import type { PaginatedResponse } from '~/types/generics';
-import type { Signature,Template } from '~/types/mail';
+import type { Signature,Template,Transporter } from '~/types/mail';
 import { type User,UserRole } from '~/types/user';
 import { required } from '~/utils/validation';
 
@@ -158,6 +176,13 @@ const {
     isLoading: signaturesLoading,
     run: runSignagutures,
 } = useAsync<Signature[]>([]);
+
+const {
+    data: transporters,
+    isLoading: transportersLoading,
+    run: runTransporters,
+} = useAsync<Transporter[]>([]);
+const transporterService = useService('emails/transporters', { auth: true });
 
 const { runWithId, isLoadingMap } = useAsync();
 const { run: runUsers, data: users } = useAsync<PaginatedResponse<User>>({
@@ -241,6 +266,7 @@ function onSignatureSelect(sig?: Signature) {
 onMounted(() => {
     runTemplates(templateService.find().exec());
     runSignagutures(signService.find().exec());
+    runTransporters(transporterService.find().exec());
     runUsers(userService.find({ limit: 1000 }).exec());
 });
 </script>

@@ -66,7 +66,7 @@ export class BotToolsService {
       },
       client_history: {
         description:
-          'History of a client company, newest first: Telegram messages, e-mails, calls, comments, tasks, stage changes. Optionally only one deal (order).',
+          'History of a client company, newest first: Telegram and WhatsApp messages (incoming / outgoing, with attached files), e-mails, calls, comments, tasks, stage changes. Optionally only one deal (order).',
         schema: z.object({
           company_id: id(),
           deal_id: id().optional().describe('Only the history of this deal'),
@@ -85,7 +85,10 @@ export class BotToolsService {
       },
       prepare_task: {
         description:
-          'Prepare a new task for the manager, linked to a company or a deal. Nothing is saved until the manager presses the confirm button that the bot shows.',
+          'Prepare a new task for the manager, linked to a deal or a company. Given a company_id, the task goes to the ' +
+          "client's only open deal; with several open deals it returns status choose_deal and the deals: ask the manager " +
+          'which one and call again with its deal_id (company_only: true links the task to the company itself). ' +
+          'Nothing is saved until the manager presses the confirm button that the bot shows.',
         schema: z.object({
           title: z.string().min(3).max(255).describe('What to do, e.g. "Позвонить по образцам"'),
           date: z.string().describe('YYYY-MM-DD, local date'),
@@ -93,7 +96,8 @@ export class BotToolsService {
           duration_minutes: z.number().int().min(5).max(600).optional(),
           type: z.string().optional().describe('Task type name, e.g. "Встреча" or "Связаться"'),
           company_id: id().optional(),
-          deal_id: id().optional(),
+          deal_id: id().optional().describe('The deal (order) the task is about; preferred over company_id'),
+          company_only: z.boolean().optional().describe('Link to the company itself, not to one of its open deals'),
         }),
         run: async (access, s, a) => this.track(s, await this.crm.prepareTask(access, s.chatId, a)),
       },
