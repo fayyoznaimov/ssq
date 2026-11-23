@@ -64,6 +64,29 @@ try {
         await page.waitForTimeout(1000);
         await target.click({ timeout: 5000 }).catch((e) => console.error(`"${process.env.SCREEN_CLICK}" not clicked: ${e.message.split('\n')[0]}`));
       }
+      // SCREEN_SCROLL: a CSS selector inside a scrolled box (a deal feed): the box is scrolled to its end and back
+      // to its start, as a user does. A list that loads its older page when its start comes into view
+      // (IntersectionObserver) only does so when the start leaves the view and comes back; a click on an
+      // element already in view does not scroll at all. SCREEN_SCROLL_ROUNDS: how many times (default 1).
+      if (process.env.SCREEN_SCROLL) {
+        const inside = page.locator(process.env.SCREEN_SCROLL).first();
+        await inside.waitFor({ timeout: 15000 }).catch(() => undefined);
+        await page.waitForTimeout(1000);
+        for (let round = 0; round < Number(process.env.SCREEN_SCROLL_ROUNDS || 1); round++) {
+          for (const to of ['end', 'start']) {
+            const room = await inside.evaluate((el, to) => {
+              let box = el.parentElement;
+              while (box && !/auto|scroll/.test(getComputedStyle(box).overflowY)) box = box.parentElement;
+              box = box || document.scrollingElement;
+              box.scrollTop = to === 'end' ? box.scrollHeight : 0;
+              return box.scrollHeight - box.clientHeight;
+            }, to).catch((e) => { console.error(`"${process.env.SCREEN_SCROLL}" not scrolled: ${e.message.split('\n')[0]}`); return null; });
+            if (room !== null && room <= 0) console.error(`"${process.env.SCREEN_SCROLL}": its box does not overflow, nothing to scroll`);
+            await page.waitForTimeout(800);
+          }
+          await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined);
+        }
+      }
       await page.waitForTimeout(1500);
       const file = join(out, `${path.replace(/[^\w]+/g, '_').replace(/^_|_$/g, '') || 'home'}${process.env.SCREEN_TAB ? '_' + process.env.SCREEN_TAB.replace(/\s+/g, '_') : ''}-${size.name}.png`);
       await page.screenshot({ path: file, fullPage: true });
@@ -72,7 +95,10 @@ try {
       // SCREEN_BASE: the web copy is served under a prefix (the QA stand serves the /preview/ build)
       const base = (process.env.SCREEN_BASE || '').replace(/\/+$/, '');
       const fullPath = new URL(page.url()).pathname;
-      const finalPath = base && fullPath.startsWith(base) ? fullPath.slice(base.length) || '/' : fullPath;
+      const basePath = base && fullPath.startsWith(base) ? fullPath.slice(base.length) || '/' : fullPath;
+      // a static host of the generated build (nginx try_files $uri $uri/) answers /deals with a 301 to the
+      // prerendered folder /deals/; the router shows the same page, so the slash is the hosting's, not the app's
+      const finalPath = basePath.length > 1 ? basePath.replace(/\/+$/, '') || '/' : basePath;
       // for local/checks/ui_check.py: the title of the tab, the text on the page and how many elements match SCREEN_PROBE (a CSS selector)
       const title = await page.title();
       const text = (await page.evaluate(() => document.body?.innerText || '')).slice(0, 20000);

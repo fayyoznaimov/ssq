@@ -71,15 +71,18 @@ def port_checks(report):
         check("/deals: the name and the client of a row are links to the deal", (deals.get("probe") or 0) > 0, f"links: {deals.get('probe')}")
 
     # empty forms: the save is refused before any request (nothing is created), the toast names the fields
-    for path, button, field in [
-        (NEW_COMPANY, 'form button[type="submit"].nui-button-primary', "«Название компании»"),
-        ("/deals/new", 'button[type="submit"][form="deal-form"]', "«Компания»"),
+    # that are required and not the optional ones (DEAL-3: a deal needs only its responsible, the company,
+    # its e-mail and phone are optional; a company needs its name, the phone is optional)
+    for path, button, field, optional_fields in [
+        (NEW_COMPANY, 'form button[type="submit"].nui-button-primary', "«Название компании»", ["«Номер телефона»"]),
+        ("/deals/new", 'button[type="submit"][form="deal-form"]', "«Ответственный»",
+         ["«Компания»", "«Электронная почта компании»", "«Телефон компании»", "«Бюджет»"]),
     ]:
         rep, proc = screens([path], SCREEN_CLICK=button, SCREEN_OUT=os.path.join(ROOT, "local", "dev", "screens", "ui", "save"))
         row = next((r for r in rep or [] if r["size"] == "pc"), None)
         toast = next((l for l in (row or {}).get("text", "").splitlines() if "Не сохранено" in l), "")
         check(f"{path}: an empty form is not sent, the toast names its fields",
-              "Не сохранено. Проверьте" in toast and field in toast,
+              "Не сохранено. Проверьте" in toast and field in toast and not any(f in toast for f in optional_fields),
               toast or ("no toast" if row else (proc.stderr or proc.stdout)[-300:]))
 
 
@@ -185,9 +188,11 @@ def feed_checks():
                 f"values ({type_}, {deal}, {by}, {to}, {out}, {after}, {before}, now() - interval '1 hour' + {i} * interval '1 minute')")
 
         path = f"/deals/{deal}"
-        # the click on the first day separator scrolls the feed up to it: the older page is loaded (the 44 rows
-        # are two pages of 25; the Telegram run old-19, old-20 lies across them)
-        report, proc = screens([path], SCREEN_CLICK='[data-feed="day"]', SCREEN_OUT=os.path.join(ROOT, "local", "dev", "screens", "ui-feed"))
+        # the feed opens at its start with the newest page (25 rows): like a user, the check scrolls the feed down
+        # and back up, its start comes into view again and the older page is loaded (the 44 rows are two pages
+        # of 25; the Telegram run old-19, old-20 lies across them). A click on the first day separator did not
+        # scroll at all: it is already in view, so the older page was never asked for.
+        report, proc = screens([path], SCREEN_SCROLL='[data-feed="day"]', SCREEN_OUT=os.path.join(ROOT, "local", "dev", "screens", "ui-feed"))
         row = next((r for r in report or [] if r["size"] == "pc"), None)
         if not row:
             check("deal feed: screenshots ran", False, (proc.stderr or proc.stdout)[-800:])
@@ -209,7 +214,7 @@ def feed_checks():
         # the older page: its messages in their place, the run across the two pages in order, before today's
         older = [text.find(w) for w in (f"{tag}-old-4", f"{tag}-old-5", f"{tag}-old-19", f"{tag}-old-20", f"{tag}-old-29", f"{tag}-in-1")]
         check("deal feed over two pages: the older page loads, a run across the pages stays in order, no render error",
-              all(x >= 0 for x in older) and older == sorted(older), older)
+              all(x >= 0 for x in older) and older == sorted(older), f"{older} {(proc.stderr or '').strip()[-300:]}")
     finally:
         try:
             one(";".join([

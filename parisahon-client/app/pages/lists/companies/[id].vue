@@ -1,9 +1,13 @@
 <template>
     <!-- no column gaps below lg: 11 gaps of 2rem were wider than a phone and pushed the card off the right edge -->
     <div class="grid grid-cols-12 gap-x-0 gap-y-6 lg:gap-8 px-4 lg:px-10 lg:h-[calc(100vh-6.4rem)]">
+        <!-- novalidate: the form checks itself (validate() in onSubmit: the toast names the fields, the
+             first wrong one gets the cursor); the browser's own check of `required` stopped the submit
+             before it and showed only its bubble -->
         <form
             ref="formRef"
             class="col-span-12 lg:col-span-4 rounded-md"
+            novalidate
             @submit.prevent="onSubmit"
         >
             <BaseTabs
@@ -15,7 +19,6 @@
                     <section
                         v-if="activeValue === 'general'"
                         class="max-w-sm flex flex-col gap-3"
-                        novalidate
                     >
                         <CardRecognition
                             :company-id="company.id"
@@ -41,7 +44,6 @@
                             placeholder="пр.: +998901200000"
                             icon="ph:phone"
                             :loading="companyLoading"
-                            required
                             :error="errors.phone || recognitionWarning('phone')"
                             @input="(e: Event) => onChange('phone', (e.target as HTMLInputElement).value)"
                         />

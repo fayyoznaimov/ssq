@@ -629,4 +629,53 @@ watchEffect(() => {
     if (props.startObserver) observer.resume();
 });
 
+/*
+ * Paging of the feed like a chat: it opens at the newest events (next to the composer); an older page
+ * is loaded when the reader scrolls up to the top, and the view stays on the same messages while it is
+ * inserted above. The observer only fires when the top marker comes into view, so after every page it
+ * is re-armed: a page that does not fill the card loads the next one at once. Before, the feed stayed
+ * on its first screen and older pages came only after scrolling down and up again.
+ */
+const cardEl = (): HTMLElement | undefined => chatAreaRef.value?.$el ?? chatAreaRef.value;
+// the newest event at the bottom edge of the card (the list has a large bottom margin under it)
+const scrollToNewest = (el: HTMLElement) => {
+    const list = el.querySelector('ul.break-words');
+    if (!list) { el.scrollTop = el.scrollHeight; return; }
+    const bottom = list.getBoundingClientRect().bottom - el.getBoundingClientRect().top + el.scrollTop;
+    el.scrollTop = Math.max(0, bottom - el.clientHeight + 16);
+};
+let beforeInsert: { height: number; top: number } | undefined;
+let openedAtNewest = false;
+watch(() => props.events.pages.length, () => {
+    const el = cardEl();
+    beforeInsert = el ? { height: el.scrollHeight, top: el.scrollTop } : undefined;
+}, { flush: 'pre' });
+watch(() => props.events.pages.length, async (count, previous) => {
+    await nextTick();
+    const el = cardEl();
+    if (el && count > 0) {
+        if (previous && beforeInsert && count > previous) el.scrollTop = beforeInsert.top + (el.scrollHeight - beforeInsert.height);
+    }
+    beforeInsert = undefined;
+    if (!count) openedAtNewest = false;
+}, { flush: 'post' });
+// after every load the top marker is watched anew: if it is still in view (a short page), the next
+// older page is asked at once — the parent ignores the call while loading or when there is no more
+watch(() => props.eventsLoading, async (loading) => {
+    if (loading || !props.startObserver || !props.events.pages.length) return;
+    await nextTick();
+    observer.pause();
+    observer.resume();
+});
+// open at the newest once the feed is drawn (the first page may come before or after the card)
+watch(() => feed.value.length > 0 && !props.eventsLoading, async (ready) => {
+    if (!ready || openedAtNewest) return;
+    openedAtNewest = true;
+    await nextTick();
+    requestAnimationFrame(() => {
+        const el = cardEl();
+        if (el) scrollToNewest(el);
+    });
+}, { immediate: true, flush: 'post' });
+
 </script>
