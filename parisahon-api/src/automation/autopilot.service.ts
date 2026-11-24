@@ -2,6 +2,8 @@ import { Injectable, Logger, OnApplicationBootstrap, OnApplicationShutdown } fro
 import { DataSource } from 'typeorm';
 import { ANSWER_TYPES, CHAT_TYPES, WorkSchedule, answerSql, clientMessageSql } from '../analytics/control.service';
 import { AUTO_NEXT_STEP, AUTO_REPLY, AutoTaskService } from './auto-task.service';
+import { CLOSING_STAGE_KINDS } from '../deal_stage/stage-kind';
+import { AuditJournal } from '../audit/audit-journal';
 
 /**
  * Rules that work without any setup, so that nothing depends on a manager remembering it:
@@ -29,7 +31,8 @@ export class AutopilotService implements OnApplicationBootstrap, OnApplicationSh
   onApplicationBootstrap() {
     if (process.env.AUTOPILOT === '0') return;
     const every = Math.max(60, Number(process.env.AUTOPILOT_SEC || 600));
-    this.timer = setInterval(() => void this.tick(), every * 1000);
+    // the journal (src/audit): what a tick changes is the autopilot's, not the manager's (AUDIT-11)
+    this.timer = setInterval(() => void AuditJournal.job('autopilot', 'autopilot', () => this.tick()), every * 1000);
   }
 
   onApplicationShutdown() {
@@ -58,16 +61,19 @@ export class AutopilotService implements OnApplicationBootstrap, OnApplicationSh
    * the phone later than the task (the manager called back at 10:05, the task appeared at 10:15).
    */
   private async closeAnswered(): Promise<number> {
-    const result = await this.dataSource.query(
-      `UPDATE task t SET closed_at = now(), result = 'Клиенту ответили'
-        WHERE t.closed_at IS NULL AND t.label LIKE $2
-          AND EXISTS (SELECT 1 FROM event o
-                       WHERE o.deal_id = t.deal_id AND ${answerSql('o', '$1')}
-                         AND (o.created_at > t.created_at
-                              OR o.created_at > (SELECT MAX(c.created_at) FROM event c
-                                                  WHERE c.deal_id = t.deal_id AND ${clientMessageSql('c', '$3')}
-                                                    AND c.created_at <= t.created_at)))`,
-      [ANSWER_TYPES, `${AUTO_REPLY}%`, CHAT_TYPES],
+    // the tasks it closes go to the journal (TASK-5: they were closed without a trace)
+    const result = await AuditJournal.around(this.dataSource, 'task', 't.closed_at IS NULL AND t.label LIKE $1', [`${AUTO_REPLY}%`], () =>
+      this.dataSource.query(
+        `UPDATE task t SET closed_at = now(), result = 'Клиенту ответили'
+          WHERE t.closed_at IS NULL AND t.label LIKE $2
+            AND EXISTS (SELECT 1 FROM event o
+                         WHERE o.deal_id = t.deal_id AND ${answerSql('o', '$1')}
+                           AND (o.created_at > t.created_at
+                                OR o.created_at > (SELECT MAX(c.created_at) FROM event c
+                                                    WHERE c.deal_id = t.deal_id AND ${clientMessageSql('c', '$3')}
+                                                      AND c.created_at <= t.created_at)))`,
+        [ANSWER_TYPES, `${AUTO_REPLY}%`, CHAT_TYPES],
+      ),
     );
     return Array.isArray(result) ? Number(result[1] ?? 0) : 0;
   }
@@ -76,7 +82,8 @@ export class AutopilotService implements OnApplicationBootstrap, OnApplicationSh
     const schedule = new WorkSchedule();
     // tasks appear while the office works, with a deadline today or on the next working day
     if (schedule.seconds(new Date(now.getTime() - 60_000), now) === 0) return 0;
-    const closedNames = [process.env.DEAL_STAGE_CLOSED, process.env.DEAL_STAGE_CLOSED_NOT_REALIZED].filter(Boolean);
+    // the kinds of the closing stages (deal_stage/stage-kind.ts)
+    const closedNames: string[] = CLOSING_STAGE_KINDS;
 
     const deals: { id: number }[] = await this.dataSource.query(
       `SELECT d.id
@@ -84,7 +91,7 @@ export class AutopilotService implements OnApplicationBootstrap, OnApplicationSh
          JOIN "user" u ON u.id = d.agent_id AND u.deleted_at IS NULL AND u.role IN ('admin', 'manager', 'agent')
          LEFT JOIN deal_stage s ON s.id = d.stage_id
         WHERE d.deleted_at IS NULL AND d.closed_at IS NULL AND d.created_at < now() - interval '30 minutes'
-          AND NOT (COALESCE(s.name, '') = ANY($2))
+          AND NOT (COALESCE(s.kind, '') = ANY($2))
           AND NOT EXISTS (SELECT 1 FROM task t WHERE t.deal_id = d.id AND t.closed_at IS NULL)
           AND NOT EXISTS (SELECT 1 FROM task t WHERE t.deal_id = d.id AND t.closed_at > now() - interval '12 hours')
           AND NOT EXISTS (SELECT 1 FROM task t WHERE t.deal_id = d.id AND t.label = $1 AND t.created_at > now() - interval '3 days')

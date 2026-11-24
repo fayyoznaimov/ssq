@@ -33,7 +33,8 @@ export interface SimilarMatch {
   reasons: string[];
   agent_name: string | null;
   last_deal_at: string | null;
-  // false: the user may not open this record (another manager's client): shown without a link
+  // false: the user may not open this record (another manager's client): shown without a link, and
+  // without its name, company and last deal date
   visible: boolean;
 }
 
@@ -261,6 +262,14 @@ export class SimilarService {
       );
       rows.forEach((r) => visible.add(`${kind}-${r.id}`));
     }
-    for (const match of matches) match.visible = visible.has(`${match.kind}-${match.id}`);
+    for (const match of matches) {
+      match.visible = visible.has(`${match.kind}-${match.id}`);
+      if (match.visible) continue;
+      // a record the user may not open: only that it exists, why it matches and who leads it (whom to
+      // ask) — not its name, company and dates, or the list would read out another manager's clients
+      match.name = match.kind === 'company' ? 'Компания другого менеджера' : 'Контакт другого менеджера';
+      match.company_name = null;
+      match.last_deal_at = null;
+    }
   }
 }

@@ -1,8 +1,11 @@
 <template>
     <div class="flex flex-col gap-8">
-        <div>
-            <h1 class="text-xl">Аналитика по товарам</h1>
-            <h2 class="text-sm text-gray-500">Список товаров</h2>
+        <div class="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:gap-4">
+            <div>
+                <h1 class="text-xl">Аналитика по товарам</h1>
+                <h2 class="text-sm text-gray-500">Товары в сделках, созданных за период (удалённые сделки не считаются)</h2>
+            </div>
+            <PeriodPicker v-model="period" />
         </div>
         <div class="relative overflow-x-auto">
             <BaseTable
@@ -14,6 +17,7 @@
                 id="product-analytics"
             >
             </BaseTable>
+            <p v-if="!isLoading && !stats.data.length" class="text-sm text-muted-500 mt-2">За этот период в сделках нет товаров.</p>
             <BasePagination
                 v-if="stats.count / perPage > 1"
                 v-model:current-page="currentPage"
@@ -31,6 +35,7 @@
 import { onMounted, watch } from 'vue';
 
 import BaseTable from '~/components/common/BaseTable.vue';
+import PeriodPicker from '~/components/analytics/PeriodPicker.vue';
 import {type Column} from '~/components/common/types';
 import { useAsync } from '~/composables/useAsync';
 import {type PaginatedResponse} from '~/types/generics';
@@ -61,6 +66,8 @@ const { data: stats, isLoading, run } = useAsync<PaginatedResponse<ProductStat>>
 });
 
 const sortBy = ref<Record<string, any>>({});
+// all time unless a period was chosen here or in another report
+const { period, params: periodParams } = useReportPeriod('all');
 const columns = ref<Column[]>([
     {
         label: 'Имя',
@@ -100,10 +107,16 @@ function fetchStats() {
         skip: (currentPage.value - 1) * perPage.value,
         limit: perPage.value,
         sort: sortBy.value,
+        ...periodParams.value,
     }).exec());
 }
 
 watch([currentPage, sortBy, perPage], fetchStats);
+// another period starts from the first page
+watch(period, () => {
+    if (currentPage.value !== 1) currentPage.value = 1;
+    else fetchStats();
+});
 onMounted(fetchStats);
 
 </script>

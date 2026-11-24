@@ -28,6 +28,7 @@ import { instanceToPlain } from 'class-transformer';
 import { SearchCompanyDto } from './dto/search.company.dto';
 import { EventsService } from 'src/events/events.service';
 import { SearchEventDto } from 'src/events/dto/search.event.dto';
+import { CreateCommentDto } from 'src/events/dto/create.comment.dto';
 import { PaginationRequestDto } from 'src/helper/dto/pagination.dto';
 
 @UseGuards(AuthGuard)
@@ -49,7 +50,9 @@ export class CompanyController {
     return instanceToPlain(await this.companyService.search(query, request['user']));
   }
 
+  /** Company-wide numbers (turnover, the biggest clients): analytics, admin and manager only (ACL-18). */
   @Get('statistics')
+  @Roles(AuthGuard.MANAGER_LEVEL)
   async getCompanyStats(): Promise<any> {
     return this.companyService.getCompanyStats();
   }
@@ -113,6 +116,42 @@ export class CompanyController {
     return instanceToPlain(
       this.eventService.fetchCompanyEvents(id, query, new Access(request['user'])),
     );
+  }
+
+  /** A note in the company's feed, outside any deal (SCR2-4); the right to change the company. */
+  @Post(':id/comments')
+  @RecordAccess('company', 'update')
+  async postCompanyNote(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() data: CreateCommentDto,
+    @Req() request: Request,
+  ): Promise<Record<string, any>> {
+    return instanceToPlain(await this.eventService.postClientNote({ company_id: id }, data.comment, request['user'].sub));
+  }
+
+  /** The author changes their note. */
+  @Patch(':id/comments/:event_id')
+  @RecordAccess('company', 'update')
+  async updateCompanyNote(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('event_id', ParseIntPipe) eventId: number,
+    @Body() data: CreateCommentDto,
+    @Req() request: Request,
+  ): Promise<Record<string, any>> {
+    return instanceToPlain(
+      await this.eventService.updateClientNote({ company_id: id }, eventId, data.comment, request['user'].sub),
+    );
+  }
+
+  /** The author deletes their note. */
+  @Delete(':id/comments/:event_id')
+  @RecordAccess('company', 'update')
+  async deleteCompanyNote(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('event_id', ParseIntPipe) eventId: number,
+    @Req() request: Request,
+  ): Promise<void> {
+    await this.eventService.deleteClientNote({ company_id: id }, eventId, request['user'].sub);
   }
 
   /**

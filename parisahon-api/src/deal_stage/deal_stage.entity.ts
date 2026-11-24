@@ -7,13 +7,18 @@ import {
   ManyToOne,
   JoinColumn,
   Index,
+  Check,
 } from 'typeorm';
 import { Deal } from '../deal/deal.entity';
 import { Trigger } from '../trigger/trigger.entity';
 import { DealStageCollection } from './deal_stage.collection.entity';
 import { DealStageRecord } from './deal_stage.records.entity';
+import { StageKind } from './stage-kind';
 
 @Index('IDX_deal_stage_collection', ['collection'])
+// one stage of each system kind per pipeline (partial: kind <> 'work'), migration 1795620000000
+@Index('IDX_deal_stage_collection_kind', { synchronize: false })
+@Check('CHK_deal_stage_kind', `"kind" IN ('new', 'first_contact', 'prepayment', 'won', 'lost', 'work')`)
 @Entity({ name: 'deal_stage' })
 export class DealStage {
   @PrimaryGeneratedColumn()
@@ -24,6 +29,10 @@ export class DealStage {
 
   @Column({ type: 'varchar', length: 255, nullable: true })
   color: string;
+
+  /** What the stage means (stage-kind.ts); the name is only its label */
+  @Column({ type: 'varchar', length: 16, default: StageKind.WORK })
+  kind: StageKind;
 
   @OneToMany(() => Deal, (deal) => deal.stage)
   deals: Deal[];

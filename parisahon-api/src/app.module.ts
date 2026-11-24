@@ -37,6 +37,9 @@ import { RecognitionModule } from './recognition/recognition.module';
 import { BotModule } from './bot/bot.module';
 import { AutomationModule } from './automation/automation.module';
 import { CallsModule } from './calls/calls.module';
+import { AiModule } from './ai/ai.module';
+import { AuditModule } from './audit/audit.module';
+import { HistoryModule } from './history/history.module';
 import { AuthGuard } from './auth/auth.guard';
 
 @Module({
@@ -74,6 +77,11 @@ import { AuthGuard } from './auth/auth.guard';
     BotModule,
     AutomationModule,
     CallsModule,
+    AiModule,
+    // the readable client history of the deal page: header, the whole client, the reason of a loss (src/history)
+    HistoryModule,
+    // the journal «кто что изменил» and the request context of every request (src/audit)
+    AuditModule,
   ],
   controllers: [AppController],
   providers: [

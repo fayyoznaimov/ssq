@@ -21,9 +21,10 @@
                         :horizontal-scroll="props.horizontalScroll"
                     >
                         <template #title>
-                            <div>
-                                <slot name="toolbar-title"></slot>
-                                <BaseBreadcrumb class="breadCrumb" :items="breadcrumb">
+                            <!-- the name of the page, on a phone too; the crumbs only from md (no room on a phone) -->
+                            <div class="min-w-0">
+                                <span class="block truncate"><slot name="toolbar-title"></slot></span>
+                                <BaseBreadcrumb class="breadCrumb hidden md:block" :items="breadcrumb">
                                     <Icon name="ph:arrow-right"></Icon>
                                 </BaseBreadcrumb>
                             </div>
@@ -120,8 +121,12 @@ function closeModal(e: any) {
 }
 
 const breadcrumb = ref<{ label: any; to: string }[]>([]);
+// a card names its record in the last crumb («Контакты → Иван Петров», not «Новый контакт»):
+// useRecordTitle() in components/company/recordTitle.ts sets { path, label }
+const crumbTitle = useState<{ path: string; label: string } | null>('crumbTitle', () => null);
 
 watch(() => route.fullPath, breadCrumbs);
+watch(crumbTitle, breadCrumbs, { deep: true });
 
 onMounted(() => breadCrumbs());
 
@@ -136,9 +141,10 @@ function breadCrumbs() {
         last.push(r);
         let p = last.join('/');
         const meta = router.resolve(`/${p}`).meta;
+        const named = crumbTitle.value?.path === `/${p}` ? crumbTitle.value.label : null;
         subRoutes.push({
             // a page for a new and an existing record (/lists/companies/new) can name the new one itself
-            label: r === 'new' && meta.verboseNew ? meta.verboseNew : meta.verbose,
+            label: named || (r === 'new' && meta.verboseNew ? meta.verboseNew : meta.verbose),
             to: `/${p}`,
         });
     }

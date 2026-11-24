@@ -62,7 +62,9 @@ SECRET_KEYS = ('password', 'tg_api_hash', 'tg_api_id', 'sign')
 
 # The only routes that may answer without a token. /health tells only up/down (for the server watchdog);
 # /telegram/remote-file/:token is a download link like the files in /uploads (128-bit token, attachment only).
-PUBLIC_ROUTES = {('GET', '/'), ('POST', '/auth/login'), ('GET', '/health'), ('GET', '/telegram/remote-file/:token')}
+# /files/link-check is asked by nginx before it serves /uploads/<name>: it only verifies the signature of the link (FileLink).
+PUBLIC_ROUTES = {('GET', '/'), ('POST', '/auth/login'), ('GET', '/health'), ('GET', '/telegram/remote-file/:token'),
+                 ('GET', '/files/link-check')}
 
 # Skip the JWT guard but check access themselves: the MCP endpoint of the CRM bot
 # answers only on 127.0.0.1 with a per-run session token (src/bot/bot-mcp.controller.ts).
@@ -360,8 +362,8 @@ def main():
         protected = [r for r in routes if r not in PUBLIC_ROUTES and r not in SELF_AUTH_ROUTES]
         check('controllers parsed: %d routes found' % len(routes), len(routes) > 100,
               'only %d routes parsed from %s' % (len(routes), API_SRC))
-        check('@Public() is used exactly 8 times in the controllers (login, hello, health, bot MCP, telegram and whatsapp incoming, calls upload, telegram remote file)',
-              public_marks == 8 and PUBLIC_ROUTES <= set(routes) and SELF_AUTH_ROUTES <= set(routes),
+        check('@Public() is used exactly 9 times in the controllers (login, hello, health, bot MCP, telegram and whatsapp incoming, calls upload, telegram remote file, file link check)',
+              public_marks == 9 and PUBLIC_ROUTES <= set(routes) and SELF_AUTH_ROUTES <= set(routes),
               'found %d' % public_marks)
         answers = {r: http(r[0], EXTERNAL_BASE + r[1], body={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'} if r[0] == 'POST' else None)[0]
                    for r in sorted(SELF_AUTH_ROUTES)}
@@ -478,6 +480,9 @@ def main():
             ('DELETE', '/groups/%d' % MISSING_ID, None),
             ('GET', '/groups/%d/usage' % MISSING_ID, None),
             ('POST', '/auth/logout/%d' % MISSING_ID, None),
+            ('POST', '/auth/standard-rights/%d' % MISSING_ID, None),
+            ('POST', '/groups/%d/members/%d' % (MISSING_ID, MISSING_ID), None),
+            ('DELETE', '/groups/%d/members/%d' % (MISSING_ID, MISSING_ID), None),
             ('PATCH', '/settings', {}),
             ('POST', '/fillers', {}),
             ('PATCH', '/fillers/%d' % MISSING_ID, {}),
@@ -485,9 +490,6 @@ def main():
             ('POST', '/task-types', {}),
             ('PATCH', '/task-types/%d' % MISSING_ID, {}),
             ('DELETE', '/task-types/%d' % MISSING_ID, None),
-            ('POST', '/stages/1/triggers', {}),
-            ('PATCH', '/stages/1/triggers/%d' % MISSING_ID, {}),
-            ('DELETE', '/stages/1/triggers/%d' % MISSING_ID, None),
             ('PATCH', '/analytics/objectives', {}),
             ('POST', '/users', new_staff),
             ('PATCH', '/users/%d' % agent2['id'], staff_body(agent2, username=TAG + '-hacked')),
@@ -496,7 +498,7 @@ def main():
         manager_only_gets = [
             '/analytics/deals', '/analytics/calls', '/analytics/users', '/analytics/managers',
             '/analytics/consolidated-report', '/analytics/objectives', '/analytics/control',
-            '/analytics/objectives/results', '/logs', '/users/manager-statistics',
+            '/analytics/objectives/results', '/logs', '/users/manager-statistics', '/companies/statistics',
             '/desktop?from_date=2026-01-01&till_date=2026-12-31&my_stats=false',
             '/desktop?from_date=2026-01-01&till_date=2026-12-31',
         ]
@@ -539,6 +541,20 @@ def main():
 
         expect_all('manager -> 403 on admin-only routes (handler-level @Roles overrides class-level)',
                    admin_only, manager['token'], {403})
+        # the triggers of a stage (business processes): not an agent's, but the manager's too (TRG-13)
+        trigger_routes = [
+            ('POST', '/stages/1/triggers', {}),
+            ('PATCH', '/stages/1/triggers/%d' % MISSING_ID, {}),
+            ('DELETE', '/stages/1/triggers/%d' % MISSING_ID, None),
+            ('PATCH', '/stages/%d/trigger-order' % MISSING_ID, {'ids': [MISSING_ID]}),
+        ]
+        expect_all('agent -> 403 on changing the triggers of a stage', trigger_routes, agent['token'], {403})
+        bad = []
+        for method, path, body in trigger_routes:
+            status, _ = http(method, path, token=manager['token'], body=body)
+            if status in (401, 403):
+                bad.append('%s %s -> %s' % (method, path, status))
+        check('manager may change the triggers of a stage (no 401/403)', not bad, '; '.join(bad))
         # some analytics queries need parameters: 400 still proves the role check let it through
         bad = []
         for path in manager_only_gets:
@@ -929,7 +945,7 @@ def access_checks(admin_token, group_ids, people, created_user_ids):
                    'task': {'update': 3, 'delete': 3}, 'mail': True, 'file': True}
     extra = {}
     for key, role, rights in (('scoped', 'agent', scoped_rights), ('mgr0', 'manager', no_rights),
-                              ('locked', 'agent', full_rights)):
+                              ('locked', 'agent', full_rights), ('bare', 'agent', no_rights)):
         person = {'email': 'audit-auth-%s-%s@example.test' % (RUN, key), 'password': secrets.token_urlsafe(12),
                   'username': '%s-%s' % (TAG, key)}
         status, body = http('POST', '/users', token=admin_token, body={
@@ -974,6 +990,8 @@ def access_checks(admin_token, group_ids, people, created_user_ids):
     status, body = http('GET', '/auth/access', token=admin_token)
     check('admin: GET /auth/access -> admin and manager', status == 200 and isinstance(body, dict)
           and body.get('admin') is True and body.get('manager') is True, 'status %s' % status)
+
+    standard_rights_checks(admin_token, extra['bare'], mgr0, agent)
 
     # the product catalogue: everybody reads it, admin and manager change it (as the client shows it)
     status, _ = http('POST', '/products', token=scoped['token'], body={'name': TAG + '-product', 'fillers': []})
@@ -1039,6 +1057,96 @@ def access_checks(admin_token, group_ids, people, created_user_ids):
               'UNIQUE' in out and 'deleted_at IS NULL' in out and full_unique.strip() == '0',
               '%s / full unique indexes: %s' % (out.strip(), full_unique.strip()))
 
+    startup_checks()
+
+
+def startup_checks():
+    """HACK-4: the API made admin@gmail.com again at every start, looked up by e-mail; deleting that account
+    (soft: the row keeps its e-mail) made the insert fail and the API restart in a loop, and changing its
+    e-mail gave a second admin with the password of the server files. Now the admin of .env is made only for
+    a CRM without a live admin, and no start-up step (seed*, fix* of main.ts) can stop the API: the steps log
+    their error. The API cannot be restarted from here: the sources are checked."""
+    print('== 14b. start-up: the admin of .env only without a live admin; no start-up step stops the API')
+    try:
+        with open(os.path.join(API_SRC, 'seed', 'seed.service.ts'), encoding='utf-8') as f:
+            seed_src = f.read()
+        with open(os.path.join(API_SRC, 'main.ts'), encoding='utf-8') as f:
+            main_src = f.read()
+    except OSError as error:
+        skip('start-up steps', 'API sources not found: %s' % error)
+        return
+    after = seed_src.split('async seedAdminUser(', 1)[1] if 'async seedAdminUser(' in seed_src else ''
+    admin_seed = re.split(r'\n  (?:/\*\*|async )', after, 1)[0]
+    check('the admin of .env is made only when there is no live admin (counted by role, not looked up by e-mail)',
+          'countBy({ role: RoleEnum.ADMIN })' in admin_seed and 'findOneBy({ email' not in admin_seed
+          and 'withDeleted' not in admin_seed, admin_seed[:300])
+    steps = re.findall(r'await seedService\.(\w+)\(', main_src)
+    check('every start-up step of main.ts is a seed* / fix* step of SeedService, and the class logs their errors '
+          '(@NonFatalSteps) instead of stopping the API',
+          bool(steps) and all(re.match(r'(seed|fix)', s) for s in steps) and '@NonFatalSteps()' in seed_src
+          and re.search(r'@NonFatalSteps\(\)\s*export class SeedService', seed_src) is not None, steps)
+    live_admins = psql("select count(*) from \"user\" where role = 'admin' and deleted_at is null")
+    if live_admins is None:
+        skip('the CRM has a live admin', 'docker/psql not available')
+    else:
+        check('the CRM has a live admin (so the start does not make one from .env)', live_admins.strip() not in ('', '0'),
+              live_admins)
+
+
+def standard_rights_checks(admin_token, bare, mgr0, agent):
+    """ACL-15: an agent whose card forbids everything saw nothing, not even the deals colleagues made them
+    responsible for. Existing cards are not changed by themselves: the admin gives the standard rights
+    (POST /auth/standard-rights/:id, the button «Выдать стандартные права» of the list «Пользователи»):
+    own deals, companies and contacts to see, create and change, own tasks to change, nothing to delete;
+    the mail / file switches stay as they are."""
+    print('== 11b. «Выдать стандартные права»: an agent whose card forbids everything')
+    status, body = http('GET', '/auth/access', token=bare['token'])
+    scopes = body.get('scopes', {}) if isinstance(body, dict) else {}
+    check('agent with every level 0: no deals, companies or contacts to see',
+          status == 200 and all((scopes.get(e) or {}).get('view') == 'none' for e in ('deal', 'company', 'contact')),
+          json.dumps(scopes)[:300])
+    status, found = http('GET', '/linkables?name=' + urllib.parse.quote(TAG), token=bare['token'])
+    check('... and the search of the task window offers them nothing (GET /linkables -> [])',
+          status == 200 and found == [], 'status %s %s' % (status, str(found)[:300]))
+    deal_id = None
+    out = psql("insert into deal (label, display_id, budget, stage_id, agent_id, created_by) values ('%s-deal-bare', %d, 100, "
+               "(select s.id from deal_stage s join collection c on c.id = s.collection_id where c.is_active "
+               "order by s.\"order\", s.id limit 1), %d, %d) returning id"
+               % (TAG, 900000000 + secrets.randbelow(90000000), bare['id'], agent['id']))
+    first = (out or '').strip().split('\n')[0].strip()
+    if first.isdigit():
+        deal_id = int(first)
+        status, _ = http('GET', '/deals/%d' % deal_id, token=bare['token'])
+        check('... not even a deal a colleague made them responsible for (-> 404)', status == 404, 'status %s' % status)
+    else:
+        skip('... not even a deal a colleague made them responsible for', 'docker/psql not available')
+
+    status, _ = http('POST', '/auth/standard-rights/%d' % bare['id'], token=bare['token'])
+    check('the agent cannot give the rights to themselves (-> 403)', status == 403, 'status %s' % status)
+    status, body = http('POST', '/auth/standard-rights/%d' % bare['id'], token=admin_token)
+    stored = body.get('permissions', {}) if isinstance(body, dict) else {}
+    check('admin: POST /auth/standard-rights/:id -> 200 with the stored levels',
+          status == 200 and stored.get('deal', {}).get('view') == 1 and stored.get('deal', {}).get('delete') == 0
+          and stored.get('task') == {'update': 1, 'delete': 0}, 'status %s %s' % (status, str(body)[:300]))
+    status, body = http('GET', '/auth/access', token=bare['token'])
+    scopes = body.get('scopes', {}) if isinstance(body, dict) else {}
+    own = {'view': 'own', 'create': 'all', 'update': 'own', 'delete': 'none'}
+    check('... at once, with the same token: own deals, companies and contacts (see, create, change), own tasks to change, '
+          'nothing to delete',
+          status == 200 and all(scopes.get(e) == own for e in ('deal', 'company', 'contact'))
+          and scopes.get('task') == {'view': 'all', 'create': 'all', 'update': 'own', 'delete': 'none'},
+          json.dumps(scopes)[:400])
+    check('... the switches «Доступ к почте» / «Доступ к файлам» stay as they were (off)',
+          isinstance(body, dict) and body.get('mail') is False and body.get('file') is False, json.dumps(body)[:300])
+    if deal_id:
+        status, _ = http('GET', '/deals/%d' % deal_id, token=bare['token'])
+        check('... and the deal they are responsible for opens (-> 200)', status == 200, 'status %s' % status)
+    status, _ = http('POST', '/auth/standard-rights/%d' % mgr0['id'], token=admin_token)
+    check('... for a manager -> 400 (a manager sees everything, the levels of the card do not apply)',
+          status == 400, 'status %s' % status)
+    status, _ = http('POST', '/auth/standard-rights/%d' % MISSING_ID, token=admin_token)
+    check('... for an account that does not exist -> 404', status == 404, 'status %s' % status)
+
 
 def cleanup(admin_token, user_ids, task_ids, company_ids, group_ids):
     print('== cleanup')
@@ -1066,6 +1174,9 @@ def cleanup(admin_token, user_ids, task_ids, company_ids, group_ids):
         % (users, users, tasks),
         'delete from notification where company_id in (%s)' % companies,
         'delete from task where id in (%s)' % tasks,
+        # the deal of the agent without rights (standard_rights_checks)
+        "delete from event where deal_id in (select id from deal where label like 'AUDIT-auth-%')",
+        "delete from deal where label like 'AUDIT-auth-%'",
         'delete from "user" where id in (%s)' % users,
         'delete from company where id in (%s)' % companies,
         "delete from \"group\" where name like 'AUDIT-auth-%'",
@@ -1075,6 +1186,7 @@ def cleanup(admin_token, user_ids, task_ids, company_ids, group_ids):
     left = psql("select (select count(*) from \"user\" where email like 'audit-auth-%%@example.test') "
                 "+ (select count(*) from task where label like 'AUDIT-auth-%%') "
                 "+ (select count(*) from company where name like 'AUDIT-auth-%%') "
+                "+ (select count(*) from deal where label like 'AUDIT-auth-%%') "
                 "+ (select count(*) from \"group\" where name like 'AUDIT-auth-%%')".replace('%%', '%'))
     if done is None or left is None:
         skip('test rows hard-deleted from the database',

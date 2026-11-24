@@ -2,24 +2,21 @@
     <div class="flex flex-col gap-8">
         <div>
             <h1 class="text-xl">Группы</h1>
-            <h2 class="text-sm text-gray-500">Список групп</h2>
+            <h2 class="text-sm text-gray-500">
+                Отделы сотрудников. Право «Группы» в карточке сотрудника открывает записи всех участников его группы.
+            </h2>
         </div>
-        <NuxtLink
-            :to="{name: 'settings-groups-id', params: {id: 'new'}}"
-            class="border border-gray-300 dark:border-muted-600 rounded-md ml-auto"
-        >
-            <BaseButton color="primary">
-                Новая группа
-            </BaseButton>
-        </NuxtLink>
+        <BaseButton color="primary" class="ml-auto" :to="{name: 'settings-groups-id', params: {id: 'new'}}">
+            Новая группа
+        </BaseButton>
         <div class="relative overflow-x-auto">
             <BaseTable
                 v-model:sortBy="sortBy"
                 :columns="columns"
-                :data="groups"
+                :data="sorted"
                 :loading="isLoading"
+                :row-link="(item) => ({name: 'settings-groups-id', params: {id: item.id}})"
                 class="flex-auto"
-                :buttons="true"
                 id="groups"
             >
                 <template #actions="{item}">
@@ -51,17 +48,29 @@ useHead({
     title: 'Группы'
 });
 
+/** GET /groups: by name, with the number of staff in the group */
+type GroupRow = Group & { users_count?: number };
+
 const groupsService = useService('groups', {auth: true});
 
-const sortBy = ref<Record<string, any>>({createdAt: -1});
-const { data: groups, isLoading, run } = useAsync<Group[]>([]);
+const sortBy = ref<Record<string, number>>({name: 1});
+const { data: groups, isLoading, run } = useAsync<GroupRow[]>([]);
 
-const columns = ref<Column[]>([
+const columns = ref<Column<GroupRow>[]>([
     {
         label: 'Название',
         name: 'name',
         sortable: true,
         resizable: true,
+        rowAnchor: true,
+        mobile: 'title',
+    },
+    {
+        label: 'Участников',
+        name: 'users_count',
+        sortable: true,
+        // an API without the count: «—»
+        field: (g) => (typeof g.users_count === 'number' ? g.users_count : '—'),
     },
     {
         label: 'Дата создания',
@@ -78,6 +87,17 @@ const columns = ref<Column[]>([
         }
     }
 ]);
+
+const sorted = computed(() => {
+    const [column, direction] = Object.entries(sortBy.value)[0] ?? ['name', 1];
+    const value = (g: GroupRow) => (column === 'name' ? String(g.name ?? '').toLowerCase()
+        : column === 'users_count' ? g.users_count ?? 0 : String((g as any)[column] ?? ''));
+    return [...(groups.value ?? [])].sort((a, b) => {
+        const x = value(a);
+        const y = value(b);
+        return (x < y ? -1 : x > y ? 1 : a.id - b.id) * (direction === -1 ? -1 : 1);
+    });
+});
 
 onMounted(() => {
     run(groupsService.find({limit: 1000}).exec());

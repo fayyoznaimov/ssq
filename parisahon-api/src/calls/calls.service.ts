@@ -19,11 +19,12 @@ import { RoleEnum, User } from '../user/user.entity';
 import { Deal } from '../deal/deal.entity';
 import { EventTypes } from '../events/event.entity';
 import { CallRecordingEventDto } from '../events/dto/call.recording.event.dto';
-import { CallFeedQueryDto, RecordingsQueryDto, QueueQueryDto } from './dto/calls.dto';
+import { CallFeedQueryDto, CallListQueryDto, RecordingsQueryDto, QueueQueryDto } from './dto/calls.dto';
 import { CallClient, CallClientService } from './call-client.service';
 import { Access } from '../auth/access';
 import { ClientDealsService } from '../messenger/client-deals.service';
 import { phoneKeySql } from '../helper/phone';
+import { AuditJournal } from '../audit/audit-journal';
 
 const STAFF = [RoleEnum.ADMIN, RoleEnum.MANAGER, RoleEnum.AGENT];
 /** The conversation with a client goes on where the latest of these is (as ClientDealsService counts it). */
@@ -176,6 +177,7 @@ export class CallsService {
         username: u.username,
         role: u.role,
         has_token: !!t,
+        tls_required: t?.tls_required ?? false,
         issued_at: t?.created_at ?? null,
         last_upload_at: t?.last_upload_at ?? null,
       };
@@ -183,26 +185,58 @@ export class CallsService {
   }
 
   /** A new token for the user (the old one is revoked); the value is returned once. */
-  async issueToken(userId: number, admin: User): Promise<{ user_id: number; token: string }> {
+  async issueToken(userId: number, admin: User, tlsRequired?: boolean): Promise<{ user_id: number; token: string; tls_required: boolean }> {
     const user = await this.userRepository.findOne({ where: { id: userId, role: In(STAFF) } });
     if (!user) throw new NotFoundException(`Staff user ${userId} does not exist`);
+    // a new token of the same phone keeps the FTPS rule of the old one unless the admin says otherwise
+    const previous = await this.tokenRepository.findOne({ where: { user: { id: userId }, revoked_at: IsNull() } });
     await this.revokeToken(userId);
     const token = 'rec_' + randomBytes(24).toString('hex');
     const row = new RecorderToken();
     row.user = user;
     row.token_hash = CallsService.hash(token);
     row.created_by = admin;
+    row.tls_required = tlsRequired ?? previous?.tls_required ?? false;
     await this.tokenRepository.save(row);
-    return { user_id: userId, token };
+    return { user_id: userId, token, tls_required: row.tls_required };
+  }
+
+  /** FTPS required for the FTP logins with the manager's current token (the FTP receiver asks GET /calls/recorder). */
+  async setTokenTls(userId: number, tlsRequired: boolean): Promise<{ user_id: number; tls_required: boolean }> {
+    // the journal (src/audit): «Только FTPS: нет → да» of the token, who changed it
+    const result = await AuditJournal.around(this.tokenRepository.manager, 'recorder_token', 't.user_id = $1 AND t.revoked_at IS NULL', [userId], () =>
+      this.tokenRepository
+        .createQueryBuilder()
+        .update(RecorderToken)
+        .set({ tls_required: tlsRequired })
+        .where('user_id = :userId AND revoked_at IS NULL', { userId })
+        .execute(),
+    );
+    if (!result.affected) throw new NotFoundException(`Staff user ${userId} has no recorder token`);
+    return { user_id: userId, tls_required: tlsRequired };
+  }
+
+  /** The manager behind a recorder token and whether FTP logins with it must use FTPS; null — no such token. */
+  async recorderOfToken(token: string | undefined): Promise<{ user: User; tls_required: boolean } | null> {
+    if (!token || token.length < 16) return null;
+    const row = await this.tokenRepository.findOne({
+      where: { token_hash: CallsService.hash(token), revoked_at: IsNull() },
+      relations: { user: true },
+    });
+    if (!row || !row.user || row.user.deleted_at) return null;
+    return { user: row.user, tls_required: !!row.tls_required };
   }
 
   async revokeToken(userId: number): Promise<{ revoked: number }> {
-    const result = await this.tokenRepository
-      .createQueryBuilder()
-      .update(RecorderToken)
-      .set({ revoked_at: new Date() })
-      .where('user_id = :userId AND revoked_at IS NULL', { userId })
-      .execute();
+    // the journal (src/audit): «Отозван», who revoked it (the token itself is never stored)
+    const result = await AuditJournal.around(this.tokenRepository.manager, 'recorder_token', 't.user_id = $1 AND t.revoked_at IS NULL', [userId], () =>
+      this.tokenRepository
+        .createQueryBuilder()
+        .update(RecorderToken)
+        .set({ revoked_at: new Date() })
+        .where('user_id = :userId AND revoked_at IS NULL', { userId })
+        .execute(),
+    );
     return { revoked: result.affected ?? 0 };
   }
 
@@ -600,7 +634,7 @@ export class CallsService {
   // ------------------------------------------------------------------ recordings
 
   /** Every recording (the admin's list): filters by manager, days and number; each with its client and deal. */
-  async recordings(query: RecordingsQueryDto): Promise<{ data: CallRow[]; count: number; page: number; limit: number }> {
+  async recordings(query: RecordingsQueryDto, access?: Access): Promise<{ data: CallRow[]; count: number; page: number; limit: number }> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 50;
     const qb = this.recordingRepository
@@ -613,12 +647,27 @@ export class CallsService {
     if (query.user_id) qb.andWhere('r.user_id = :user', { user: query.user_id });
     if (query.from) qb.andWhere('r.created_at >= :from', { from: query.from });
     if (query.till) qb.andWhere("r.created_at < (CAST(:till AS date) + interval '1 day')", { till: query.till });
+    if (query.direction) qb.andWhere(query.direction === 'out' ? 'r.outgoing = true' : 'r.outgoing = false');
     if (query.number) {
       const digits = CallsService.digits(query.number);
       if (digits) qb.andWhere(`${DIGITS('r.from_number')} LIKE :num`, { num: '%' + digits + '%' });
     }
     const [rows, count] = await qb.getManyAndCount();
-    return { data: await this.describe(rows), count, page, limit };
+    return { data: await this.describe(rows, access), count, page, limit };
+  }
+
+  /**
+   * «Записи звонков» (GET /calls/list): the calls, newest first, with the manager, the client, the deal,
+   * the direction and the duration; filters by manager, days, direction and number. Admin and manager
+   * see everybody's calls (user_id picks one person); anybody else sees their own recordings only
+   * (the rule of GET /calls/staff/:id), and a deal they may not see is not named.
+   */
+  async listCalls(query: CallListQueryDto, access: Access): Promise<{ data: CallRow[]; count: number; page: number; limit: number }> {
+    const own = !access.isManager;
+    return this.recordings(
+      { ...query, limit: query.limit ?? 25, user_id: own ? access.id : query.user_id } as RecordingsQueryDto,
+      own ? access : undefined,
+    );
   }
 
   /** The recordings of one staff member (their own page «Записи звонков»), newest first, with client and deal. */
@@ -655,6 +704,7 @@ export class CallsService {
       params.push(query.till);
       period += ` AND r.created_at < (CAST($${params.length} AS date) + interval '1 day')`;
     }
+    if (query.direction) period += query.direction === 'out' ? ' AND r.outgoing' : ' AND NOT r.outgoing';
     let scope = '';
     if (visible) {
       params.push(access.id);

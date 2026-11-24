@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { Repository } from 'typeorm';
 import { RoleEnum, User } from '../user/user.entity';
 import * as process from 'process';
 import * as bcrypt from 'bcryptjs';
@@ -9,9 +9,39 @@ import { DealStage } from '../deal_stage/deal_stage.entity';
 import { TaskType as TaskTypeEntity } from '../task_type/task_type.entity';
 import { Setting } from '../setting/setting.entity';
 import { DealStageCollection } from 'src/deal_stage/deal_stage.collection.entity';
-import { DealStageService } from 'src/deal_stage/deal_stage.service';
+import {
+  defaultStageName,
+  legacyKindOfName,
+  StageKind,
+  SYSTEM_STAGE_KINDS,
+} from 'src/deal_stage/stage-kind';
+
+/**
+ * The start-up steps main.ts runs one by one (every seed* and fix* method of the class) log their error
+ * instead of throwing it: one broken step (a renamed or deleted default, an unexpected row, a database
+ * error) must not stop the API — the server would restart it in a loop and the CRM would stay down.
+ */
+function NonFatalSteps(): ClassDecorator {
+  return (target) => {
+    const prototype = target.prototype;
+    for (const name of Object.getOwnPropertyNames(prototype)) {
+      if (!/^(seed|fix)/.test(name)) continue;
+      const step = prototype[name];
+      if (typeof step !== 'function') continue;
+      prototype[name] = async function (...args: unknown[]) {
+        try {
+          return await step.apply(this, args);
+        } catch (error) {
+          console.error(`Start-up step ${name} failed, the API starts anyway: ${(error as Error)?.message ?? error}`);
+          return undefined;
+        }
+      };
+    }
+  };
+}
 
 @Injectable()
+@NonFatalSteps()
 export class SeedService {
   constructor(
     @InjectRepository(User)
@@ -74,43 +104,50 @@ export class SeedService {
     }
   }
 
+  /**
+   * Every pipeline has one stage of each system kind (deal_stage/stage-kind.ts): a missing one is
+   * created with its default name. The kind decides, not the name: a renamed system stage is not
+   * created again.
+   *
+   * Fallback for one release (DEAL_STAGE_* of .env): a stage of kind `work` that bears the
+   * default name of a missing kind gets that kind instead of a new stage being made (a pipeline made
+   * by the old code between the migration and this release).
+   */
   async seedStages(): Promise<void> {
-    // Fetch all collections with stages
     const collections = await this.collectionRepository
       .createQueryBuilder('t0')
       .leftJoinAndSelect('t0.deal_stages', 't1')
       .getMany();
 
-    const stagesToCreate: DealStage[] = [];
+    const stagesToSave: DealStage[] = [];
 
-    // Loop through existing collections
     for (const collection of collections) {
-      // Loop through deal stages of the collection
-      for (const defaultStageName of DealStageService.defaultStageNames) {
-        let found: boolean = false;
-        // Search for default stage name
-        for (const existingStage of collection.deal_stages) {
-          if (defaultStageName === existingStage.name) {
-            found = true;
-            continue;
-          }
+      const stages = [...collection.deal_stages].sort((a, b) => a.id - b.id);
+      for (const kind of SYSTEM_STAGE_KINDS) {
+        if (stages.some((stage) => stage.kind === kind)) {
+          continue;
         }
 
-        // If not found, create one
-        if (!found) {
-          const newStage = new DealStage();
-          newStage.name = defaultStageName;
-          newStage.collection = collection;
-
-          stagesToCreate.push(newStage);
+        const legacy = stages.find(
+          (stage) => stage.kind === StageKind.WORK && legacyKindOfName(stage.name) === kind,
+        );
+        if (legacy) {
+          legacy.kind = kind;
+          stagesToSave.push(legacy);
+          continue;
         }
+
+        const newStage = new DealStage();
+        newStage.name = defaultStageName(kind);
+        newStage.kind = kind;
+        newStage.collection = collection;
+        stagesToSave.push(newStage);
       }
     }
 
-    // Save new default deal stages if need to
-    if (stagesToCreate.length > 0) {
-      console.log(`Created ${stagesToCreate.length} new default deal stages`);
-      await this.dealStageRepository.save(stagesToCreate);
+    if (stagesToSave.length > 0) {
+      console.log(`System deal stages: ${stagesToSave.length} created or given their kind`);
+      await this.dealStageRepository.save(stagesToSave);
     } else {
       console.log('Default deal stages are populated for every collection');
     }
@@ -131,8 +168,22 @@ export class SeedService {
       name: process.env.DEFAULT_COLLECTION_NAME,
     });
 
+    // one stage of each system kind per pipeline (IDX_deal_stage_collection_kind): a stray stage of
+    // a kind the pipeline already has becomes an ordinary one
+    const taken = new Set(
+      (
+        await this.dealStageRepository
+          .createQueryBuilder('t0')
+          .where('t0.collection_id = :id', { id: defaultCollection?.id ?? 0 })
+          .getMany()
+      ).map((stage) => stage.kind),
+    );
     for (const dealStage of dealStagesWithoutCollection) {
       dealStage.collection = defaultCollection;
+      if (dealStage.kind !== StageKind.WORK) {
+        if (taken.has(dealStage.kind)) dealStage.kind = StageKind.WORK;
+        else taken.add(dealStage.kind);
+      }
     }
 
     await this.dealStageRepository.save(dealStagesWithoutCollection);
@@ -153,13 +204,15 @@ export class SeedService {
       name: process.env.DEFAULT_COLLECTION_NAME,
     });
 
-    // If no active collections, set default collection as active
+    // If no active collections, set default collection as active (none by that name: the oldest pipeline)
     if (activeCollections && activeCollections.length === 0) {
-      if (defaultCollection) {
-        defaultCollection.is_active = true;
+      const fallback =
+        defaultCollection ?? (await this.collectionRepository.find({ order: { id: 'ASC' }, take: 1 }))[0];
+      if (fallback) {
+        fallback.is_active = true;
 
-        await this.collectionRepository.save(defaultCollection);
-        console.log('Default collection is set as active!');
+        await this.collectionRepository.save(fallback);
+        console.log(`Collection ${fallback.id} is set as active!`);
         return;
       }
     }
@@ -183,6 +236,11 @@ export class SeedService {
     }
   }
 
+  /**
+   * The pipeline of an empty CRM only. Looked up by DEFAULT_COLLECTION_NAME alone, a changed name in .env made a
+   * new empty pipeline at the next start, and fixCollectionStatuses() then made it the active one instead of the
+   * pipeline with the deals.
+   */
   async seedDefaultCollection(): Promise<void> {
     const defaultCollection = await this.collectionRepository.findOneBy({
       name: process.env.DEFAULT_COLLECTION_NAME,
@@ -190,6 +248,13 @@ export class SeedService {
 
     if (defaultCollection) {
       console.log('Default Collection already exists!');
+      return;
+    }
+
+    if ((await this.collectionRepository.count()) > 0) {
+      console.warn(
+        `No pipeline is named "${process.env.DEFAULT_COLLECTION_NAME}" (DEFAULT_COLLECTION_NAME), but pipelines exist: none created`,
+      );
       return;
     }
 
@@ -201,29 +266,20 @@ export class SeedService {
     console.log('Populated default collection');
   }
 
+  /**
+   * The task types of an empty CRM only. They were looked up by name at every start, so a type the admin
+   * renamed or deleted in the settings came back. The tasks the CRM makes itself find their type by
+   * DEFAULT_TASK_TYPE with a fallback (task_type/default-task-type.ts), not by these names.
+   */
   async seedTaskTypes(): Promise<void> {
-    const taskTypes = ['Встреча', 'Связаться'];
-
-    const existingTaskTypes = await this.taskTypeRepository.findBy({
-      name: In(taskTypes),
-    });
-
-    const newTaskTypes: TaskTypeEntity[] = [];
-
-    taskTypes.forEach((taskType) => {
-      if (
-        !existingTaskTypes.some(
-          (existingTaskType) => existingTaskType.name === taskType,
-        )
-      ) {
-        const newTaskType = new TaskTypeEntity();
-        newTaskType.name = taskType;
-        newTaskTypes.push(newTaskType);
-      }
-    });
-
-    await this.taskTypeRepository.save(newTaskTypes);
-    console.log('Created Task Types: ', newTaskTypes);
+    if ((await this.taskTypeRepository.count()) > 0) {
+      console.log('Task types already exist');
+      return;
+    }
+    await this.taskTypeRepository.save(
+      ['Встреча', 'Связаться'].map((name) => this.taskTypeRepository.create({ name })),
+    );
+    console.log('Default task types created');
   }
 
   /** The default groups of an empty CRM only: groups the admin deleted do not come back at the next start. */
@@ -255,9 +311,15 @@ export class SeedService {
 
     if (settings.length == 0) {
       const newSettings = new Setting();
-      newSettings.default_stage = await this.stageRepository.findOneBy({
-        name: process.env.DEAL_STAGE_CREATED,
-      });
+      // «Первичный контакт» of the active pipeline (any pipeline when none is active yet)
+      newSettings.default_stage =
+        (await this.stageRepository
+          .createQueryBuilder('s')
+          .innerJoin('s.collection', 'c')
+          .where('s.kind = :kind', { kind: StageKind.FIRST_CONTACT })
+          .orderBy('c.is_active', 'DESC')
+          .addOrderBy('s.id', 'ASC')
+          .getOne()) ?? null;
 
       await this.settingsRepository.save(newSettings);
       console.log('Default settings created');

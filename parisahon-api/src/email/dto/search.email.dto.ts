@@ -64,4 +64,9 @@ export class SearchEmailDto extends PaginationRequestDto {
   @IsOptional()
   @IsString()
   email_to: string;
+
+  /** "true": letters of clients (in a deal, from a contact or a company address); "false": «Неразобранные» */
+  @IsOptional()
+  @IsBooleanString()
+  of_client: string;
 }

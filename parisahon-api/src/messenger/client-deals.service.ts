@@ -2,11 +2,13 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 import { AuthUser } from '../auth/auth.guard';
+import { Access } from '../auth/access';
 import { RoleEnum, User } from '../user/user.entity';
 import { Deal } from '../deal/deal.entity';
 import { Event, EventTypes } from '../events/event.entity';
 import { DealService } from '../deal/deal.service';
 import { AutoTaskService } from '../automation/auto-task.service';
+import { MessengerHealthService } from './messenger-health.service';
 
 /** Messages with the client: where "the conversation goes on" is decided by the latest of them. */
 const CHAT_TYPES = [
@@ -37,11 +39,14 @@ export interface DealChoiceOptions {
   dealId?: number | null;
   /** an incoming message soon after the client's deal was closed goes into that deal (MESSENGER_AFTER_CLOSE_HOURS) */
   afterCloseGrace?: boolean;
+  /** «Telegram» / «WhatsApp»: for the note to the manager of a deal the message did not go into */
+  channel?: string;
 }
 
 interface OpenDealRow {
   id: number;
   agent_id: number | null;
+  agent_group_id: number | null;
   agent_active: boolean;
   last_chat_at: Date | null;
   last_event_at: Date | null;
@@ -62,11 +67,17 @@ function envNumber(name: string, fallback: number): number {
  *  1. the manager's own open deals with the client: the one the conversation goes on in (where the
  *     latest message with this client is: a message moved there by hand pulls the next ones after
  *     it), else the newest;
- *  2. else another manager's open deal with the client, but only a live one: its manager is still
- *     a staff user and something happened in it within MESSENGER_FOREIGN_DEAL_DAYS (30) days;
+ *  2. else another manager's open deal with the client, but only a live one (its manager is still
+ *     a staff user and something happened in it within MESSENGER_FOREIGN_DEAL_DAYS (30) days) that
+ *     this manager may open (Access: the deal view right of the user card). A message never goes
+ *     silently into a deal the manager whose messenger it is cannot see (OMNI-7): then rule 3 gives
+ *     the manager a deal of their own, and the manager of the other deal is told in the CRM bot;
  *  3. else nothing is open:
  *     - a message the manager wrote from the phone never opens a deal: it goes into the client's
- *       latest deal (the manager's own first), or is not recorded when the client has none;
+ *       latest deal (the manager's own first, another one only when this manager may open it), or is
+ *       not recorded when the client has none. One exception (OMNI-7): the client has a live deal of a
+ *       colleague this manager cannot open — then the manager gets a deal of their own, as for a
+ *       client's message, so the conversation is neither lost nor hidden;
  *     - a client's message within MESSENGER_AFTER_CLOSE_HOURS (24) after the manager's deal with the
  *       client was closed goes into that deal, and the manager gets a task to look at it
  *       («спасибо, получили» does not open a new deal; a new order is not missed);
@@ -85,6 +96,7 @@ export class ClientDealsService {
     private dealService: DealService,
     private dataSource: DataSource,
     private autoTasks: AutoTaskService,
+    private health: MessengerHealthService,
   ) {}
 
   static foreignDealDays(): number {
@@ -115,17 +127,30 @@ export class ClientDealsService {
     }
     const days = ClientDealsService.foreignDealDays();
     const since = Date.now() - days * 24 * 3600 * 1000;
+    const recent = (d: OpenDealRow) => Math.max(time(d.last_event_at), time(d.created_at));
     const live = open
-      .filter((d) => d.agent_active && (days === 0 || Math.max(time(d.last_event_at), time(d.created_at)) >= since))
-      .sort((a, b) => Math.max(time(b.last_event_at), time(b.created_at)) - Math.max(time(a.last_event_at), time(a.created_at)) || b.id - a.id);
-    if (live.length) return { deal: await this.load(live[0].id), created: false };
+      .filter((d) => d.agent_active && (days === 0 || recent(d) >= since))
+      .sort((a, b) => recent(b) - recent(a) || b.id - a.id);
+    const viewer = live.length ? await this.accessOf(agent) : null;
+    const visible = live.filter((d) => viewer!.allowsDeal('view', d.agent_id, d.agent_group_id));
+    if (visible.length) return { deal: await this.load(visible[0].id), created: false };
     if (open.length) {
-      this.logger.log(`contact ${contact.id}: open deal(s) ${open.map((d) => d.id).join(',')} of another manager are stale or orphaned, not used`);
+      this.logger.log(
+        `contact ${contact.id}: open deal(s) ${open.map((d) => d.id).join(',')} of another manager are stale, orphaned or not visible to user ${agent.id}, not used`,
+      );
     }
 
     if (options.outgoing) {
       const latest = await this.latestDealOf(contact.id, agent.id, false);
-      return latest ? { deal: await this.load(latest), created: false } : { deal: null, created: false, reason: 'no_deal' };
+      if (!latest) return { deal: null, created: false, reason: 'no_deal' };
+      const visible = Number(latest.agent_id) === agent.id || (await this.accessOf(agent)).allowsDeal('view', latest.agent_id, latest.agent_group_id);
+      if (visible) return { deal: await this.load(latest.id), created: false };
+      // the client is in work with a colleague whose deal this manager cannot open: the manager's
+      // conversation is not lost and not hidden in that deal — it gets a deal of its own (and the colleague is told)
+      if (!live.length) return { deal: null, created: false, reason: 'no_visible_deal' };
+      const deal = await this.createDeal(agent, contact);
+      void this.tellForeign(live[0], agent, contact, deal, options.channel);
+      return { deal, created: true };
     }
     if (options.afterCloseGrace) {
       const hours = ClientDealsService.afterCloseHours();
@@ -140,7 +165,43 @@ export class ClientDealsService {
         if (rows[0]) return { deal: await this.load(rows[0].id), created: false, afterClose: true };
       }
     }
-    return { deal: await this.createDeal(agent, contact), created: true };
+    const deal = await this.createDeal(agent, contact);
+    // the client already has a live deal of another manager that this one cannot open: that manager is told
+    if (live.length) void this.tellForeign(live[0], agent, contact, deal, options.channel);
+    return { deal, created: true };
+  }
+
+  /** The note to the manager of the client's other open deal: the client wrote to a colleague, who has a deal of their own now. */
+  private async tellForeign(foreign: OpenDealRow, agent: User, contact: User, deal: Deal, channel?: string): Promise<void> {
+    if (!foreign.agent_id || Number(foreign.agent_id) === agent.id) return;
+    try {
+      const base = (process.env.CRM_PUBLIC_URL || '').replace(/\/+$/, '');
+      const link = (id: number) => (base ? `${base}/deals/${id}` : `№${id}`);
+      await this.health.tellUser(
+        Number(foreign.agent_id),
+        `Клиент «${contact.username || contact.phone || contact.id}» написал${channel ? ` в ${channel}` : ''} менеджеру ${agent.username || agent.id}, ` +
+          `у которого нет доступа к вашей сделке ${link(foreign.id)}. Его переписка теперь идёт в его сделку ${link(deal.id)}.`,
+      );
+    } catch (error) {
+      this.logger.warn(`note about deal ${foreign.id}: ${(error as Error).message}`);
+    }
+  }
+
+  /** The rights of a staff user (role, the user card's permissions, group), as the API checks them on a request. */
+  private async accessOf(agent: User): Promise<Access> {
+    const rows: { id: number; username: string; role: any; permissions: any; group_id: number | null }[] = await this.dataSource.query(
+      `SELECT id, username, role, permissions, group_id FROM "user" WHERE id = $1`,
+      [agent.id],
+    );
+    const row = rows[0];
+    const user: AuthUser = {
+      sub: agent.id,
+      username: row?.username ?? agent.username,
+      role: row?.role ?? agent.role,
+      permissions: row?.permissions ?? agent.permissions ?? null,
+      group_id: row?.group_id ?? null,
+    };
+    return new Access(user);
   }
 
   /**
@@ -223,7 +284,7 @@ export class ClientDealsService {
 
   private async openDealsOf(contactId: number): Promise<OpenDealRow[]> {
     return this.dataSource.query(
-      `SELECT d.id, d.agent_id, d.created_at,
+      `SELECT d.id, d.agent_id, a.group_id AS agent_group_id, d.created_at,
               (a.id IS NOT NULL AND a.deleted_at IS NULL AND a.role = ANY($3)) AS agent_active,
               (SELECT max(e.created_at) FROM event e
                 WHERE e.deal_id = d.id AND e.type = ANY($2) AND (e.user_id = $1 OR e.target_user_id = $1)) AS last_chat_at,
@@ -238,15 +299,17 @@ export class ClientDealsService {
   }
 
   /** The client's latest deal (open or closed): the manager's own first. */
-  private async latestDealOf(contactId: number, agentId: number, ownOnly: boolean): Promise<number | null> {
-    const rows: { id: number }[] = await this.dataSource.query(
-      `SELECT d.id FROM deal d JOIN deal_user du ON du."dealId" = d.id AND du."userId" = $1
+  private async latestDealOf(contactId: number, agentId: number, ownOnly: boolean): Promise<{ id: number; agent_id: number | null; agent_group_id: number | null } | null> {
+    const rows: { id: number; agent_id: number | null; agent_group_id: number | null }[] = await this.dataSource.query(
+      `SELECT d.id, d.agent_id, a.group_id AS agent_group_id
+         FROM deal d JOIN deal_user du ON du."dealId" = d.id AND du."userId" = $1
+         LEFT JOIN "user" a ON a.id = d.agent_id
         WHERE d.deleted_at IS NULL ${ownOnly ? 'AND d.agent_id = $2' : ''}
         ORDER BY (d.agent_id IS NOT DISTINCT FROM $2) DESC, COALESCE(d.closed_at, d.created_at) DESC, d.id DESC
         LIMIT 1`,
       [contactId, agentId],
     );
-    return rows[0]?.id ?? null;
+    return rows[0] ?? null;
   }
 
   private async createDeal(agent: User, contact: User): Promise<Deal> {

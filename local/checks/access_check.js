@@ -39,10 +39,10 @@ async function api(token, method, path, body) {
   if (groups.length < 2) throw new Error('need two groups');
   const own = { view: 1, create: 3, update: 1, delete: 1, export: 0 };
   const perms = { deal: own, company: own, contact: own, task: { update: 1, delete: 1 }, mail: false, file: true };
-  const mkUser = async (name, groupId) =>
+  const mkUser = async (name, groupId, permissions = perms) =>
     (await q(
       `INSERT INTO "user"(username, email, role, permissions, group_id, password) VALUES ($1, $2, 'agent', $3, $4, 'x') RETURNING id`,
-      [name, `${name}@check.invalid`, perms, groupId],
+      [name, `${name}@check.invalid`, permissions, groupId],
     ))[0].id;
   const A = await mkUser('QA-CHECK agent A', groups[0].id);
   const B = await mkUser('QA-CHECK agent B', groups[1].id);
@@ -111,6 +111,30 @@ async function api(token, method, path, body) {
       label: 'QA-CHECK task A on B deal', assign_to: { target: 'agent', id: A }, link_to: { target: 'deal', id: D },
       start_time: new Date(Date.now() + 36e5).toISOString(), end_time: new Date(Date.now() + 72e5).toISOString(), allDay: false,
     });
+    // ACL-8: the task level of the card decides whom a task may be given to and which unlinked tasks are seen
+    await deny('A (own task level) cannot give a task to B of another group', 'POST', '/tasks', {
+      label: 'QA-CHECK task A for B', assign_to: { target: 'agent', id: B }, link_to: { target: 'deal', id: dealA.b?.id },
+      start_time: new Date(Date.now() + 36e5).toISOString(), end_time: new Date(Date.now() + 72e5).toISOString(), allDay: false,
+    }, [403]);
+    const loose = (await q(
+      `INSERT INTO task (label, start_time, end_time, type_id, agent_id, "createdById")
+       VALUES ('QA-CHECK task B loose', now() + interval '1 day', now() + interval '25 hours', (SELECT id FROM task_type ORDER BY id LIMIT 1), $1, $1)
+       RETURNING id`,
+      [B],
+    ))[0].id;
+    await deny('A cannot read B task without a client', 'GET', `/tasks/${loose}`, undefined, [404]);
+    const looseList = await api(ta, 'GET', `/tasks?assigned_to[]=${B}&type=all&limit=1000`);
+    check('A task list hides B task without a client', looseList.s === 200 && !looseList.b.data.some((t) => t.id === loose), `status ${looseList.s}`);
+    // ACL-13: «Для группы» lets change the tasks of the colleagues of the group (task.group_id is empty)
+    const groupLevel = { view: 2, create: 3, update: 2, delete: 2, export: 0 };
+    const C = await mkUser('QA-CHECK agent C', groups[1].id, { ...perms, deal: groupLevel, task: { update: 2, delete: 2 } });
+    const byC = await api(tok(C), 'PATCH', `/tasks/${T}`, { label: 'QA-CHECK task B (changed by C)' });
+    check('C (group task level, B group) changes B task', byC.s === 200, `got ${byC.s} ${JSON.stringify(byC.b).slice(0, 160)}`);
+    const looseByC = await api(tok(C), 'PATCH', `/tasks/${loose}`, { label: 'QA-CHECK task B loose (C)' });
+    check('C changes B task without a client too', looseByC.s === 200, `got ${looseByC.s}`);
+    const byA = await api(ta, 'PATCH', `/tasks/${loose}`, { label: 'QA-CHECK hacked' });
+    check('A (another group) still cannot change it', [403, 404].includes(byA.s), `got ${byA.s}`);
+
     await deny('A cannot read B events', 'GET', `/users/${B}/events`);
     await deny('A cannot read B recordings', 'GET', `/users/${B}/recordings`);
     await deny('A cannot read B files', 'GET', `/users/${B}/files`);

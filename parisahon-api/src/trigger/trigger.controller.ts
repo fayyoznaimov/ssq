@@ -12,11 +12,15 @@ import {
 } from '@nestjs/common';
 import { Request } from 'express';
 import { TriggerService } from './trigger.service';
-import { AssignTriggerDto } from './dto/assign.trigger.dto';
+import { AssignTriggerDto, TriggerOrderDto } from './dto/assign.trigger.dto';
 import { Trigger } from './trigger.entity';
 import { Roles } from '../auth/decorator/roles.decorator';
 import { AuthGuard } from '../auth/auth.guard';
 
+/**
+ * The triggers of a stage. Reading: everybody (the runs only of the deals the user may see). Building
+ * the processes (create, change, delete): admins and managers (руководитель продаж), TRG-13.
+ */
 @Controller('stages/:id')
 export class TriggerController {
   constructor(private readonly triggerService: TriggerService) {}
@@ -46,7 +50,7 @@ export class TriggerController {
     return this.triggerService.fetchRuns(id, triggerId, Number(limit) || 100, request['user']);
   }
 
-  @Roles(AuthGuard.ADMIN_LEVEL)
+  @Roles(AuthGuard.MANAGER_LEVEL)
   @Post('triggers')
   async attachTrigger(
     @Param('id', ParseIntPipe) id: number,
@@ -55,7 +59,17 @@ export class TriggerController {
     return this.triggerService.assignTriggerToDealStage(data, id);
   }
 
-  @Roles(AuthGuard.ADMIN_LEVEL)
+  /** The order the triggers of the stage run in (the settings page: «выше» / «ниже»). */
+  @Roles(AuthGuard.MANAGER_LEVEL)
+  @Patch('trigger-order')
+  async reorderTriggers(
+    @Param('id', ParseIntPipe) dealStageId: number,
+    @Body() data: TriggerOrderDto,
+  ): Promise<{ id: number; position: number }[]> {
+    return this.triggerService.reorderTriggers(dealStageId, data.ids);
+  }
+
+  @Roles(AuthGuard.MANAGER_LEVEL)
   @Patch('triggers/:triggerId')
   async updateTrigger(
     @Param('id', ParseIntPipe) dealStageId: number,
@@ -65,7 +79,7 @@ export class TriggerController {
     return this.triggerService.updateTrigger(triggerId, dealStageId, data);
   }
 
-  @Roles(AuthGuard.ADMIN_LEVEL)
+  @Roles(AuthGuard.MANAGER_LEVEL)
   @Delete('triggers/:triggerId')
   async deleteTrigger(
     @Param('id', ParseIntPipe) dealStageId: number,

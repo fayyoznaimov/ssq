@@ -12,7 +12,7 @@
         <BaseHeading
             v-if="app.tairo.collapse?.toolbar?.showTitle"
             as="h1"
-            class="text-muted-800 hidden dark:text-white md:block"
+            class="text-muted-800 dark:text-white min-w-0 flex-1 xs:!text-lg xs:!font-normal"
             size="2xl"
             weight="light"
         >
@@ -20,8 +20,8 @@
                 {{ route.meta.title }}
             </slot>
         </BaseHeading>
-        <div class="ms-auto" />
-        <BaseThemeToggle />
+        <div v-if="!app.tairo.collapse?.toolbar?.showTitle" class="ms-auto" />
+        <BaseThemeToggle class="shrink-0" />
         <UserNav :user="user" />
     </div>
 </template>

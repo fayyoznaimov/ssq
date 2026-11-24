@@ -1,10 +1,11 @@
 import { BadRequestException, HttpException, Injectable, Logger } from '@nestjs/common';
 import { Request } from 'express';
+import { Access } from '../auth/access';
 import { AuthUser } from '../auth/auth.guard';
 import { PaginationResponseDto } from '../helper/dto/pagination.dto';
 import { HelperService } from '../helper/helper.service';
 import { User } from '../user/user.entity';
-import { CreateDealsFromLettersDto } from './dto/create.deals.dto';
+import { CreateDealsFromLettersDto, LinkLetterDto } from './dto/create.deals.dto';
 import { CreateSignDto } from './dto/create.sign.dto';
 import { CreateTemplateDto } from './dto/create.template.dto';
 import { CreateTransporterDto } from './dto/create.transporter.dto';
@@ -13,7 +14,7 @@ import { SearchEmailDto } from './dto/search.email.dto';
 import { SendEmailDto } from './dto/send.email.dto';
 import { Email } from './email.entity';
 import { DealFromLetters, MailDealsService } from './mail-deals.service';
-import { MailboxService } from './mailbox.service';
+import { MailboxService, toAuthUser } from './mailbox.service';
 import { MailSendingService, SendEmailOptions } from './mail-sending.service';
 import { MailSignService } from './mail-sign.service';
 import { MailSyncService, MailSyncStatus } from './mail-sync.service';
@@ -82,6 +83,10 @@ export class EmailService {
     return this.mailbox.fetchOneLocalEmail(id, user, authUser);
   }
 
+  markRead(ids: number[], user: User) {
+    return this.mailbox.markRead(ids, user);
+  }
+
   markAsSpam(id: number, user: User) {
     return this.mailbox.markAsSpam(id, user);
   }
@@ -121,6 +126,16 @@ export class EmailService {
     return this.mailDeals.createFromLetters(letters, data, user, authUser);
   }
 
+  /**
+   * «Привязать» a letter of no deal (Mail, «Неразобранные»): into a deal and / or to a contact; the
+   * other stored letters of the address follow the contact.
+   */
+  async linkLetter(id: number, data: LinkLetterDto, user: User, authUser: AuthUser) {
+    if (!data.deal_id && !data.contact_id) throw new BadRequestException('Выберите сделку или контакт');
+    const [letter] = await this.mailbox.accessibleLetters([id], user);
+    return this.mailDeals.linkLetter(letter, data, authUser ?? toAuthUser(user));
+  }
+
   /** «доб.контакты»: the stored letters of the new contacts point to them (and go into their open deals). */
   linkLetterContacts(userIds: number[]) {
     return this.mailDeals.linkContacts(userIds);
@@ -149,13 +164,20 @@ export class EmailService {
     data: SendEmailDto,
     originatedBy: User,
     files: Array<Express.Multer.File> = [],
+    authUser: AuthUser | null = null,
   ): Promise<{ id: number; message_id: string }> {
     const repliedTo = data.reply_to_email_id
       ? await this.mailbox.accessibleLetter(+data.reply_to_email_id, originatedBy)
       : null;
+    // the deal written from: one the user may change and not closed (an agent used to write into
+    // the history of colleagues' and closed deals)
+    const deal = data.deal_id
+      ? await this.mailDeals.writableDeal(+data.deal_id, new Access(authUser ?? toAuthUser(originatedBy)))
+      : null;
     const saved = await this.sending.sendEmail(data, originatedBy, files, {
       signature: data.with_signature === 'true',
       repliedTo,
+      deal,
     });
     return { id: saved.id, message_id: saved.message_id };
   }

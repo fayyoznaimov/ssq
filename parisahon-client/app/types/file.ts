@@ -14,4 +14,11 @@ export type MyFile = {
     size: string;
     uploaded_by: User;
     email?: Email;
+    // the history row of a message that holds the file (GET /files): its time, type, deal and client
+    message?: {
+        at: string;
+        type: number;
+        deal: { id: number; label: string } | null;
+        client: { id: number; username: string } | null;
+    } | null;
 }

@@ -1,48 +1,35 @@
 <template>
-    <div class="flex flex-col gap-8">
-        <div class="flex flex-wrap items-center gap-4">
-            <h1 class="text-xl whitespace-nowrap">Аналитика по звонкам</h1>
-            <div class="max-w-xs w-full shrink-0">
-                <DatePicker
-                    v-model="dateRange"
-                    :format="format"
-                    range
-                    text-input
-                    vertical
-                    :preset-dates="presetDates"
-                    auto-apply
-                    :enable-time-picker="false"
-                    model-type="yyyy-MM-dd"
-                    :teleport="true"
-                    :dark="colorMode.value === 'dark'"
-                >
-                    <template #dp-input="{ onInput, value, onBlur, onPaste }">
-                        <BaseInput :value="value" @input="onInput" @blur="onBlur" @paste="onPaste" placeholder="За все время" />
-                    </template>
-                </DatePicker>
-            </div>
+    <div class="flex flex-col gap-6">
+        <div class="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:gap-4">
+            <h1 class="text-xl">Аналитика по звонкам</h1>
+            <PeriodPicker v-model="period" />
         </div>
         <div class="relative overflow-x-auto">
             <BaseTable
                 v-model:sortBy="sortBy"
                 :columns="columns"
-                :data="stats"
+                :data="sorted"
                 :loading="isLoading"
                 class="flex-auto"
-                id="employee-analytics"
+                id="call-analytics"
             >
             </BaseTable>
         </div>
-        <p class="text-sm text-muted-500">Звонки — записи звонков за период по времени самого звонка, как в «Контроле» и «По менеджерам».</p>
+        <p v-if="!isLoading && !stats.length" class="text-sm text-muted-500">
+            За этот период записей звонков нет. Записи приходят с телефонов менеджеров (Настройки → Звонки).
+        </p>
+        <p class="text-sm text-muted-500">
+            Звонки — записи звонков за период по времени самого звонка, как в «Контроле» и «По менеджерам». Длительность — минуты:секунды.
+        </p>
     </div>
 </template>
 
 <script lang="ts" setup>
-import moment from 'moment';
-import DatePicker from '@vuepic/vue-datepicker';
 import BaseTable from '~/components/common/BaseTable.vue';
+import PeriodPicker from '~/components/analytics/PeriodPicker.vue';
 import {type Column} from '~/components/common/types';
 import type { CallStat } from '~/types/stats';
+import { clock, spoken } from '~/utils/duration';
 
 definePageMeta({
     authRoute: true,
@@ -57,90 +44,87 @@ useHead({
 const callsService = useService('analytics/calls', {auth: true});
 
 const { data: stats, isLoading, run } = useAsync<CallStat[]>([]);
-const sortBy = ref<Record<string, any>>({createdAt: -1});
-const colorMode = useColorMode();
-// the same default as «Контроль» and «По менеджерам»: the current month
-const dateRange = ref([moment().startOf('month').format('YYYY-MM-DD'), moment().endOf('month').format('YYYY-MM-DD')]);
+const sortBy = ref<Record<string, number>>({});
+// the same default as «Контроль» and «По менеджерам»: the current month (or the period chosen in another report)
+const { period, params } = useReportPeriod('month');
 
-const presetDates = ref([
-    { label: 'За сегодня', value: [moment().startOf('day'), moment().startOf('day')] },
-    { label: 'За вчера', value: [moment().subtract(1, 'day').startOf('day'), moment().subtract(1, 'day').startOf('day')] },
-    { label: 'За последние 30 дней', value: [moment().subtract(30, 'day').startOf('day'), moment().startOf('day')] },
-    { label: 'За эту неделю', value: [moment().startOf('week'), moment().endOf('week')] },
-    { label: 'За прошлую неделю', value: [moment().subtract(1, 'week').startOf('week'), moment().subtract(1, 'week').endOf('week')] },
-    { label: 'За этот месяц', value: [moment().startOf('month'), moment().endOf('month')] },
-    { label: 'За прошлый месяц', value: [moment().subtract(1, 'month').startOf('month'), moment().subtract(1, 'month').endOf('month')] },
-    { label: 'За квартал', value: [moment().startOf('quarters'), moment().endOf('quarters')] },
-    { label: 'За этот год', value: [moment().startOf('year'), moment().endOf('year')] },
-    { label: 'За все время', value: [moment().set('year', 2020).startOf('year'), moment().set('year', 2100).endOf('year')] },
-]);
+// seconds from the API; an older API sends minutes only
+const sec = (item: any, key: string, minutesKey: string) =>
+    item[key] !== undefined && item[key] !== null ? Number(item[key]) : Math.round(Number(item[minutesKey] ?? 0) * 60);
 
-function format(dates: Date[]) {
-    const fromStr = moment(dates[0]).format('YYYY-MM-DD');
-    const toStr = moment(dates[1]).format('YYYY-MM-DD');
-    for (const preset of presetDates.value) {
-        if (preset.value[0].format('YYYY-MM-DD') === fromStr && preset.value[1].format('YYYY-MM-DD') === toStr) {
-            return preset.label;
-        }
-    }
-    return `${fromStr} - ${toStr}`;
-}
-
-const columns = ref<Column[]>([
+const columns = ref<Column<CallStat>[]>([
     {
-        label: 'Имя',
+        label: 'Сотрудник',
         name: 'user_name',
         resizable: true,
+        sortable: true,
     },
     {
-        label: 'Среднее время (мин)',
-        name: 'avg_duration',
-        resizable: true,
-    },
-    {
-        label: 'Кол-во звонков',
+        label: 'Звонков',
         name: 'call_count',
         resizable: true,
+        sortable: true,
     },
     {
-        label: 'Кол-во исходящих',
+        label: 'Исходящих',
         name: 'outgoing_call_count',
         resizable: true,
+        sortable: true,
     },
     {
-        label: 'Кол-во входящих',
+        label: 'Входящих',
         name: 'incoming_call_count',
         resizable: true,
+        sortable: true,
     },
     {
-        label: 'Исходящие (мин)',
-        name: 'total_outgoing_duration',
+        label: 'Средний звонок',
+        name: 'avg_duration_sec',
         resizable: true,
+        sortable: true,
+        field: (item) => clock(sec(item, 'avg_duration_sec', 'avg_duration')),
     },
     {
-        label: 'Входящие (мин)',
-        name: 'total_incoming_duration',
+        label: 'Исходящие, всего',
+        name: 'total_outgoing_sec',
         resizable: true,
+        sortable: true,
+        field: (item) => spoken(sec(item, 'total_outgoing_sec', 'total_outgoing_duration')),
     },
     {
-        label: 'Всего (мин)',
-        name: 'total_call_duration',
+        label: 'Входящие, всего',
+        name: 'total_incoming_sec',
         resizable: true,
+        sortable: true,
+        field: (item) => spoken(sec(item, 'total_incoming_sec', 'total_incoming_duration')),
+    },
+    {
+        label: 'Всего',
+        name: 'total_call_sec',
+        resizable: true,
+        sortable: true,
+        field: (item) => spoken(sec(item, 'total_call_sec', 'total_call_duration')),
     },
 ]);
 
+// sorted by the raw value of the column (seconds, counts), not by its text
+const sorted = computed(() => {
+    const rows = [...(stats.value ?? [])];
+    const [key, order] = Object.entries(sortBy.value)[0] ?? [];
+    if (!key) return rows;
+    return rows.sort((a: any, b: any) => {
+        const x = typeof a[key] === 'string' && key !== 'user_name' ? Number(a[key]) : a[key];
+        const y = typeof b[key] === 'string' && key !== 'user_name' ? Number(b[key]) : b[key];
+        if (x === y) return 0;
+        const less = typeof x === 'string' ? x.localeCompare(y, 'ru') < 0 : x < y;
+        return (less ? -1 : 1) * (order === -1 ? -1 : 1);
+    });
+});
+
 function fetchStats() {
-    // the field cleared: all time
-    if (!dateRange.value?.[0] || !dateRange.value?.[1]) return run(callsService.find().exec());
-    run(callsService.find({
-        from_date: dateRange.value[0],
-        till_date: dateRange.value[1],
-    }).exec());
+    run(callsService.find(params.value).exec());
 }
 
-watch(dateRange, fetchStats);
+watch(period, fetchStats);
 onMounted(fetchStats);
 </script>
-
-<style>
-</style>

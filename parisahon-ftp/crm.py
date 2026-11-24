@@ -29,6 +29,8 @@ class Recorder:
     user_id: Optional[int] = None
     username: str = ""
     detail: str = ""
+    # the admin set "FTPS only" for this token (settings -> calls): a plain FTP session with it is refused
+    tls_required: bool = False
 
 
 @dataclass
@@ -81,7 +83,7 @@ class CrmApi:
             user_id = int(data["user_id"])
             if user_id <= 0:
                 raise ValueError("user_id")
-            return Recorder("ok", user_id=user_id, username=str(data.get("username") or ""))
+            return Recorder("ok", user_id=user_id, username=str(data.get("username") or ""), tls_required=data.get("tls_required") is True)
         except urllib.error.HTTPError as error:
             body = error.read()
             if error.code == 401:

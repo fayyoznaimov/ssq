@@ -53,12 +53,11 @@ watch([withExtensions, whichFiles, from, to, unit], () => {
     props.trigger.delete_files_data.which_files = whichFiles.value.map((v) => v.value);
     props.trigger.delete_files_data.with_extensions = withExtensions.value.map((v) => v.value).flat();
 
-    const fromValue = Number(from.value);
-    const toValue = Number(to.value);
-    console.log('FROM: ', fromValue);
-    console.log('TO: ', fromValue);
-    props.trigger.delete_files_data.from_bytes = isNaN(fromValue) ? undefined : toBytes(unit.value, fromValue);
-    props.trigger.delete_files_data.till_bytes = isNaN(toValue) ? undefined : toBytes(unit.value, toValue);
+    // an empty or zero size is «no limit» (0 was sent as a size and the API refused the trigger)
+    const fromValue = Number(String(from.value ?? '').replace(',', '.'));
+    const toValue = Number(String(to.value ?? '').replace(',', '.'));
+    props.trigger.delete_files_data.from_bytes = !fromValue || isNaN(fromValue) || fromValue < 0 ? undefined : toBytes(unit.value, fromValue);
+    props.trigger.delete_files_data.till_bytes = !toValue || isNaN(toValue) || toValue < 0 ? undefined : toBytes(unit.value, toValue);
 });
 
 </script>

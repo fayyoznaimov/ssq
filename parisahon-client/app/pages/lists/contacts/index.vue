@@ -5,7 +5,7 @@
                 Контакты
             </h1>
             <h2 class="text-sm text-gray-500">
-                Список контактов
+                Всего: {{ formatNumber(contacts.count ?? 0, 0, '0') }}
             </h2>
         </div>
         <div class="flex flex-wrap gap-5 justify-between">
@@ -276,6 +276,7 @@ import Search from "~/components/common/Search.vue";
 import {type Column} from "~/components/common/types";
 import TairoPopover from "~/components/tairo/TairoPopover.vue";
 import { useAsync } from "~/composables/useAsync";
+import { formatNumber } from "~/utils/format";
 import {type PaginatedResponse} from "~/types/generics";
 import type { Stage } from "~/types/stage";
 import { type Contact, type User,UserRole } from "~/types/user";

@@ -9,6 +9,7 @@
 
 <script setup lang="ts">
 import type { DealEvent } from '~/types/deal';
+import { formatDateTime } from '~/utils/format';
 import { personName, timeOf } from './feed';
 
 const props = withDefaults(defineProps<{ event: DealEvent | any; withDate?: boolean; at?: string | null }>(), {
@@ -18,6 +19,7 @@ const props = withDefaults(defineProps<{ event: DealEvent | any; withDate?: bool
 
 const moment = computed(() => props.at || props.event.created_at);
 const time = computed(() => timeOf(moment.value));
-const full = computed(() => (moment.value ? new Date(moment.value).toLocaleString('ru') : ''));
+// «21 нояб. 2026, 18:35», as everywhere in the CRM (it was «21.11.2026, 18:48:09»)
+const full = computed(() => (moment.value ? formatDateTime(moment.value, '') : ''));
 const author = computed(() => personName(props.event.originated_by));
 </script>

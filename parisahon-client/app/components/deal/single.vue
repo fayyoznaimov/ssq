@@ -3,11 +3,18 @@
          then the deal's fields; from lg: client + fields on the left (4), the history on the right (8) -->
     <div class="grid grid-cols-12 gap-x-0 gap-y-6 lg:gap-x-8 lg:gap-y-0 lg:grid-rows-[auto_minmax(0,1fr)] lg:h-[calc(100vh-6.4rem)]">
         <section class="order-1 col-span-12 lg:col-span-4 lg:row-start-1 min-w-0">
-            <input type="hidden" name="label" v-model="deal.label" form="deal-form">
-            <BaseHeading size="lg" as="h1" contenteditable class="outline-none break-words" @input="labelChanged = true" @blur="deal.label = labelChanged ? $event.target.innerText : ''">{{ deal.label  || 'Сделка #XXXXX' }}</BaseHeading>
+            <!-- the name is the field «Название сделки» of the form (main-tab.vue); the heading only shows it -->
+            <BaseHeading size="lg" as="h1" class="break-words">{{ dealTitle }}</BaseHeading>
+            <!-- №, the stage and days in it, the source, «клиент ждёт ответа», the reason of a loss (components/history) -->
+            <DealHeader v-if="route.params.id" :summary="summary" class="mt-1" @ask-lost="askLost" />
             <ClientBlock v-if="route.params.id" :deal-id="route.params.id as string" class="mt-3 mb-2" />
         </section>
-        <section class="order-3 lg:order-2 col-span-12 lg:col-span-4 lg:row-start-2 rounded-md min-w-0">
+        <!-- from lg the column scrolls by itself (a visible scrollbar), «Сохранить» stays at its bottom;
+             phone: a new deal starts with its fields, a saved one with its conversation -->
+        <section
+            class="col-span-12 lg:col-span-4 lg:row-start-2 lg:order-2 lg:min-h-0 lg:overflow-y-auto rounded-md min-w-0"
+            :class="route.params.id ? 'order-3' : 'order-2'"
+        >
             <BaseTabs
                 rounded="lg"
                 model-value="main"
@@ -22,104 +29,43 @@
                         :users="users.data"
                     />
                     <FilesTab v-if="activeValue === 'files'" />
+                    <!-- who changed what in this deal and from where (the journal of changes, components/audit) -->
+                    <CardHistory v-if="activeValue === 'history' && route.params.id" scope="deal" :id="route.params.id as string" />
+                    <!-- «ИИ» (src/ai): summary, questions without an answer, promises, order parameters -->
+                    <DealAiPanel v-if="activeValue === 'ai'" :ai="dealAi" :deal="deal" />
                 </template>
             </BaseTabs>
         </section>
-        <section class="order-2 lg:order-3 col-span-12 lg:col-span-8 lg:col-start-5 lg:row-start-1 lg:row-span-2 flex flex-col min-w-0">
-            <EventsList 
-                :events="events" 
-                :deal="deal" 
-                :events-loading="eventsLoading" 
-                :start-observer="!!route.params.id" 
+        <!-- from lg the history takes the height of the screen next to the form and scrolls by itself (it was
+             a box of at most 40rem); a phone: full width, the composer under it -->
+        <section
+            class="lg:order-3 col-span-12 lg:col-span-8 lg:col-start-5 lg:row-start-1 lg:row-span-2 flex flex-col min-w-0 lg:min-h-0"
+            :class="route.params.id ? 'order-2' : 'order-3'"
+        >
+            <EventsList
+                v-model:filters="historyFilters"
+                v-model:scope="historyScope"
+                :events="events"
+                :deal="deal"
+                :events-loading="eventsLoading"
+                :start-observer="!!route.params.id"
                 :intersected="onIntersect"
                 :tasks="tasks.data"
+                :client-deals="summary?.client_deals ?? 0"
+                :show-deal="historyScope === 'client'"
                 @task-closed="() => {
                     fetchTasks();
                     onFilterApply();
                 }"
-            >
-                <template #header>
-                    <details class="sticky top-0 bg-white z-10 dark:bg-muted-800" ref="filterDetailsRef">
-                        <summary class="border-b p-4 text-sm text-muted-500 cursor-pointer dark:text-muted-400 dark:border-b-muted-700">
-                            Поиск и фильтр
-                        </summary>
-                        <div class="absolute p-4 bg-white w-full flex flex-col sm:flex-row gap-4 dark:bg-muted-800 shadow-xl rounded-b-lg">
-                            <section class="sm:max-w-[16rem] w-full">
-                                <ul class="flex flex-col gap-1">
-                                    <li class="w-full">
-                                        <input type="radio" name="preset" :value="Preset.All" v-model="preset" :id="'preset-' + Preset.All" class="apperance-none opacity-0 h-0 absolute -z-10 peer" @change="onPresetSelect($event)" checked>
-                                        <label :for="'preset-' + Preset.All" class="nui-button nui-button-medium nui-button-rounded nui-button-pastel dark:text-primary-200 hover:bg-primary-600/10 dark:hover:bg-primary-600/40 hover:text-primary-600 dark:peer-checked:bg-primary-600/40 dark:peer-checked:text-primary-200 peer-checked:bg-primary-600/10 peer-checked:text-primary-600 w-full justify-start">
-                                            Все события 
-                                        </label>
-                                    </li>
-                                    <li class="w-full">
-                                        <input type="radio" name="preset" :value="Preset.Inner" v-model="preset" :id="'preset-' + Preset.Inner" class="apperance-none opacity-0 h-0 absolute -z-10 peer" @change="onPresetSelect($event)">
-                                        <label :for="'preset-' + Preset.Inner" class="nui-button nui-button-medium nui-button-rounded nui-button-pastel dark:text-primary-200 hover:bg-primary-600/10 dark:hover:bg-primary-600/40 hover:text-primary-600 dark:peer-checked:bg-primary-600/40 dark:peer-checked:text-primary-200 peer-checked:bg-primary-600/10 peer-checked:text-primary-600 w-full justify-start">
-                                            Только чаты 
-                                        </label>
-                                    </li>
-                                    <li class="w-full">
-                                        <input type="radio" name="preset" :value="Preset.WithClients" v-model="preset" :id="'preset-' + Preset.WithClients" class="apperance-none opacity-0 h-0 absolute -z-10 peer" @change="onPresetSelect($event)">
-                                        <label :for="'preset-' + Preset.WithClients" class="nui-button nui-button-medium nui-button-rounded nui-button-pastel dark:text-primary-200 hover:bg-primary-600/10 dark:hover:bg-primary-600/40 hover:text-primary-600 dark:peer-checked:bg-primary-600/40 dark:peer-checked:text-primary-200 peer-checked:bg-primary-600/10 peer-checked:text-primary-600 w-full justify-start">
-                                            Только чаты с клиентами
-                                        </label>
-                                    </li>
-                                </ul>
-                            </section>
-                            <section class="max-w-sm w-full flex flex-col gap-2">
-                                <BaseListbox 
-                                    :items="chatTypesOptions" 
-                                    v-model="chatTypes"
-                                    :properties="{label: 'label', value: 'id' }"
-                                    multiple 
-                                    :fixed="true"
-                                    placeholder="Сообщения чатов" 
-                                    label="Сообщения чатов"
-                                    :multipleLabel="(value, prop) => {
-                                        if (!value.length) return;
-                                        else return `${value.map(v => v[prop]).join(', ')}`;
-                                    }"
-                                />
-                                <BaseListbox 
-                                    :items="linkedEntitiesOptions" 
-                                    v-model="linkedEntities"
-                                    :properties="{label: 'label', value: 'id' }"
-                                    multiple 
-                                    :fixed="true"
-                                    placeholder="Связанные объекты" 
-                                    label="Связанные объекты"
-                                    :multipleLabel="(value, prop) => {
-                                        if (!value.length) return;
-                                        else return `${value.map(v => v[prop]).join(', ')}`;
-                                    }"
-                                />
-                                <BaseListbox 
-                                    :items="eventTypesOptions" 
-                                    v-model="eventTypes"
-                                    :properties="{label: 'label', value: 'id' }"
-                                    multiple 
-                                    :fixed="true"
-                                    placeholder="Типы событий" 
-                                    label="Типы событий"
-                                    :multipleLabel="(value, prop) => {
-                                        if (!value.length) return;
-                                        else return `${value.map(v => v[prop]).join(', ')}`;
-                                    }"
-                                />
-                                <BaseButton color="primary" @click="onFilterApply" class="max-w-fit mt-4">Применить</BaseButton>
-                            </section>
-                        </div>
-                    </details>
-                </template>
-            </EventsList>
-            <div class="mb-8 my-4 space-y-2">
+            />
+            <div class="shrink-0 mb-8 mt-3 space-y-2 lg:mb-2">
                 <form class="flex flex-wrap lg:flex-nowrap gap-2" id="compose-form" @submit.prevent="onEvent">
                     <BaseListbox
                         v-model="messageType"
                         class="w-48 shrink-0"
                         name="message_type"
                         value="chat"
-                        :items="messageTypes"
+                        :items="availableMessageTypes"
                         :properties="{ value: 'id', label: 'label', icon: 'icon' }"
                         size="md"
                     />
@@ -179,6 +125,7 @@
                     :channel="messageType.id"
                     :contact="messageTarget"
                     :deal="deal"
+                    @blocked="messengerBlocked = $event"
                 />
                 <EmailReplyForm 
                     v-if="messageType.id === 'email'" 
@@ -204,7 +151,7 @@
                         <BaseButton
                             size="sm"
                             type="submit"
-                            :disabled="creatingEvent"
+                            :disabled="creatingEvent || (isClientMessenger && messengerBlocked)"
                             form="compose-form"
                         >
                             <div class="flex items-center gap-1">
@@ -223,15 +170,17 @@
                 </BaseTextarea>
             </div>
         </section>
+        <!-- «Почему сделка не реализована?» after the deal is saved in the stage «Закрыто и не реализовано» -->
+        <LostReasonModal />
     </div>
 </template>
 
 <script lang="ts" setup>
-import moment from 'moment';
 import { useRoute, useRouter } from 'vue-router';
 
 import BaseButton from '~/components/base/BaseButton.vue';
 import EventSchedulerSingle from '~/components/common/EventSchedulerSingle.vue';
+import { confirmTaskPlan } from '~/components/task/taskPlan';
 import EventsList from '~/components/common/EventsList.vue';
 import EmailReplyForm from '~/components/mail/EmailReplyForm.vue';
 import { type Deal, type DealEvent, DealEventType, type DealFile, type Task,type TaskType } from '~/types/deal';
@@ -243,18 +192,19 @@ import { promiseResult } from '~/utils/result';
 import MessengerComposerStatus from '~/components/whatsapp/MessengerComposerStatus.vue';
 import ClientBlock from './ClientBlock.vue';
 import FilesTab from './files-tab.vue';
+import CardHistory from '~/components/audit/CardHistory.vue';
 import MainTab from './main-tab.vue';
+import DealAiPanel from '~/components/ai/DealAiPanel.vue';
+import { useDealAi } from '~/composables/useDealAi';
+import DealHeader from '~/components/history/DealHeader.vue';
+import LostReasonModal from '~/components/history/LostReasonModal.vue';
+import { type DealSummary, type HistoryFilters, emptyHistoryFilters, historyQuery } from '~/components/history/history';
+import { askLostReason } from '~/components/history/lostReason';
 import type { PaginatedResponse } from '~/types/generics';
 
 type GroupedUser = User & {type: 'user', temp_id: string};
 type GroupedGroup = Group & {type: 'group', temp_id: string};
 type UserGroup = GroupedUser | GroupedGroup;
-
-enum Preset {
-    All = 'all',
-    Inner = 'inner',
-    WithClients = 'with_clients',
-} 
 
 let fakeId = -1;
 let currentPage = 0;
@@ -269,94 +219,9 @@ const messageTypes = [
     { id: 'email', label: 'E-mail', icon: 'ph:envelope-simple' },
 ]; 
 
-const innerChat = {
-    label: 'Внутренние',
-    id: 'inner'
-};
-
-const chatWithClients = {
-    label: 'С клиентами',
-    id: 'with_clients'
-};
-
-const chatTypesOptions = [
-    innerChat,
-    chatWithClients,
-];
-
-const linkedEntitiesOptions = [
-    {
-        label: 'Контакты',
-        id: 'contacts'
-    },
-    {
-        label: 'Компании',
-        id: 'company'
-    }
-];
-
-const eventTypesOptions = [
-    {
-        id: DealEventType.NewComment,
-        label: 'Новое примечание'
-    },
-    {
-        id: DealEventType.NewChatMessage,
-        label: 'Внутренное сообщение'
-    },
-    {
-        id: DealEventType.NewCompany,
-        label: 'Новая компания'
-    },
-    {
-        id: DealEventType.NewCtrAgent,
-        label: 'Новая контакт'
-    },
-    {
-        id: DealEventType.NewSMS,
-        label: 'Новый СМС'
-    },
-    {
-        id: DealEventType.NewTask,
-        label: 'Новая задача'
-    },
-    {
-        id: DealEventType.NewCallRecording,
-        label: 'Новое голосове'
-    },
-    {
-        id: DealEventType.NewTaskStatus,
-        label: 'Результат по задаче'
-    },
-    {
-        id: DealEventType.NewTelegramCall,
-        label: 'Новый телеграм звонок'
-    },
-    {
-        id: DealEventType.NewEmail,
-        label: 'Новое письмо'
-    },
-    {
-        id: DealEventType.NewFieldValue,
-        label: 'Новое значение'
-    },
-    {
-        id: DealEventType.NewUpdatedFieldValue,
-        label: 'Изменения поля'
-    },
-    {
-        id: DealEventType.NewTelegramMessage,
-        label: 'Новое телеграм сообщение'
-    },
-    {
-        id: DealEventType.NewWhatsAppMessage,
-        label: 'Новое WhatsApp сообщение'
-    },
-    {
-        id: DealEventType.NewProduct,
-        label: 'Новый товар'
-    },
-];
+// «E-mail» only with the mail right: without it every request of the form answered 403
+const mailAbility = useAppAbility();
+const availableMessageTypes = computed(() => messageTypes.filter((type) => type.id !== 'email' || mailAbility.can('read', 'Mail')));
 
 const router = useRouter();
 const dealService = useService('deals', { auth: true });
@@ -366,15 +231,14 @@ const userService = useService('users', { auth: true });
 const taskService = useService('tasks', { auth: true });
 const telegramService = useService('telegram', { auth: true });
 const whatsappService = useService('whatsapp', { auth: true });
-const distinctDates = new Map<string, number>();
 const messageTarget = ref<UserGroup>();
 const content = ref();
 const eventsEnded = ref(false);
-const preset = ref<Preset>(Preset.All);
-const eventTypes = ref(eventTypesOptions);
-const linkedEntities = ref(linkedEntitiesOptions);
-const chatTypes = ref(chatTypesOptions);
-const filterDetailsRef = ref<HTMLDetailsElement>();
+// the history: «Всё / Переписка / Звонки / Задачи / Изменения», the search, this deal or the whole client
+const historyFilters = ref<HistoryFilters>(emptyHistoryFilters());
+const historyScope = ref<'deal' | 'client'>('deal');
+// the deal header (GET /deals/:id/summary): №, days in the stage, the source, «клиент ждёт ответа»
+const summary = ref<DealSummary | null>(null);
 
 const end = new Date();
 const start = new Date().toISOString();
@@ -396,10 +260,12 @@ const task = ref<Partial<Task>>({
 const tabs = computed(() => {
     let tabs = [{label: 'Основные', value: 'main'}];
     if (route.params.id) tabs.push({ label: 'Файлы', value: 'files'});
+    if (route.params.id) tabs.push({ label: 'История', value: 'history'});
+    // «ИИ» only while the AI of the CRM is on (AI_FEATURES); its label counts what waits for the manager
+    if (route.params.id && dealAi.enabled.value) tabs.push({ label: dealAi.tabLabel.value, value: 'ai' });
     return tabs;
 });
 
-const labelChanged = ref(false);
 const toast = useToast('GlobalToast');
 const commentRef = ref();
 const messageType = ref(messageTypes[0]);
@@ -414,8 +280,17 @@ const { run: runDeal, data: deal } = useAsync<Deal>({
     deal_fillers: [], 
     ctr_agents: [], 
     company: {} as Company, 
-    agent: user.value.role !== 'admin' ? Object.assign(user.value, {user_fillers: []}) : undefined,
+    // a new deal: the one who creates it is responsible (an admin too; he can pick another)
+    agent: Object.assign(user.value, {user_fillers: []}),
     deal_products: [],
+});
+
+// «Новая сделка» until it is saved; a deal without a name shows its number
+const dealTitle = computed(() => {
+    const label = String(deal.value.label ?? '').trim();
+    if (label) return label;
+    if (!deal.value.id) return 'Новая сделка';
+    return `Сделка №${deal.value.display_id ?? deal.value.id}`;
 });
 
 const { run: runStages, isLoading: stagesLoading, data: stages } = useAsync<Stage[]>([]);
@@ -437,6 +312,8 @@ const { data: tasks, isLoading: tasksLoading, run: runTasks } = useAsync<Paginat
 });
 
 const route = useRoute();
+// the AI of the deal (tab «ИИ», components/ai/DealAiPanel.vue)
+const dealAi = useDealAi(() => route.params.id as string | undefined);
 
 function userGroup(user: User): Group {
     let name = '';
@@ -473,37 +350,25 @@ const groupedUsers = computed(() => {
     return {grouped, tgUsers};
 });
 
-async function fetchEvents() {
-    return await promiseResult(runEventsAsync(dealService.get(`${route.params.id as string}/events`, eventsQuery(currentPage * limit)).exec()));
+// this deal's history, or the whole client's (every deal of its company and contacts the user may see, DEAL-7)
+function eventsPath(id: string = route.params.id as string) {
+    return historyScope.value === 'client' ? `${id}/client-events` : `${id}/events`;
 }
 
-// the history query with the filters chosen above the feed
+async function fetchEvents() {
+    return await promiseResult(runEventsAsync(dealService.get(eventsPath(), eventsQuery(currentPage * limit)).exec()));
+}
+
+// the history query: newest first, the filter and the search chosen above the feed
 function eventsQuery(skip: number) {
-    const query: Record<string, any> = {
-        sort: { 
-            id: -1 
-        }, 
-        skip, 
+    return {
+        sort: {
+            id: -1
+        },
+        skip,
         limit,
+        ...historyQuery(historyFilters.value),
     };
-
-    const chatTypesExcluded = chatTypesOptions.filter((item) => !chatTypes.value.some((c) => c.id === item.id));
-    const linkedEntitiesExcluded = linkedEntitiesOptions.filter((item) => !linkedEntities.value.some((c) => c.id === item.id));
-    const eventTypesExcluded = eventTypesOptions.filter((item) => !eventTypes.value.some((c) => c.id === item.id));
-
-    if (chatTypesExcluded.length) {
-        query.exclude_chats = chatTypesExcluded.map((i) => i.id);
-    }
-
-    if (linkedEntitiesExcluded.length) {
-        query.exclude_linked_entities = linkedEntitiesExcluded.map((i) => i.id);
-    }
-
-    if (eventTypesExcluded.length) {
-        query.exclude_event_types = eventTypesExcluded.map((i) => i.id);
-    }
-
-    return query;
 }
 
 // Live: new history events, tasks and a stage changed elsewhere (another
@@ -512,8 +377,8 @@ let serverStageId: number | undefined;
 useLive(async (changes) => {
     const id = route.params.id as string;
     if (!id) return;
-    if (liveTouches(changes, 'events', id)) {
-        const result = await promiseResult(dealService.get(`${id}/events`, eventsQuery(0)).exec());
+    if (liveTouches(changes, 'events', id) || (historyScope.value === 'client' && liveTouches(changes, 'events'))) {
+        const result = await promiseResult(dealService.get(eventsPath(id), eventsQuery(0)).exec());
         if (result.ok) mergeNewestEvents(events.value.pages, (result.value as any).data, user.value?.id);
     }
     if (liveTouches(changes, 'tasks', id)) fetchTasks();
@@ -525,64 +390,66 @@ useLive(async (changes) => {
         if (fresh.stage?.id !== serverStageId && deal.value.stage?.id === serverStageId) deal.value.stage = fresh.stage;
         serverStageId = fresh.stage?.id;
     }
+    // the header: a new message of the client («ждёт ответа»), an answer, a stage moved elsewhere
+    if (liveTouches(changes, 'events', id) || liveTouches(changes, 'deals', id)) loadSummary();
 });
 
 async function onIntersect() {
     if (eventsEnded.value || eventsLoading.value) return;
     const result = await fetchEvents();
     if (!result.ok) return;
-    distinctDates.clear();
-    if (result.value.current_page === result.value.last_page) eventsEnded.value = true;
+    // the last page (an empty filter result answers current_page 1 of last_page 0: the end too)
+    if (result.value.current_page >= result.value.last_page || !result.value.data?.length) eventsEnded.value = true;
     currentPage++;
 }
 
+// the history again from its newest page (a filter, the search or «Весь клиент» changed, a task closed)
+let reloadPending = false;
 function onFilterApply() {
+    if (!route.params.id) return;
+    if (eventsLoading.value) {
+        reloadPending = true;
+        return;
+    }
+    reloadPending = false;
     currentPage = 0;
+    eventsEnded.value = false;
     resetEvents();
-    fetchEvents();
-    filterDetailsRef.value?.removeAttribute('open');
+    onIntersect();
+}
+watch(eventsLoading, (loading) => {
+    if (!loading && reloadPending) onFilterApply();
+});
+watch(historyFilters, onFilterApply, { deep: true });
+watch(historyScope, onFilterApply);
+
+function loadSummary() {
+    const id = route.params.id as string;
+    if (!id) return Promise.resolve();
+    return promiseResult(dealService.get<DealSummary>(`${id}/summary`).exec()).then((result) => {
+        if (!result.ok) return;
+        const first = !summary.value;
+        summary.value = result.value as DealSummary;
+        // a repeat client: the deal opens with the history of the whole client (DEAL-7)
+        if (first && summary.value.repeat_of && summary.value.client_deals > 0) historyScope.value = 'client';
+    });
 }
 
-function onPresetSelect(e: Event) {
-    const target = e.target as HTMLInputElement;
-    const preset = target.value as Preset;
-    switch (preset) {
-        case Preset.All: {
-            eventTypes.value = eventTypesOptions;
-            linkedEntities.value = linkedEntitiesOptions;
-            chatTypes.value = chatTypesOptions;
-        } break;
-        case Preset.Inner: {
-            chatTypes.value = [innerChat];
-        } break;
-        case Preset.WithClients: {
-            chatTypes.value = [chatWithClients];
-        } break;
-    }
-
-    currentPage = 0;
-    resetEvents();
-    fetchEvents();
-    filterDetailsRef.value?.removeAttribute('open');
+/** «Почему сделка не реализована?»: saved by the modal itself (PATCH /deals/:id/lost). */
+async function askLost() {
+    if (!deal.value.id) return;
+    const answer = await askLostReason({
+        deal: { id: deal.value.id, display_id: deal.value.display_id, label: deal.value.label },
+        reasons: summary.value?.lost_reasons,
+        reason: summary.value?.lost_reason,
+        comment: summary.value?.lost_comment,
+    });
+    if (answer) loadSummary();
 }
 
 function displayUserGroup(u: UserGroup) {
     if (u.type === 'group') return u.name;
     if (u.type === 'user') return u.username;
-}
-
-function getEventDateGroup(event: DealEvent): string | undefined {
-    const days = moment().diff(event.created_at, 'days');
-    const yyyymmdd = moment(event.created_at).format('YYYY-MM-DD');
-    let out = yyyymmdd;
-    if (days === 0) out = 'Сегодня';
-    if (days === 1) out = 'Вчера';
-    const existing = distinctDates.get(yyyymmdd);
-    if (!existing) {
-        distinctDates.set(yyyymmdd, event.id);
-        return out;
-    }
-    if (existing === event.id) return out;
 }
 
 function nameFilter(query?: string, items?: UserGroup[]) {
@@ -788,8 +655,6 @@ async function onEvent(e: Event) {
             break;
     }
 
-    distinctDates.clear();
-
     if (commentRef.value) {
         content.value = '';
         commentRef.value.el.focus();
@@ -810,6 +675,8 @@ async function onEvent(e: Event) {
 // one id per typed message (kept until it is sent): a repeated click or a retry is not sent twice
 let messengerRequestId = '';
 const isClientMessenger = computed(() => messageType.value?.id === 'tg' || messageType.value?.id === 'wa');
+// the manager's own Telegram / WhatsApp is not connected (MessengerComposerStatus): «Отправить» waits, the text stays
+const messengerBlocked = ref(false);
 
 function messengerRequest(cleanFormData: FormData) {
     if (!messengerRequestId) messengerRequestId = Date.now().toString(36) + Math.random().toString(36).slice(2, 12);
@@ -956,7 +823,7 @@ async function onTask(formData: FormData) {
     const latest = events.value.pages.length - 1;
     events.value.pages[latest].data.unshift(event);
     if (!deal.value.id) return;
-    const result = await promiseResult(taskService.create(values).exec());
+    const result = await promiseResult(confirmTaskPlan((flags) => taskService.create({...values, ...flags}).exec()));
 
     if (!result.ok) {
         toast.show({message: result.error.message, timeout: 3000, type: 'error'});
@@ -1071,13 +938,18 @@ function loadDeal() {
 // as the server has it now (the new values of the fields got their ids)
 async function onDealUpdated() {
     toast.show({message: 'Сделка сохранена', timeout: 2500, type: 'success'});
+    const before = summary.value?.stage?.kind ?? null;
     await loadDeal();
+    await loadSummary();
+    // saved into «Закрыто и не реализовано»: why (DEAL-11); «Не указывать» leaves it for later (the header offers it)
+    if (summary.value?.stage?.kind === 'lost' && before !== 'lost' && !summary.value.lost_reason) askLost();
 }
 
 onMounted(() => {
     if (route.params.id) {
         loadDeal();
         fetchTasks();
+        loadSummary();
     }
     runStages(stageService.find().exec());
     runFillers(fillerService.find().exec());

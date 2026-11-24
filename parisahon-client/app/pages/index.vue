@@ -2,6 +2,7 @@
 import DatePicker from '@vuepic/vue-datepicker';
 import moment from 'moment';
 import Money from '~/components/common/Money.vue';
+import { countOf } from '~/utils/format';
 import FileIcon from '~/components/common/FileIcon.vue';
 import BaseButtonGroup from '~/components/base/BaseButtonGroup.vue';
 import type BaseAutocomplete from '~/components/form/BaseAutocomplete.vue';
@@ -10,6 +11,8 @@ import type { PaginatedResponse } from '~/types/generics';
 import type {DesktopStats, FileStat, ObjectiveResultStat, UserStat} from '~/types/stats';
 import { type User, UserRole } from '~/types/user';
 import AddonApexcharts from '~/components/tairo/AddonApexcharts.vue';
+import { NuxtLink } from '#components';
+import type { RouteLocationRaw } from 'vue-router';
 import type { MyFile } from '~/types/file';
 
 definePageMeta({
@@ -66,7 +69,13 @@ const userAnalyticsService = useService('analytics/users', {auth: true});
 const desktopServie = useService('desktop', {auth: true});
 const objectiveResultService = useService('analytics/objectives/results');
 
-const { data: stats, run: runStats, isLoading: statsLoading } = useAsync<DesktopStats>({
+/** GET /desktop: the task counters, the comments of the period and the "won" stage the card links to. */
+type Stats = DesktopStats & {
+    task_stats: DesktopStats['task_stats'] & {comments?: string};
+    won_stage?: {id: number, name: string} | null;
+};
+
+const { data: stats, run: runStats, isLoading: statsLoading } = useAsync<Stats>({
     task_stats: {
         tasks_overdue: '0',
         tasks_closed: '0',
@@ -74,7 +83,8 @@ const { data: stats, run: runStats, isLoading: statsLoading } = useAsync<Desktop
         deals_without_tasks: '0',
         incoming_calls: '0',
         outgoing_calls: '0',
-        succesfull_deals: '',
+        succesfull_deals: '0',
+        comments: '0',
     },
     total_manager_stats: {
         total_budget: '0',
@@ -114,18 +124,24 @@ const selectedUsers = ref<User[]>([]);
 // the people picked in "Мои ▾": their numbers (the API filters by user_ids)
 const picked = computed(() => !ownOnly.value && sel.value === Selector.Custom && selectedUsers.value.length > 0);
 
+/** The first and the last day of the chosen period (both included). */
+function currentRange(): [string, string] {
+    if (period.value === Period.Custom && date.value?.length === 2) return [date.value[0], date.value[1]];
+    return periodDates(period.value);
+}
+
+// the first load shows placeholders, a reload keeps the numbers in place
+const statsLoaded = ref(false);
+
 function fetchStats() {
-    let [fromDate, tillDate] = periodDates(period.value);
-    if (period.value === Period.Custom && date.value?.length === 2) {
-        [fromDate, tillDate] = date.value;
-    }
+    const [fromDate, tillDate] = currentRange();
 
     runStats(desktopServie.find({
         from_date: fromDate,
         till_date: tillDate,
         my_stats: ownOnly.value || sel.value === Selector.Mine,
         ...(picked.value ? {user_ids: selectedUsers.value.map((u) => u.id)} : {}),
-    }).exec());
+    }).exec()).then(() => { statsLoaded.value = true; });
     // the newest files of the period (an agent: own ones, like the numbers); the list
     // of files is behind the "files" switch of the staff card (403 otherwise);
     // the files list takes the end exclusive: the day after the last one
@@ -183,11 +199,86 @@ const shownUserStats = computed(() => {
     return userStats.value;
 });
 
-// a counter opens the task list with the same tasks: mine, the picked people's or everybody's
-function tasksLink(status: 'overdue' | 'open' | 'closed') {
-    if (picked.value) return {path: '/tasks', query: {status, user_id: selectedUsers.value.map((u) => String(u.id))}};
-    return {path: '/tasks', query: {status, scope: ownOnly.value || sel.value === Selector.Mine ? 'mine' : 'all'}};
+// the caption of a period: «за сегодня», «за 7 дней», «за 01.11–05.11»
+const periodCaption = computed(() => {
+    switch (period.value) {
+        case Period.Today: return 'за сегодня';
+        case Period.Yesterday: return 'за вчера';
+        case Period.Week: return 'за 7 дней';
+        case Period.Month: return 'за 30 дней';
+        default: {
+            const [from, till] = currentRange();
+            return `за ${moment(from).format('DD.MM')}–${moment(till).format('DD.MM')}`;
+        }
+    }
+});
+
+const mineSelected = computed(() => ownOnly.value || sel.value === Selector.Mine);
+
+/**
+ * A counter opens the task list with the same tasks (the API counts them by the same rules):
+ * mine (me or my group), the picked people's or everybody's; overdue — all of them now; upcoming —
+ * open, not overdue, the span touching the period; closed — done in the period.
+ */
+function tasksLink(status: 'overdue' | 'upcoming' | 'closed'): RouteLocationRaw {
+    const [from, till] = currentRange();
+    const who = picked.value
+        ? {user_id: selectedUsers.value.map((u) => String(u.id))}
+        : {scope: mineSelected.value ? 'mine' : 'all'};
+    const dates = status === 'upcoming' ? {from, till} : status === 'closed' ? {closed_from: from, closed_till: till} : {};
+    return {path: '/tasks', query: {status, ...who, ...dates}};
 }
+
+/** The deals list for the same people: mine — my deals (responsible), one picked person — theirs. */
+function dealsLink(extra: Record<string, string>): RouteLocationRaw {
+    const query: Record<string, string> = {...extra};
+    const person = mineSelected.value ? currentUser.value : picked.value && selectedUsers.value.length === 1 ? selectedUsers.value[0] : null;
+    if (person) {
+        query.user_id = String(person.id);
+        query.username = person.username;
+    }
+    return {path: '/deals', query};
+}
+
+type StatCard = {key: string, title: string, value: string | number, caption: string, color: string, to?: RouteLocationRaw, hint?: string};
+
+const statCards = computed<StatCard[]>(() => {
+    const t = stats.value.task_stats ?? ({} as Stats['task_stats']);
+    const [from, till] = currentRange();
+    const won = stats.value.won_stage;
+    const n = (v?: string | number | null) => Number(v ?? 0) || 0;
+    return [
+        {key: 'overdue', title: 'Просроченные задачи', value: n(t.tasks_overdue), caption: 'на сейчас',
+            color: n(t.tasks_overdue) ? 'text-red-500' : 'text-muted-400', to: tasksLink('overdue'), hint: 'Открыть просроченные задачи'},
+        {key: 'upcoming', title: 'Задачи к выполнению', value: n(t.active_tasks), caption: periodCaption.value,
+            color: 'text-purple-600 dark:text-purple-400', to: tasksLink('upcoming'), hint: 'Открыть задачи периода'},
+        {key: 'closed', title: 'Выполненные задачи', value: n(t.tasks_closed), caption: periodCaption.value,
+            color: 'text-green-500', to: tasksLink('closed'), hint: 'Открыть выполненные задачи'},
+        {key: 'no-task', title: 'Сделки без задач', value: n(t.deals_without_tasks), caption: 'на сейчас',
+            color: n(t.deals_without_tasks) ? 'text-amber-500' : 'text-muted-400', to: dealsLink({preset: 'no-task'}), hint: 'Открыть сделки без задач'},
+        {key: 'won', title: 'Успешные сделки', value: n(t.succesfull_deals), caption: periodCaption.value,
+            color: 'text-green-500',
+            to: won ? dealsLink({stage_id: String(won.id), stage_name: won.name, closed_from: from, closed_till: till}) : undefined,
+            hint: 'Открыть сделки, закрытые успешно за период'},
+        {key: 'comments', title: 'Примечания', value: n(t.comments), caption: periodCaption.value, color: 'text-primary-600 dark:text-primary-200'},
+        {key: 'incoming', title: 'Входящие звонки', value: n(t.incoming_calls), caption: periodCaption.value, color: 'text-primary-600 dark:text-primary-200'},
+        {key: 'outgoing', title: 'Исходящие звонки', value: n(t.outgoing_calls), caption: periodCaption.value, color: 'text-primary-600 dark:text-primary-200'},
+    ];
+});
+
+// the total of «Сделки по менеджерам» is the sum of its list (the API total is used until the list is there)
+const managerTotal = computed(() => {
+    if (shownUserStats.value.length) {
+        return {
+            count: shownUserStats.value.reduce((sum, u) => sum + Number(u.deal_count || 0), 0),
+            budget: shownUserStats.value.reduce((sum, u) => sum + Number(u.deal_budget || 0), 0),
+        };
+    }
+    return {
+        count: Number(stats.value.total_manager_stats?.deal_count || 0),
+        budget: Number(stats.value.total_manager_stats?.total_budget || 0),
+    };
+});
 
 
 const objectiveResult = computed(() => {
@@ -199,9 +290,10 @@ const objectiveResult = computed(() => {
         budgetTotal += group.total_budget;
     }
 
-    const progress = Math.floor(budgetTotal / goalTotal);
+    // a share of the plan in per cent (it was floor(budget / goal) * 100: 0 % until the plan was met, then 100 %)
+    const progress = goalTotal > 0 ? Math.round(budgetTotal / goalTotal * 100) : 0;
     return {
-        progress: !Number.isFinite(progress) ? 0 : progress * 100,
+        progress: Number.isFinite(progress) ? progress : 0,
         budgetTotal,
         goalTotal
     }
@@ -212,19 +304,11 @@ const objectives = computed(() => {
     const height = 320;
     const type = 'radialBar';
 
-    const series = [objectiveResult.value.progress];
+    // the arc stops at 100 %, the label tells the real share (120 % of the plan)
+    const real = objectiveResult.value.progress;
+    const series = [Math.min(real, 100)];
     const options = {
-        dataLabels: {
-            style: {
-                fontSize: '12px',
-                weight: 500,
-                colors: COLORS,
-            },
-            offsetY: -20,
-            formatter: (value: number) => {
-                return formatMoney(value, 0, {spaceBetweenAmountAndSymbol: ' ', symbolOnLeft: false});
-            },
-        },
+        labels: ['План'],
         plotOptions: {
             radialBar: {
                 startAngle: -90,
@@ -240,7 +324,8 @@ const objectives = computed(() => {
                     },
                     value: {
                         offsetY: -2,
-                        fontSize: '16px'
+                        fontSize: '16px',
+                        formatter: () => `${real} %`,
                     }
                 },
             }
@@ -301,19 +386,19 @@ onMounted(() => {
         <!-- on a phone the period buttons are narrower and both groups may wrap instead of being cut off -->
         <div class="flex flex-wrap gap-3 justify-center">
             <BaseButtonGroup class="flex-wrap justify-center xs:[&_.nui-button]:!px-3">
-                <BaseButton color="default" :to="{path: '/', query: {...route.query, period: Period.Today}}" :class="period === Period.Today ? '!bg-muted-200 dark:!bg-muted-600' : ''">
+                <BaseButton color="default" :to="{path: '/', query: {...route.query, period: Period.Today}}" :class="period === Period.Today ? 'toggle-selected' : ''">
                     <span>Сегодня</span>
                 </BaseButton>
-                <BaseButton color="default" :to="{path: '/', query: {...route.query, period: Period.Yesterday}}" :class="period === Period.Yesterday ? '!bg-muted-200 dark:!bg-muted-600' : ''">
+                <BaseButton color="default" :to="{path: '/', query: {...route.query, period: Period.Yesterday}}" :class="period === Period.Yesterday ? 'toggle-selected' : ''">
                     <span>Вчера</span>
                 </BaseButton>
-                <BaseButton color="default" :to="{path: '/', query: {...route.query, period: Period.Week}}"  :class="period === Period.Week ? '!bg-muted-200 dark:!bg-muted-600' : ''">
+                <BaseButton color="default" :to="{path: '/', query: {...route.query, period: Period.Week}}"  :class="period === Period.Week ? 'toggle-selected' : ''">
                     <span>Неделя</span>
                 </BaseButton>
-                <BaseButton color="default" :to="{path: '/', query: {...route.query, period: Period.Month}}" :class="period === Period.Month ? '!bg-muted-200 dark:!bg-muted-600' : ''">
+                <BaseButton color="default" :to="{path: '/', query: {...route.query, period: Period.Month}}" :class="period === Period.Month ? 'toggle-selected' : ''">
                     <span>Месяц</span>
                 </BaseButton>
-                <BaseButton color="default" :class="period === Period.Custom ? '!bg-muted-200 dark:!bg-muted-600' : ''">
+                <BaseButton color="default" :class="period === Period.Custom ? 'toggle-selected' : ''">
                     <DatePicker 
                         v-model="date"
                         format="dd-MM-yyyy" 
@@ -335,12 +420,12 @@ onMounted(() => {
                 </BaseButton>
             </BaseButtonGroup>
             <BaseButtonGroup v-if="!ownOnly">
-                <BaseButton color="default" :to="{path: '/', query: {...route.query, sel: Selector.All}}" :class="sel === Selector.All ? '!bg-muted-200 dark:!bg-muted-600' : ''">Все</BaseButton>
-                <div class="flex border dark:border-muted-600 text-sm items-center rounded-r-md" :class="sel === Selector.Mine || sel === Selector.Custom ? 'bg-muted-200 dark:bg-muted-600' : 'bg-white dark:bg-muted-700'">
+                <BaseButton color="default" :to="{path: '/', query: {...route.query, sel: Selector.All}}" :class="sel === Selector.All ? 'toggle-selected' : ''">Все</BaseButton>
+                <div class="flex border dark:border-muted-600 text-sm items-center rounded-r-md" :class="sel === Selector.Mine || sel === Selector.Custom ? 'bg-primary-500/15 !border-primary-500 dark:bg-primary-500/25 font-semibold' : 'bg-white dark:bg-muted-700'">
                     <span v-if="sel === Selector.Custom" class="px-2.5">
                         <Icon v-if="usersLoading" name="lucide:loader-circle" class="animate-spin size-4" />
                         <template v-if="selectedUsers.length === 1">{{ selectedUsers[0].username }}</template>
-                        <template v-if="selectedUsers.length > 1">{{ selectedUsers.length }} менеджера</template>
+                        <template v-if="selectedUsers.length > 1">{{ countOf(selectedUsers.length, 'менеджер', 'менеджера', 'менеджеров') }}</template>
                     </span>
                     <NuxtLink v-else class="h-full pl-2.5 flex items-center text-muted-700 dark:text-muted-200" :to="{path: '/', query: {...route.query, sel: Selector.Mine}}">Мои</NuxtLink>
                     <TairoPopover orientation="end" @change="onPopoverChange">
@@ -364,139 +449,29 @@ onMounted(() => {
                 </div>
             </BaseButtonGroup>
         </div>
-        <div class="grid grid-cols-12 gap-4 mt-8">
-            <div class="grid grid-cols-2 col-span-12 xl:col-span-4 gap-4">
-                <BaseCard class="p-4 col-span-2 sm:col-span-1">
-                    <div class="mb-1 flex items-center justify-between">
-                        <BaseHeading
-                            as="h5"
-                            size="xs"
-                            weight="medium"
-                            lead="tight"
-                            class="text-muted-500 dark:text-white uppercase"
-                        >
-                            <span>Просроченные задачи</span>
-                        </BaseHeading>
-                    </div>
-                    <div class="mb-2">
-                        <BaseHeading
-                            as="h4"
-                            size="5xl"
-                            weight="semibold"
-                            lead="tight"
-                            class="text-purple-600"
-                        >
-                            <NuxtLink :to="tasksLink('overdue')" class="hover:underline">{{ stats.task_stats?.tasks_overdue }}</NuxtLink>
-                        </BaseHeading>
-                    </div>
-                    <hr class="border border-muted-200 dark:border-muted-600" />
-                    <!-- overdue is a state: every task overdue now, whatever the period -->
-                    <div class="text-green-500 flex flex-col font-sans text-2xl mt-2">
-                        <span>{{ stats.task_stats?.tasks_overdue }}</span>
-                        <span class="text-muted-400 text-xs"> на сейчас</span>
-                    </div>
-                </BaseCard>
-                <BaseCard class="p-4 col-span-2 sm:col-span-1">
-                    <div class="mb-1 flex items-center justify-between">
-                        <BaseHeading
-                            as="h5"
-                            size="xs"
-                            weight="medium"
-                            lead="tight"
-                            class="text-muted-500 dark:text-white uppercase"
-                        >
-                            <span>Выполненные задачи</span>
-                        </BaseHeading>
-                    </div>
-                    <div class="mb-2">
-                        <BaseHeading
-                            as="h4"
-                            size="5xl"
-                            weight="semibold"
-                            lead="tight"
-                            class="text-green-500"
-                        >
-                            <NuxtLink :to="tasksLink('closed')" class="hover:underline">{{ stats.task_stats?.tasks_closed }}</NuxtLink>
-                        </BaseHeading>
-                        <span class="text-muted-400 text-xs mt-2"> за {{ periodDisplay(period) }}</span>
-                    </div>
-                </BaseCard>
-                <BaseCard class="p-4 col-span-2 sm:col-span-1">
-                    <div class="mb-1 flex items-center justify-between">
-                        <BaseHeading
-                            as="h5"
-                            size="xs"
-                            weight="medium"
-                            lead="tight"
-                            class="text-muted-500 dark:text-white uppercase"
-                        >
-                            <span>Задачи к выполнению</span>
-                        </BaseHeading>
-                    </div>
-                    <div class="mb-2">
-                        <BaseHeading
-                            as="h4"
-                            size="5xl"
-                            weight="semibold"
-                            lead="tight"
-                            class="text-purple-600"
-                        >
-                            <NuxtLink :to="tasksLink('open')" class="hover:underline">{{ stats.task_stats?.active_tasks }}</NuxtLink>
-                        </BaseHeading>
-                    </div>
-                    <hr class="border border-muted-200 dark:border-muted-600" />
-                    <div class="text-green-500 flex flex-col font-sans text-2xl mt-2">
-                        <span>{{ stats.task_stats?.active_tasks }}</span>
-                        <span class="text-muted-400 text-xs"> за {{ periodDisplay(period) }}</span>
-                    </div>
-                </BaseCard>
-                <BaseCard class="p-4 col-span-2 sm:col-span-1">
-                    <div class="mb-1 flex items-center justify-between">
-                        <BaseHeading
-                            as="h5"
-                            size="xs"
-                            weight="medium"
-                            lead="tight"
-                            class="text-muted-500 dark:text-white uppercase"
-                        >
-                            <span>Сделки без задач</span>
-                        </BaseHeading>
-                    </div>
-                    <div class="mb-2">
-                        <BaseHeading
-                            as="h4"
-                            size="5xl"
-                            weight="semibold"
-                            lead="tight"
-                            class="text-purple-600"
-                        >
-                            <span>{{ stats.task_stats?.deals_without_tasks }}</span>
-                        </BaseHeading>
-                    </div>
-                    <hr class="border border-muted-200 dark:border-muted-600" />
-                    <div class="text-green-500 flex flex-col font-sans text-2xl mt-2">
-                        <span>{{ stats.task_stats?.deals_without_tasks }}</span>
-                        <span class="text-muted-400 text-xs"> за {{ periodDisplay(period) }}</span>
-                    </div>
-                </BaseCard>
-            </div>
-            <BaseCard class="col-span-12 md:col-span-6 xl:col-span-4 p-4 h-full">
-                <div class="mb-1 flex items-center justify-between">
-                    <BaseHeading
-                        as="h5"
-                        size="xs"
-                        weight="medium"
-                        lead="tight"
-                        class="text-muted-500 dark:text-white uppercase"
-                    >
-                        <span>Источники сделок</span>
-                    </BaseHeading>
-                </div>
-                <p class="text-amber-500 text-sm mt-2">
-                    <Icon name="ph:warning" />
-                    Недастаточно данных для отображения
+        <!-- one number per card; a card that has a list behind it opens that list with the same filter -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4 mt-6 sm:mt-8">
+            <component
+                :is="card.to ? NuxtLink : 'div'"
+                v-for="card in statCards"
+                :key="card.key"
+                v-bind="card.to ? {to: card.to} : {}"
+                :title="card.to ? card.hint : undefined"
+                class="block rounded-md border border-muted-200 bg-white p-3 sm:p-4 dark:border-muted-700 dark:bg-muted-800"
+                :class="card.to ? 'transition-colors hover:border-primary-500 dark:hover:border-primary-400' : ''"
+            >
+                <p class="text-[11px] sm:text-xs font-medium uppercase leading-tight text-muted-500 dark:text-muted-300">{{ card.title }}</p>
+                <p class="mt-2 text-3xl sm:text-4xl font-semibold leading-none" :class="card.color">
+                    <BasePlaceload v-if="statsLoading && !statsLoaded" class="h-8 w-12 rounded" />
+                    <template v-else>{{ card.value }}</template>
                 </p>
-            </BaseCard>
+                <p class="mt-2 flex items-center gap-1 text-xs text-muted-400">
+                    <span>{{ card.caption }}</span>
+                    <Icon v-if="card.to" name="ph:arrow-right" class="size-3" />
+                </p>
+            </component>
+        </div>
+        <div class="grid grid-cols-12 gap-4 mt-4">
             <BaseCard v-if="!ownOnly" class="col-span-12 md:col-span-6 xl:col-span-4 p-4 h-full">
                 <div class="mb-1 flex items-center justify-between">
                     <BaseHeading
@@ -508,32 +483,27 @@ onMounted(() => {
                     >
                         <span>Сделки по менеджерам</span>
                     </BaseHeading>
+                    <span class="text-xs text-muted-400">{{ periodCaption }}</span>
                 </div>
-                <div class="mb-2 flex justify-between">
-                    <BaseHeading
-                        as="h4"
-                        size="5xl"
-                        weight="semibold"
-                        lead="tight"
-                        class="text-purple-600"
-                    >
-                        <span>{{ stats.total_manager_stats.deal_count }}</span>
-                    </BaseHeading>
-                    <div class="text-green-500 flex flex-col font-sans text-2xl mt-2 text-right">
-                        <span>{{ stats.total_manager_stats.deal_count }}</span>
-                        <span class="text-muted-400 text-xs"> за {{ periodDisplay(period) }}</span>
-                    </div>
+                <!-- the total is the sum of the list below (the same deals: created in the period, by the responsible) -->
+                <div class="mb-2 flex items-end justify-between gap-2">
+                    <NuxtLink :to="dealsLink({})" class="text-4xl font-semibold text-purple-600 dark:text-purple-400 hover:underline">
+                        {{ managerTotal.count }}
+                    </NuxtLink>
+                    <Money class="text-green-500 text-lg" :value="managerTotal.budget" />
                 </div>
                 <hr class="border border-muted-200 dark:border-muted-600" />
                 <ul class="flex flex-col mt-2">
-                    <li v-for="user in shownUserStats" class="text-[15px] text-muted-700 dark:text-white flex items-center justify-between border-t-2 border-t-amber-500 first:border-t-0 py-1.5">
-                        <p>{{ user.username }} <span class="font-medium">{{ user.deal_count }} сделок</span></p>
-                        <Money class="text-green-500" :value="Number(user.deal_budget)" />
+                    <li v-for="user in shownUserStats" :key="user.id" class="text-[15px] text-muted-700 dark:text-white flex items-center justify-between gap-2 border-t border-muted-200 dark:border-muted-700 first:border-t-0 py-1.5">
+                        <NuxtLink :to="{path: '/deals', query: {user_id: String(user.id), username: user.username}}" class="hover:underline min-w-0 truncate">
+                            {{ user.username }} <span class="font-medium">{{ countOf(Number(user.deal_count), 'сделка', 'сделки', 'сделок') }}</span>
+                        </NuxtLink>
+                        <Money class="text-green-500 shrink-0" :value="Number(user.deal_budget)" />
                     </li>
                     <li v-if="!shownUserStats.length && !userStatsLoading" class="text-sm text-muted-400 py-1.5">Нет сделок за период</li>
                 </ul>
             </BaseCard>
-            <BaseCard v-if="!ownOnly" class="col-span-12 md:col-span-6 xl:col-span-4 p-4 h-full">
+            <BaseCard v-if="!ownOnly && objectiveResult.goalTotal > 0" class="col-span-12 md:col-span-6 xl:col-span-4 p-4 h-full">
                 <div class="mb-1 flex items-center justify-between">
                     <BaseHeading
                         as="h5"
@@ -542,8 +512,9 @@ onMounted(() => {
                         lead="tight"
                         class="text-muted-500 dark:text-white uppercase"
                     >
-                        <span>Цели</span>
+                        <span>Цели на месяц</span>
                     </BaseHeading>
+                    <span class="text-xs text-muted-400">{{ objectiveResult.progress }} %</span>
                 </div>
                 <AddonApexcharts v-bind="objectives" />
                 <p class="text-center text-sm mt-4 text-muted-500 dark:text-white">
@@ -551,7 +522,7 @@ onMounted(() => {
                     из <Money :value="objectiveResult.goalTotal" />
                 </p>
             </BaseCard>
-            <BaseCard class="col-span-12 md:col-span-6 xl:col-span-4 p-4 h-full">
+            <BaseCard v-if="ability.can('read', 'File')" class="col-span-12 md:col-span-6 xl:col-span-4 p-4 h-full">
                 <div class="mb-1 flex items-center justify-between">
                     <BaseHeading
                         as="h5"
@@ -562,15 +533,16 @@ onMounted(() => {
                     >
                         <span>Последние файлы</span>
                     </BaseHeading>
+                    <span class="text-xs text-muted-400">{{ periodCaption }}</span>
                 </div>
                 <ul v-if="files.data.length" class="max-h-80 flex flex-col gap-2 overflow-y-auto -mx-4 px-4">
-                    <li v-for="file of files.data" class="flex justify-between items-start">
-                        <div class="flex items-center gap-2">
+                    <li v-for="file of files.data" :key="file.id" class="flex justify-between items-start gap-2">
+                        <div class="flex items-center gap-2 min-w-0">
                             <FileIcon :file-name="file.name" />
-                            <div class="text-sm text-muted-500">
-                                <span>{{ file.name }} ({{ formatBytes(Number(file.size)) }})</span>
-                                <div class="flex gap-1">
-                                    <NuxtLink v-for="deal in file.deals" :href="'/deals/' + deal.id">в <span class="underline">Сделка {{ deal.label }}</span></NuxtLink>
+                            <div class="text-sm text-muted-500 min-w-0">
+                                <span class="break-all">{{ file.name }} ({{ formatBytes(Number(file.size)) }})</span>
+                                <div class="flex flex-wrap gap-1">
+                                    <NuxtLink v-for="deal in file.deals" :key="deal.id" :href="'/deals/' + deal.id">в <span class="underline">сделке {{ deal.label }}</span></NuxtLink>
                                 </div>
                             </div>
                         </div>
@@ -580,118 +552,9 @@ onMounted(() => {
                         </BaseButtonIcon>
                     </li>
                 </ul>
-                <p v-else class="text-amber-500 text-sm mt-2">
-                    <Icon name="ph:warning" />
-                    Недастаточно данных для отображения
-                </p>
+                <!-- nothing to show is not a warning -->
+                <p v-else class="text-muted-400 text-sm mt-2">Файлов за период нет</p>
             </BaseCard>
-            <div class="grid grid-cols-2 col-span-12 xl:col-span-4 gap-4">
-                <BaseCard class="p-4 col-span-2 sm:col-span-1">
-                    <div class="mb-1 flex items-center justify-between">
-                        <BaseHeading
-                            as="h5"
-                            size="xs"
-                            weight="medium"
-                            lead="tight"
-                            class="text-muted-500 dark:text-white uppercase"
-                        >
-                            <span>Входящие звонки</span>
-                        </BaseHeading>
-                    </div>
-                    <div class="mb-2">
-                        <BaseHeading
-                            as="h4"
-                            size="5xl"
-                            weight="semibold"
-                            lead="tight"
-                            class="text-green-500"
-                        >
-                            <span>{{ stats.task_stats?.incoming_calls }}</span>
-                        </BaseHeading>
-                        <span class="text-muted-400 text-xs mt-2"> за {{ periodDisplay(period) }}</span>
-                    </div>
-                </BaseCard>
-                <BaseCard class="p-4 col-span-2 sm:col-span-1">
-                    <div class="mb-1 flex items-center justify-between">
-                        <BaseHeading
-                            as="h5"
-                            size="xs"
-                            weight="medium"
-                            lead="tight"
-                            class="text-muted-500 dark:text-white uppercase"
-                        >
-                            <span>Исходящие звонки</span>
-                        </BaseHeading>
-                    </div>
-                    <div class="mb-2">
-                        <BaseHeading
-                            as="h4"
-                            size="5xl"
-                            weight="semibold"
-                            lead="tight"
-                            class="text-green-500"
-                        >
-                            <span>{{ stats.task_stats?.outgoing_calls }}</span>
-                        </BaseHeading>
-                        <span class="text-muted-400 text-xs mt-2"> за {{ periodDisplay(period) }}</span>
-                    </div>
-                </BaseCard>
-                <BaseCard class="p-4 col-span-2 sm:col-span-1">
-                    <div class="mb-1 flex items-center justify-between">
-                        <BaseHeading
-                            as="h5"
-                            size="xs"
-                            weight="medium"
-                            lead="tight"
-                            class="text-muted-500 dark:text-white uppercase"
-                        >
-                            <span>Примечаний</span>
-                        </BaseHeading>
-                    </div>
-                    <div class="mb-2">
-                        <BaseHeading
-                            as="h4"
-                            size="5xl"
-                            weight="semibold"
-                            lead="tight"
-                            class="text-green-500"
-                        >
-                            <span>0</span>
-                        </BaseHeading>
-                        <span class="text-muted-400 text-xs mt-2"> за {{ periodDisplay(period) }}</span>
-                    </div>
-                </BaseCard>
-                <BaseCard class="p-4 col-span-2 sm:col-span-1">
-                    <div class="mb-1 flex items-center justify-between">
-                        <BaseHeading
-                            as="h5"
-                            size="xs"
-                            weight="medium"
-                            lead="tight"
-                            class="text-muted-500 dark:text-white uppercase"
-                        >
-                            <span>Успешные сделки</span>
-                        </BaseHeading>
-                    </div>
-                    <div class="mb-2">
-                        <BaseHeading
-                            as="h4"
-                            size="5xl"
-                            weight="semibold"
-                            lead="tight"
-                            class="text-purple-600"
-                        >
-                            <span>{{ stats.task_stats?.succesfull_deals }}</span>
-                        </BaseHeading>
-                    </div>
-                    <hr class="border border-muted-200 dark:border-muted-600" />
-                    <div class="text-green-500 flex flex-col font-sans text-2xl mt-2">
-                        <span>{{ stats.task_stats?.succesfull_deals }}</span>
-                        <span class="text-muted-400 text-xs"> за {{ periodDisplay(period) }}</span>
-                    </div>
-                </BaseCard>
-            </div>
         </div>
     </div>
 </template>
-

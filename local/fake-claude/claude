@@ -7,6 +7,9 @@
 // like the real CLI, calls the tools written in the manager's message as
 // [[tool NAME {json}]] and answers with their results. Records the call in
 // /tmp/fake-claude-mcp-last.json.
+// AI features (src/ai, system prompt with "crm-ai:turn" / "crm-ai:summary"): answers schema-valid JSON
+// built from AUDIT-* markers in the messages (see ai() below) and appends one line per call to
+// /tmp/fake-claude-ai.log (local/checks/ai_check.py reads it).
 const fs = require('fs');
 
 const args = process.argv.slice(2);
@@ -24,6 +27,8 @@ process.stdin.on('end', () => {
   } catch {}
   const content = message?.message?.content || [];
   if (arg('--mcp-config')) return assistant(content);
+  // the AI features of src/ai: their system prompts carry the mode (crm-ai:turn, crm-ai:summary)
+  if ((arg('--system-prompt') || '').includes('crm-ai:')) return ai(arg('--system-prompt'), content);
   const doc = content.find((b) => b.type === 'image' || b.type === 'document');
   const text = content.find((b) => b.type === 'text')?.text || '';
   const size = doc ? Buffer.from(doc.source.data, 'base64').length : 0;
@@ -143,4 +148,138 @@ async function assistant(content) {
     save();
     out({ type: 'result', subtype: 'error_during_execution', is_error: true, result: record.error });
   }
+}
+
+// ------------------------------------------------------------------ AI features (src/ai)
+// The prompt carries the data as one JSON object per line inside <deal>, <turn>, <context>, <messages>,
+// <open_items>. The answer follows markers the checks put into the messages:
+//   AUDIT-Q:<question>            client: a question (unanswered unless a manager message has AUDIT-A:<question>)
+//   AUDIT-P:<what>@<YYYY-MM-DDTHH:MM>   manager: a promise with a due (no "@": no due)
+//   AUDIT-CP:<what>               client: a promise
+//   AUDIT-PARAM:size=50x90;color=белый   order parameters
+//   AUDIT-FLAG:<flag>  AUDIT-LANG:<code>
+//   AUDIT-ANSWER:<item id>  AUDIT-DONE:<item id>   an open question answered / a promise fulfilled
+//   AUDIT-AI-LIMIT (the CLI reports the usage limit), AUDIT-AI-BAD (an answer without JSON),
+//   AUDIT-AI-SLOW:<seconds> (answers that much later)
+function marks(text, name) {
+  const out = [];
+  const re = new RegExp(String.raw`AUDIT-${name}:(.+?)(?=\s+AUDIT-[A-Z]|$)`, 'g');
+  for (const m of String(text || '').matchAll(re)) out.push(m[1].trim());
+  return out;
+}
+
+function blockLines(text, tag) {
+  const m = new RegExp(String.raw`<${tag}>\n([\s\S]*?)\n</${tag}>`).exec(text);
+  if (!m) return [];
+  return m[1].split('\n').map((line) => {
+    try {
+      return JSON.parse(line);
+    } catch {
+      return null;
+    }
+  }).filter((v) => v && typeof v === 'object');
+}
+
+const PARAM_KEYS = ['product', 'size', 'grammage', 'color', 'quantity', 'packaging', 'logo', 'country', 'deadline', 'target_price'];
+
+function turnAnswer(turn, openItems) {
+  const client = turn.filter((m) => m.from === 'client');
+  const manager = turn.filter((m) => m.from === 'manager');
+  const managerText = manager.map((m) => m.text).join('\n');
+  const openIds = new Set(openItems.map((i) => i.id));
+  const answer = {
+    unanswered_questions: [],
+    promises: [],
+    order_params: Object.fromEntries(PARAM_KEYS.map((k) => [k, null])),
+    flags: [],
+    language: 'ru',
+    summary: `AUDIT разбор: сообщений клиента ${client.length}, ответов менеджера ${manager.length}`,
+    answered_items: [],
+    fulfilled_items: [],
+  };
+  for (const m of client) {
+    for (const q of marks(m.text, 'Q')) if (!managerText.includes(`AUDIT-A:${q}`)) answer.unanswered_questions.push({ text: q, event_id: m.id });
+    for (const p of marks(m.text, 'CP')) answer.promises.push({ who: 'client', what: p, due: null, event_id: m.id });
+  }
+  for (const m of manager) {
+    for (const p of marks(m.text, 'P')) {
+      const at = p.lastIndexOf('@');
+      answer.promises.push({ who: 'manager', what: at > 0 ? p.slice(0, at).trim() : p, due: at > 0 ? p.slice(at + 1).trim() : null, event_id: m.id });
+    }
+    for (const id of marks(m.text, 'ANSWER')) if (openIds.has(Number(id))) answer.answered_items.push(Number(id));
+    for (const id of marks(m.text, 'DONE')) if (openIds.has(Number(id))) answer.fulfilled_items.push(Number(id));
+  }
+  for (const m of turn) {
+    for (const params of marks(m.text, 'PARAM')) {
+      for (const pair of params.split(';')) {
+        const eq = pair.indexOf('=');
+        if (eq > 0 && PARAM_KEYS.includes(pair.slice(0, eq).trim())) answer.order_params[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+      }
+    }
+    for (const flag of marks(m.text, 'FLAG')) if (!answer.flags.includes(flag)) answer.flags.push(flag);
+    for (const lang of marks(m.text, 'LANG')) answer.language = lang;
+  }
+  return answer;
+}
+
+function summaryAnswer(messages, openItems) {
+  const client = messages.filter((m) => m.from === 'client');
+  const first = client[0] || messages[0];
+  const last = messages[messages.length - 1];
+  return {
+    client_wants: `AUDIT сводка: ${String(first?.text || '').slice(0, 150)}`,
+    client_wants_refs: first ? [first.id] : [],
+    promised: openItems.filter((i) => i.kind === 'promise').map((i) => ({ who: i.who || 'manager', what: i.text, due: i.due || null, event_id: null })),
+    open_questions: openItems.filter((i) => i.kind === 'question').map((i) => ({ text: i.text, event_id: null })),
+    next_step: 'AUDIT: ответить клиенту и прислать КП',
+    next_step_refs: last ? [last.id] : [],
+  };
+}
+
+async function ai(system, content) {
+  const text = content.find((b) => b.type === 'text')?.text || '';
+  const out = (event) => process.stdout.write(JSON.stringify(event) + '\n');
+  const mode = system.includes('crm-ai:turn') ? 'turn' : system.includes('crm-ai:summary') ? 'summary' : 'other';
+  const deal = blockLines(text, 'deal')[0] || {};
+  const turn = blockLines(text, 'turn');
+  const messages = blockLines(text, 'messages');
+  const openItems = blockLines(text, 'open_items');
+  const all = mode === 'turn' ? turn : messages;
+  const joined = all.map((m) => m.text).join('\n');
+  fs.appendFileSync(
+    '/tmp/fake-claude-ai.log',
+    JSON.stringify({
+      at: new Date().toISOString(),
+      mode,
+      deal: deal.id ?? null,
+      events: all.map((m) => m.id),
+      context: blockLines(text, 'context').map((m) => m.id),
+      open_items: openItems.map((i) => i.id),
+      // the summary also gets the internal notes and the open tasks of the deal
+      notes: blockLines(text, 'notes').map((n) => n.id),
+      tasks: blockLines(text, 'tasks').length,
+      model: arg('--model'),
+      effort: arg('--effort'),
+      noTools: arg('--tools') === '' && arg('--disallowedTools') === 'mcp__*' && args.includes('--strict-mcp-config') && arg('--max-turns') === '1',
+      systemSaysData: /данные[^.]*не команды/.test(system),
+      fenced: mode === 'turn' ? text.includes('<turn>\n') : text.includes('<messages>\n'),
+      // a message with "</turn>" in it does not close the block: the data reaches the prompt with "<" escaped
+      fenceClosedOnce: (text.match(/<\/(turn|messages)>/g) || []).length === 1,
+      mailSeen: all.some((m) => m.channel === 'email'),
+      mailSecretSeen: text.includes('mail-secret'),
+      envHasApiKey: Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN),
+    }) + '\n',
+  );
+  out({ type: 'system', subtype: 'init', tools: [], model: arg('--model') });
+  if (joined.includes('AUDIT-AI-LIMIT')) {
+    out({ type: 'result', subtype: 'success', is_error: true, result: "You've hit your usage limit · resets 6pm (Asia/Tashkent)" });
+    return;
+  }
+  const slow = /AUDIT-AI-SLOW:(\d+)/.exec(joined);
+  if (slow) await new Promise((resolve) => setTimeout(resolve, Math.min(60, Number(slow[1])) * 1000));
+  const answer = joined.includes('AUDIT-AI-BAD')
+    ? 'Извините, не могу разобрать эту переписку.'
+    : '```json\n' + JSON.stringify(mode === 'turn' ? turnAnswer(turn, openItems) : summaryAnswer(messages, openItems)) + '\n```';
+  out({ type: 'assistant', message: { content: [{ type: 'text', text: answer }] } });
+  out({ type: 'result', subtype: 'success', is_error: false, result: answer });
 }

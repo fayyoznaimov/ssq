@@ -7,12 +7,26 @@
             </div>
             <div class="flex px-2 flex-wrap gap-5 justify-between">
                 <div class="flex flex-wrap items-center gap-4">
-                    <!-- the API filters by the task's span (start..deadline), not by the creation date -->
+                    <!-- «Срок»: the task's span (start..deadline) touches these days; «Создана»: when it was set -->
                     <DateSelect
                         v-model:start="filters.fromDate"
                         v-model:end="filters.tillDate"
                         label="Срок"
                     />
+                    <DateSelect
+                        v-model:start="filters.createdFrom"
+                        v-model:end="filters.createdTill"
+                        label="Создана"
+                    />
+                    <!-- a link from the desktop: the tasks done in its period -->
+                    <BaseButton
+                        v-if="filters.closedFrom || filters.closedTill"
+                        title="Снять фильтр"
+                        @click="clearClosed"
+                    >
+                        Выполнены {{ closedPeriod }}
+                        <Icon name="ph:x" class="ms-1" />
+                    </BaseButton>
                     <PerPageSelect v-model="filters.perPage" />
                 </div>
             </div>
@@ -25,10 +39,33 @@
                     class="flex-auto"
                     id="tasks"
                 >
+                    <!-- the deadline; an overdue one says by how much (only this cell is red, not the row) -->
+                    <template #end_time="{item}">
+                        <button type="button" class="text-left" @click="taskModal.open(item)">
+                            <span :class="isTaskOverdue(item) ? 'text-red-600 dark:text-red-400 font-medium' : ''">
+                                {{ taskWhen(item.end, item.allDay) }}
+                            </span>
+                            <span
+                                v-if="isTaskOverdue(item)"
+                                class="block w-max mt-0.5 rounded px-1.5 py-0.5 text-xs bg-red-100 text-red-700 dark:bg-red-500/20 dark:text-red-300"
+                            >{{ overdueText(item) }}</span>
+                        </button>
+                    </template>
                     <template #actions="{item}">
-                        <BaseButtonIcon size="md" type="button" @click="taskResultModal.open(item)">
-                            <Icon class="w-5 h-5" name="ph:pencil-simple" />
-                        </BaseButtonIcon>
+                        <div class="flex gap-1 justify-end">
+                            <BaseButtonIcon
+                                v-if="!item.closed_at"
+                                size="md"
+                                type="button"
+                                title="Выполнить"
+                                @click="taskResultModal.open(item)"
+                            >
+                                <Icon class="w-5 h-5 text-green-600" name="ph:check" />
+                            </BaseButtonIcon>
+                            <BaseButtonIcon size="md" type="button" title="Изменить" @click="taskModal.open(item)">
+                                <Icon class="w-5 h-5" name="ph:pencil-simple" />
+                            </BaseButtonIcon>
+                        </div>
                     </template>
                 </BaseTable>
                 <BasePagination
@@ -60,6 +97,7 @@ import PerPageSelect from '~/components/common/PerPageSelect.vue';
 import type { Column } from '~/components/common/types';
 import TaskModal from '~/components/task/TaskModal.vue';
 import TaskResultModal from '~/components/task/TaskResultModal.vue';
+import { isTaskOverdue, overdueText, taskSubject, taskWhen } from '~/components/task/taskText';
 import type { Task, TaskFilters } from '~/types/deal';
 import type { PaginatedResponse } from '~/types/generics';
 
@@ -74,86 +112,51 @@ useHead({
     title: 'Задачи'
 });
 
+/** The list filters of pages/tasks.vue: the deadline, creation and done dates too. */
+type ListFilters = TaskFilters & { createdFrom?: string; createdTill?: string; closedFrom?: string; closedTill?: string };
+
 const taskResultModal = useModal('TaskResultModal');
+const taskModal = useModal('TaskModal');
 const emits = defineEmits(['fetchTasks']);
 const route = useRoute();
 const toast = useToast('GlobalToast');
 const tasksService = useService('tasks', {auth: true});
-const { data: Task, isLoading, runAsync } = useAsync<Task>();
+const { runAsync } = useAsync<Task>();
 
-defineProps<{
-    filters: TaskFilters;
+const props = defineProps<{
+    filters: ListFilters;
     tasks: PaginatedResponse<Task>;
     tasksLoading: boolean;
 }>();
 
-function memoize(fn: (arg: any) => any) {
-    const cache = new WeakMap();
-    return (arg: any) => {
-        let found = cache.get(arg);
-        if (!found) {
-            found = fn(arg);
-            cache.set(arg, found);
-        }
-
-        return found;
-    };
-}
-
-const isOverdue = memoize((item) => {
-    const endAt = moment(item.end);
-    return endAt.isBefore(moment()) && !item.closed_at;
+const closedPeriod = computed(() => {
+    const day = (v?: string) => (v ? moment(v).format('DD.MM') : '…');
+    return `${day(props.filters.closedFrom)}–${day(props.filters.closedTill)}`;
 });
 
-/** "23.11, 15:00"; an all-day task: the day only. The list rows keep the times as start / end. */
-function when(value: string, allDay?: boolean) {
-    return formatDate(value, allDay ? 'DD.MM.YYYY' : 'DD.MM.YYYY, HH:mm');
+function clearClosed() {
+    props.filters.closedFrom = '';
+    props.filters.closedTill = '';
 }
 
-const columns = ref<Column[]>([
+// «Результат» and «Выполнена» only where closed tasks are listed (they are empty for open ones)
+const showsClosed = computed(() => ['closed', 'all'].includes(props.filters.status?.value));
+
+const columns = computed<Column[]>(() => [
     {
-        // the deadline; sorted by end_time on the server (the default order: the nearest first)
+        // the deadline (the cell is the slot above); sorted by end_time on the server, the nearest first
         label: 'Срок',
         name: 'end_time',
         sortable: true,
-        field(item) {
-            return when(item.end, item.allDay);
-        },
-        click(item) {
-            taskResultModal.open(item);
-        },
-        classes(item) {
-            if (isOverdue(item)) return '!text-red-600';
-        },
         resizable: true,
     },
     {
-        label: 'Начало',
-        name: 'start_time',
-        sortable: true,
-        field(item) {
-            return when(item.start, item.allDay);
-        },
+        label: 'Текст задачи',
+        name: 'label',
+        mobile: 'title',
+        wrap: true,
         click(item) {
-            taskResultModal.open(item);
-        },
-        classes(item) {
-            if (isOverdue(item)) return '!text-red-600';
-        },
-        resizable: true,
-    },
-    {
-        label: 'Ответственный',
-        name: 'agent_id',
-        click(item) {
-            taskResultModal.open(item);
-        },
-        // a task of a group: the group is the assignee
-        field(item) {
-            return item.agent?.username || (item.group ? `Группа «${item.group.name}»` : '');
-        },
-        classes(item) {
-            if (isOverdue(item)) return '!text-red-600';
+            taskModal.open(item);
         },
         resizable: true,
     },
@@ -161,11 +164,8 @@ const columns = ref<Column[]>([
         // the deal first: an automatic task names the deal and its company
         label: 'Объект',
         name: 'object',
-        classes(item) {
-            let classes = 'underline';
-            if (isOverdue(item)) classes += ' !text-red-600';
-            else classes += ' !text-blue-600';
-            return classes;
+        classes() {
+            return 'underline !text-blue-600 dark:!text-blue-400';
         },
         link(item) {
             let link = '';
@@ -179,69 +179,65 @@ const columns = ref<Column[]>([
             return link;
         },
         field(item) {
-            let value = '';
-            if (item.deal) {
-                value = item.deal.label;
-            } else if (item.company) {
-                value = item.company.name;
-            }
-            else if (item.ctr_agent) {
-                value = item.ctr_agent.username;
-            }
-            return value;
+            return taskSubject(item);
         },
         subtitle(item) {
             return item.deal && item.company ? item.company.name : '';
         },
-
+        resizable: true,
+    },
+    {
+        label: 'Ответственный',
+        name: 'agent_id',
+        click(item) {
+            taskModal.open(item);
+        },
+        // a task of a group: the group is the assignee
+        field(item) {
+            return item.agent?.username || (item.group ? `Группа «${item.group.name}»` : '');
+        },
         resizable: true,
     },
     {
         label: 'Тип задачи',
         name: 'type',
         click(item) {
-            taskResultModal.open(item);
+            taskModal.open(item);
         },
         field(item) {
-            return item.type?.name;
-        },
-        classes(item) {
-            if (isOverdue(item)) return '!text-red-600';
+            return item.type?.name ?? 'Задача';
         },
         resizable: true,
     },
     {
-        label: 'Текст задачи',
-        name: 'label',
-        click(item) {
-            taskResultModal.open(item);
-        },
-        classes(item) {
-            if (isOverdue(item)) return '!text-red-600';
-        },
-        resizable: true,
-    },
-    {
-        label: 'Результат',
-        name: 'result',
-        click(item) {
-            taskResultModal.open(item);
-        },
-        classes(item) {
-            if (isOverdue(item)) return '!text-red-600';
-        },
-        resizable: true,
-    },
-    {
-        label: 'Выполнена',
-        name: 'closed_at',
-        dateFormat: 'DD.MM.YYYY, HH:mm',
+        label: 'Начало',
+        name: 'start_time',
         sortable: true,
+        field(item) {
+            return taskWhen(item.start, item.allDay);
+        },
         click(item) {
-            taskResultModal.open(item);
+            taskModal.open(item);
         },
         resizable: true,
     },
+    ...(showsClosed.value ? [
+        {
+            label: 'Результат',
+            name: 'result',
+            wrap: true,
+            resizable: true,
+        },
+        {
+            label: 'Выполнена',
+            name: 'closed_at',
+            sortable: true,
+            field(item: Task) {
+                return item.closed_at ? taskWhen(item.closed_at) : '';
+            },
+            resizable: true,
+        },
+    ] as Column[] : []),
     {
         label: '',
         name: 'actions',
@@ -255,10 +251,10 @@ async function openSingleTask(val: string | LocationQueryValue[]) {
     if (!id) return;
     const result = await promiseResult(runAsync(tasksService.get(id).exec()));
     if (!result.ok) return toast.show({message: result.error.message, type: 'error', timeout: 3000});
-    taskModal.open(result.value);
+    // GET /tasks/:id names the times start_time / end_time, the list start / end
+    const task = result.value as Task;
+    taskModal.open({...task, start: task.start ?? task.start_time, end: task.end ?? task.end_time});
 }
-
-const taskModal = useModal('TaskModal');
 
 onMounted(() => {
     if (route.query.id) openSingleTask(route.query.id);

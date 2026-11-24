@@ -30,24 +30,12 @@
                     </NuxtLink>
                 </div>
             </div>
-            <div class="flex gap-6">
-                <div class="flex gap-2">
-                    <BaseAutocomplete
-                        v-if="choosingDeal"
-                        v-model="selectedDeal"
-                        placeholder="Сделки"
-                        :fixed="true"
-                        :items="deals.data"
-                        :properties="{label: 'label', value: 'id'}"
-                        :display-value="(deal: Deal) => deal?.label ?? ''"
-                        dropdown
-                        clearable
-                        @input="onDealInput"
-                        :classes="{wrapper: 'max-w-xs'}"
-                    />
-                    <BaseButton v-if="!choosingDeal" @click="choosingDeal = true">Привязать сделку</BaseButton>
-                    <BaseButtonClose v-else size="md" rounded="md" color="muted" class="shrink-0" @click="choosingDeal = false; selectedDeal = undefined" />
-                </div>
+            <div class="flex gap-3 items-center">
+                <!-- a letter of no deal («Неразобранные»): into a deal and / or its sender to a contact -->
+                <BaseButton v-if="!choosingDeal && email.id && !email.deals?.length" size="sm" @click="choosingDeal = true">
+                    <Icon name="ph:link" class="size-4 me-1" />
+                    Привязать
+                </BaseButton>
                 <BaseDropdown
                     variant="context"
                     label="Dropdown"
@@ -72,6 +60,48 @@
                         @click="markAsSpam"
                     />
                 </BaseDropdown>
+            </div>
+        </div>
+        <div
+            v-if="choosingDeal"
+            class="p-4 border-b border-b-muted-200 dark:border-muted-700 flex flex-col gap-3 bg-muted-50 dark:bg-muted-900"
+        >
+            <p class="text-sm text-muted-600 dark:text-muted-300">
+                Письмо попадёт в историю выбранной сделки. Если выбрать контакт, адрес {{ counterpart || 'отправителя' }} станет его адресом:
+                прежние и следующие письма с этого адреса будут привязываться сами.
+            </p>
+            <div class="flex flex-col gap-2 lg:flex-row lg:items-end">
+                <BaseAutocomplete
+                    v-model="selectedDeal"
+                    label="Сделка"
+                    placeholder="Название или номер сделки"
+                    :fixed="true"
+                    :items="deals.data"
+                    :properties="{label: 'label', value: 'id', sublabel: (deal: Deal) => `№${deal.display_id ?? deal.id}`}"
+                    :display-value="(deal: Deal) => deal?.label ?? ''"
+                    dropdown
+                    clearable
+                    :classes="{wrapper: 'w-full lg:max-w-xs'}"
+                    @input="onDealInput"
+                />
+                <BaseAutocomplete
+                    v-if="!email.outgoing"
+                    v-model="selectedContact"
+                    label="Контакт"
+                    placeholder="Имя, телефон или почта"
+                    :fixed="true"
+                    :items="contacts"
+                    :properties="{label: 'username', value: 'id', sublabel: (contact: any) => contact.company?.name ?? contact.email ?? ''}"
+                    :display-value="(contact: any) => contact?.username ?? ''"
+                    dropdown
+                    clearable
+                    :classes="{wrapper: 'w-full lg:max-w-xs'}"
+                    @input="onContactInput"
+                />
+                <div class="flex gap-2">
+                    <BaseButton color="primary" :loading="linkBusy" :disabled="linkBusy || (!selectedDeal && !selectedContact)" @click="onLink">Привязать</BaseButton>
+                    <BaseButton variant="pastel" @click="choosingDeal = false; selectedDeal = undefined; selectedContact = undefined">Отмена</BaseButton>
+                </div>
             </div>
         </div>
         <div class="h-[calc(100%-5rem)] overflow-y-auto">
@@ -223,6 +253,7 @@ const mailService = useService('emails', {auth: true});
 const templateService = useService('emails/templates', {auth: true});
 const transporterService = useService('emails/transporters', {auth: true});
 const dealService = useService('deals', {auth: true});
+const contactService = useService('contacts', {auth: true});
 
 const toast = useToast('GlobalToast');
 const { data: email, run } = useAsync<Email & { reply?: Reply }>(props.email ? props.email : {to: [], cc: []});
@@ -242,8 +273,11 @@ const emailSubject = ref();
 const emailBody = ref<string>('');
 const detailsRef = ref();
 const choosingDeal = ref(false);
-// The deal picked in "Привязать сделку": the reply goes into its history too
+// The deal picked in «Привязать»: the letter goes into its history (and the reply too)
 const selectedDeal = ref<Deal>();
+const selectedContact = ref<{ id: number; username: string }>();
+const contacts = ref<any[]>([]);
+const linkBusy = ref(false);
 const lastTemplate = ref<Template>();
 // "" = the shared mailbox; the user's own mailbox when there is one, as before
 const transporterId = ref('');
@@ -330,6 +364,37 @@ const onDealInput = debounce((e: Event) => {
     const target = (e.target as HTMLInputElement);
     runDeals(dealService.find({ label: target.value }).exec());
 }, 300);
+
+const onContactInput = debounce(async (e: Event) => {
+    const text = (e.target as HTMLInputElement).value?.trim();
+    const result = await promiseResult(contactService.find({ q: text, role: 'ctr_agent', limit: 20 }).exec());
+    if (result.ok) contacts.value = (result.value as any)?.data ?? [];
+}, 300);
+
+/** The client's address of the letter: its sender (a letter we sent: the first recipient). */
+const counterpart = computed(() => email.value?.outgoing ? (email.value?.to?.[0]?.value ?? '') : (email.value?.from ?? ''));
+
+/** «Привязать»: the letter into the chosen deal and / or its sender to the chosen contact. */
+async function onLink() {
+    if (!selectedDeal.value && !selectedContact.value) return;
+    linkBusy.value = true;
+    const result = await promiseResult(mailService.post(`${email.value.id}/link`, {
+        ...(selectedDeal.value?.id ? { deal_id: selectedDeal.value.id } : {}),
+        ...(selectedContact.value?.id ? { contact_id: selectedContact.value.id } : {}),
+    }).exec());
+    linkBusy.value = false;
+    if (!result.ok) return toast.show({message: result.error.message, type: 'error', timeout: 5000});
+    const linked = result.value as { deal?: { display_id: number; label: string } | null; contact?: { username: string } | null; letters?: number };
+    const parts = [
+        linked?.deal ? `в сделку №${linked.deal.display_id} ${linked.deal.label}` : '',
+        linked?.contact ? `к контакту ${linked.contact.username}` : '',
+    ].filter(Boolean);
+    toast.show({message: `Письмо привязано ${parts.join(' и ')}`, type: 'success', timeout: 4000});
+    choosingDeal.value = false;
+    selectedContact.value = undefined;
+    run(mailService.get(email.value.id).exec());
+    emits('linked', email.value.id);
+}
 
 function toggleEditor() {
     detailsRef.value.removeAttribute('open');

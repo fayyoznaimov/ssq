@@ -1,7 +1,7 @@
 <template>
     <div class="flex flex-col gap-8">
         <div>
-            <h1 class="text-xl">Транспортеры</h1>
+            <h1 class="text-xl">Почтовые ящики</h1>
             <h2 class="text-sm text-gray-500">
                 Ящики, с которых сотрудники отправляют письма. Сотрудник подключает только свой ящик и только с паролем,
                 который принял почтовый сервер; чужой ящик подключает администратор.
@@ -15,7 +15,7 @@
                 class="border border-gray-300 dark:border-muted-600 rounded-md"
             >
                 <BaseButton color="primary">
-                    Новый транспортер
+                    Добавить ящик
                 </BaseButton>
             </NuxtLink>
         </div>
@@ -66,13 +66,13 @@ import { promiseResult } from '~/utils/result';
 definePageMeta({
     authRoute: true,
     layout: 'account',
-    verbose: 'Транспортеры',
+    verbose: 'Почтовые ящики',
     roles: ['admin'],
     subject: 'Mail'
 });
 
 useHead({
-    title: 'Транспортеры'
+    title: 'Почтовые ящики'
 });
 
 const transporterService = useService('emails/transporters', {auth: true});

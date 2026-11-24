@@ -64,6 +64,8 @@ export class TaskController {
     @Param('id', ParseIntPipe) id: number,
     @Req() request: Request,
   ): Promise<void> {
+    // a task the user does not see is "not found" (the guard checks the right to change it)
+    await this.taskService.getVisibleById(id, request['user']);
     const savedTask = await this.taskService.update(id, data, request['user']);
 
     // the change is a new history entry with its author (the creation entry stays as it was)
@@ -77,12 +79,14 @@ export class TaskController {
     @Param('id', ParseIntPipe) id: number,
     @Req() request: Request,
   ): Promise<void> {
+    await this.taskService.getVisibleById(id, request['user']);
     return this.taskService.close(id, data, request);
   }
 
   @Delete(':id')
   @RecordAccess('task', 'delete')
-  async delete(@Param('id', ParseIntPipe) id: number): Promise<void> {
+  async delete(@Param('id', ParseIntPipe) id: number, @Req() request: Request): Promise<void> {
+    await this.taskService.getVisibleById(id, request['user']);
     return this.taskService.delete(id);
   }
 }

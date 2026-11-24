@@ -23,6 +23,10 @@ export enum TriggerTypes {
   CHANGE_AGENT = 4,
   CHANGE_FIELDS = 5,
   DELETE_FILES = 6,
+  // the deal goes to another stage (its triggers run there, one level deeper)
+  MOVE_STAGE = 7,
+  // a message to the responsible and / or the managers in the CRM bot (a task when the bot cannot)
+  NOTIFY = 8,
 }
 
 @Index('IDX_trigger_deal_stage', ['deal_stage'])
@@ -39,6 +43,10 @@ export class Trigger {
 
   @Column({ type: 'smallint', nullable: false })
   type: TriggerTypes;
+
+  // the order of the triggers of a stage: they run in it (then by id), the settings page shows it
+  @Column({ type: 'int', default: 0 })
+  position: number;
 
   @Column({ type: 'varchar', length: 255, name: 'apply_when', nullable: false })
   apply_when: ApplyTriggerWhenEnum;

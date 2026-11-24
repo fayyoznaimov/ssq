@@ -4,7 +4,15 @@ import { DataSource } from 'typeorm';
 import { BotService } from './bot.service';
 import { ANSWER_TYPES, CHAT_TYPES, WorkSchedule, answerSql, clientMessageSql } from '../analytics/control.service';
 import { AUTO_REPLY, AutoTaskService } from '../automation/auto-task.service';
-import { TRIGGER_RUN_FAILED, TriggerRunFailure } from '../trigger/trigger-events';
+import { AuditJournal } from '../audit/audit-journal';
+import {
+  TRIGGER_BROKEN,
+  TRIGGER_NOTIFY,
+  TRIGGER_RUN_FAILED,
+  TriggerBrokenSummary,
+  TriggerNotification,
+  TriggerRunFailure,
+} from '../trigger/trigger-events';
 
 /**
  * Business process «Клиент ждёт ответа» (see «Контроль менеджеров»):
@@ -21,7 +29,9 @@ import { TRIGGER_RUN_FAILED, TriggerRunFailure } from '../trigger/trigger-events
  * (answerSql, the same rule as «Контроль менеджеров»).
  *
  * Also: a trigger run that failed (TRIGGER_RUN_FAILED) is told to the admins who linked the bot,
- * at most once an hour per trigger (TRIGGER_FAIL_NOTIFY=0 turns it off).
+ * at most once an hour per trigger (TRIGGER_FAIL_NOTIFY=0 turns it off); the triggers that name
+ * something deleted (TRIGGER_BROKEN: one message, each trigger once a day) too; and the action «Уведомить» of a
+ * trigger (TRIGGER_NOTIFY) sends its message to the employees who linked the bot.
  */
 @Injectable()
 export class BotWaitingService implements OnApplicationBootstrap, OnApplicationShutdown {
@@ -40,7 +50,8 @@ export class BotWaitingService implements OnApplicationBootstrap, OnApplicationS
   onApplicationBootstrap() {
     if (process.env.CONTROL_NOTIFY === '0') return;
     const every = Math.max(60, Number(process.env.CONTROL_NOTIFY_SEC || 300));
-    this.timer = setInterval(() => void this.tick(), every * 1000);
+    // the journal (src/audit): the tasks of «клиент ждёт ответа» are the autopilot's, not the manager's
+    this.timer = setInterval(() => void AuditJournal.job('autopilot', 'waiting-client', () => this.tick()), every * 1000);
   }
 
   onApplicationShutdown() {
@@ -200,6 +211,57 @@ export class BotWaitingService implements OnApplicationBootstrap, OnApplicationS
     } catch (error) {
       this.logger.warn(`trigger failure message: ${(error as Error).message}`);
     }
+  }
+
+  /** Triggers name a dismissed employee, a deleted template ...: the admins who linked the bot hear of it, in one message. */
+  @OnEvent(TRIGGER_BROKEN)
+  async onTriggerBroken(summary: TriggerBrokenSummary): Promise<void> {
+    const reports = summary?.triggers ?? [];
+    if (process.env.TRIGGER_FAIL_NOTIFY === '0' || !this.bot.enabled || reports.length === 0) return;
+    try {
+      const admins: { chat_id: string }[] = await this.dataSource.query(
+        `SELECT ba.chat_id FROM bot_account ba JOIN "user" u ON u.id = ba.user_id AND u.deleted_at IS NULL WHERE u.role = 'admin'`,
+      );
+      if (admins.length === 0) return;
+      const base = (process.env.CRM_PUBLIC_URL || '').replace(/\/+$/, '');
+      const shown = reports.slice(0, 10);
+      const text =
+        `${reports.length === 1 ? 'Триггер не сможет сработать' : `Не смогут сработать триггеры: ${reports.length}`}:\n` +
+        shown.map((r) => `• этап «${r.stage_name ?? '—'}», «${r.action}»: ${r.problems.join('; ')}`).join('\n') +
+        (reports.length > shown.length ? `\n… и ещё ${reports.length - shown.length}` : '') +
+        `\nИсправьте в настройке воронки${base ? `: ${base}/settings/deals` : ''}.`;
+      for (const admin of admins) {
+        await this.bot.send(admin.chat_id, text).catch((error) =>
+          this.logger.warn(`broken trigger message to chat ${admin.chat_id} failed: ${(error as Error).message}`),
+        );
+      }
+    } catch (error) {
+      this.logger.warn(`broken trigger message: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * «Уведомить» of a trigger (emitAsync): the message goes to each of the employees who linked the bot;
+   * the answer is the ids of those told (the trigger gives the others a task instead).
+   */
+  @OnEvent(TRIGGER_NOTIFY)
+  async onTriggerNotify(notification: TriggerNotification): Promise<number[]> {
+    if (!this.bot.enabled || !notification?.user_ids?.length) return [];
+    const chats: { user_id: number; chat_id: string }[] = await this.dataSource.query(
+      `SELECT ba.user_id, ba.chat_id FROM bot_account ba JOIN "user" u ON u.id = ba.user_id AND u.deleted_at IS NULL
+        WHERE ba.user_id = ANY($1)`,
+      [notification.user_ids],
+    );
+    const told = new Set<number>();
+    for (const chat of chats) {
+      try {
+        await this.bot.send(chat.chat_id, notification.text);
+        told.add(Number(chat.user_id));
+      } catch (error) {
+        this.logger.warn(`trigger notification to user ${chat.user_id} about deal ${notification.deal_id} failed: ${(error as Error).message}`);
+      }
+    }
+    return [...told];
   }
 
   private async hasOpenReplyTask(dealId: number): Promise<boolean> {

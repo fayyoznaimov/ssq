@@ -34,11 +34,12 @@ export const defaultTheme = {
         typography: ({ theme }: any) => ({
             primary: {
                 css: {
-                    '--tw-prose-links': theme('colors.primary.600'),
-                    '--tw-prose-quote-borders': theme('colors.primary.600'),
+                    // the primary tones are CSS variables (app.vue), with lighter ones in the dark theme
+                    '--tw-prose-links': 'rgb(var(--color-primary-600))',
+                    '--tw-prose-quote-borders': 'rgb(var(--color-primary-600))',
 
-                    '--tw-prose-invert-links': theme('colors.primary.500'),
-                    '--tw-prose-invert-quote-borders': theme('colors.primary.500'),
+                    '--tw-prose-invert-links': 'rgb(var(--color-primary-200))',
+                    '--tw-prose-invert-quote-borders': 'rgb(var(--color-primary-500))',
                 },
             },
             muted: {

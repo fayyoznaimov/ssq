@@ -29,7 +29,7 @@ CRM_API_TOKEN, the same shared secret the service sends to the API): otherwise 4
                        through the manager's account (files above TG_MAX_AUTO_DOWNLOAD_MB are not saved
                        in the CRM; this fetches one when somebody asks for it). Nothing is kept here.
                        400 no session, 404 the message or file is gone, 502/504 Telegram did not answer
-  GET  /health         {ok, sessions, connected, states, problems, outbox, outbox_oldest_sec, rejected}, no token
+  GET  /health         {ok, sessions, connected, states, problems, outbox, outbox_oldest_sec, rejected, ffmpeg}, no token
 
 The listener (listener_session_string.py) runs in a separate process; the two
 talk through a multiprocessing queue and manager dicts.
@@ -55,7 +55,7 @@ from helpers.Logger import Logger  # noqa: E402
 from helpers.Session import LoginCode, ActivationResult  # noqa: E402
 from helpers.message_handler import Message, Location, Contact  # noqa: E402
 from helpers.file import File  # noqa: E402
-from helpers import media_download, name_lookup, phone_lookup, session_state  # noqa: E402
+from helpers import converter as ffmpeg_lookup, media_download, name_lookup, phone_lookup, session_state  # noqa: E402
 from helpers.session_jobs import Logout  # noqa: E402
 from scripts import authenticate_user  # noqa: E402
 
@@ -234,7 +234,8 @@ def get_sessions():
 def health():
     alive = listener_process is not None and listener_process.is_alive()
     rows = fetch_all_db_sessions()
-    return jsonify({"ok": alive, **session_state.health(rows), **outbox_stats()}), 200 if alive else 503
+    # ffmpeg false: voice messages are kept as .ogg (FFMPEG_BIN, helpers/converter.py); the watchdog reports it
+    return jsonify({"ok": alive, **session_state.health(rows), **outbox_stats(), "ffmpeg": ffmpeg_lookup.find()[2]}), 200 if alive else 503
 
 
 @app.route("/logout", methods=["POST"])
@@ -263,7 +264,9 @@ def send_answer(result: dict, repeated: bool = False):
     if result["ok"]:
         return jsonify({"message": "Отправлено", "sent": result["sent"], **extra}), 200
     reason = result.get("reason") or "Telegram не принял сообщение"
-    status = 400 if ("нет подключённого" in reason or "Нечего" in reason or "отключён" in reason or "не знает этот чат" in reason) else 502
+    # the manager's own side (no session, ended or offline session, nothing to send, unknown chat): 400, the CRM keeps the text
+    mine = ("нет подключённого", "не подключён", "не на связи", "Нечего", "отключён", "не знает этот чат")
+    status = 400 if any(part in reason for part in mine) else 502
     return jsonify({"message": reason, "sent": result.get("sent") or [], **extra}), status
 
 
@@ -459,6 +462,11 @@ def start_listener() -> None:
 def main_app():
     if not (config.HTTP_API_TOKEN or "").strip():
         logger.warning("Neither SERVICE_HTTP_TOKEN nor CRM_API_TOKEN is set: every route except /health answers 401")
+    binary, _, ok, tried = ffmpeg_lookup.find()
+    if ok:
+        logger.info(f"ffmpeg: {binary}")
+    else:
+        logger.error(f"ffmpeg not found ({'; '.join(tried)}): voice messages stay .ogg; set FFMPEG_BIN")
     start_listener()
     app.run(debug=False, port=int(os.environ.get('PORT') or 3030), host=os.environ.get('HOST') or '0.0.0.0', threaded=True)
 

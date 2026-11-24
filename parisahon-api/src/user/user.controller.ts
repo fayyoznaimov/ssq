@@ -6,6 +6,7 @@ import {
   Delete,
   ForbiddenException,
   Get,
+  HttpCode,
   Param,
   ParseIntPipe,
   Patch,
@@ -20,11 +21,12 @@ import { CreateUserDto } from './dto/create.user.dto';
 import { AuthGuard, AuthUser } from '../auth/auth.guard';
 import { Roles } from '../auth/decorator/roles.decorator';
 import { instanceToPlain } from 'class-transformer';
-import { ChangeOwnPasswordDto, UpdateOwnProfileDto, UpdateUserDto } from './dto/update.user.dto';
+import { ChangeOwnPasswordDto, MergeContactsDto, UpdateOwnProfileDto, UpdateUserDto } from './dto/update.user.dto';
 import { SearchUserQueryDto, StaffQueryDto } from './dto/search.user.query.dto';
 import { PaginationRequestDto } from '../helper/dto/pagination.dto';
 import { EventsService } from 'src/events/events.service';
 import { SearchEventDto } from 'src/events/dto/search.event.dto';
+import { CreateCommentDto } from 'src/events/dto/create.comment.dto';
 import { RoleEnum } from './user.entity';
 
 /**
@@ -112,6 +114,42 @@ export class UserController {
     );
   }
 
+  /** A note in the contact's feed, outside any deal (SCR2-4); the right to change the contact. */
+  @Post(':id/comments')
+  @RecordAccess('contact', 'update')
+  async postContactNote(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() data: CreateCommentDto,
+    @Req() request: Request,
+  ): Promise<Record<string, any>> {
+    return instanceToPlain(await this.eventService.postClientNote({ contact_id: id }, data.comment, request['user'].sub));
+  }
+
+  /** The author changes their note. */
+  @Patch(':id/comments/:event_id')
+  @RecordAccess('contact', 'update')
+  async updateContactNote(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('event_id', ParseIntPipe) eventId: number,
+    @Body() data: CreateCommentDto,
+    @Req() request: Request,
+  ): Promise<Record<string, any>> {
+    return instanceToPlain(
+      await this.eventService.updateClientNote({ contact_id: id }, eventId, data.comment, request['user'].sub),
+    );
+  }
+
+  /** The author deletes their note. */
+  @Delete(':id/comments/:event_id')
+  @RecordAccess('contact', 'update')
+  async deleteContactNote(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('event_id', ParseIntPipe) eventId: number,
+    @Req() request: Request,
+  ): Promise<void> {
+    await this.eventService.deleteClientNote({ contact_id: id }, eventId, request['user'].sub);
+  }
+
   /**
    * Open to every staff role, not only admin + manager: the deal, task, mail
    * and contact screens load their "responsible" and contact pickers from here.
@@ -187,6 +225,22 @@ export class UserController {
     @Req() request: Request,
   ): Promise<{ id: number; username: string; phone: string | null }> {
     return this.userService.updateOwnProfile(request['user'].sub, data);
+  }
+
+  /**
+   * «Объединить контакты»: the contact from_id (the same client entered twice) is merged into :id — its
+   * deals, history, tasks, e-mails, messenger ids and what :id lacks — and is deleted; the history of :id
+   * says so. Needs the right to change :id and to delete from_id.
+   */
+  @Post(':id/merge')
+  @HttpCode(200)
+  @RecordAccess('contact', 'update')
+  async merge(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() data: MergeContactsDto,
+    @Req() request: Request,
+  ): Promise<{ id: number; merged_id: number; deals: number; fields: string[] }> {
+    return this.userService.mergeContacts(id, Number(data.from_id), request, new Access(request['user']));
   }
 
   @Patch(':id')

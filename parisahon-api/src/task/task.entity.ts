@@ -40,9 +40,11 @@ export class Task {
   @Column({ type: 'varchar', length: 255 })
   label: string;
 
+  // every task has a type (migration 1795650000000-task-type-required); a type with tasks is not deleted
+  // by the database: TaskTypeService.delete moves its tasks to another type first
   @ManyToOne(() => TaskTypeEntity, (taskType) => taskType.tasks, {
-    nullable: true,
-    onDelete: 'SET NULL',
+    nullable: false,
+    onDelete: 'RESTRICT',
   })
   @JoinColumn({ name: 'type_id' })
   type: TaskTypeEntity;

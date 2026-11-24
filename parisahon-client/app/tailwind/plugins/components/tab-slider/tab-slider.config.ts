@@ -24,7 +24,7 @@ export const defaultConfig = {
             color: {
                 active: {
                     light: 'white',
-                    dark: 'white',
+                    dark: 'primary-invert',
                 },
                 inactive: {
                     light: 'muted-400',

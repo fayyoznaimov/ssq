@@ -55,12 +55,12 @@ const { runAsync: deleteAsync, isLoading: deleting } = useAsync<Transporter>({})
 definePageMeta({
     authRoute: true,
     layout: 'account',
-    verbose: 'Транпортер',
+    verbose: 'Почтовый ящик',
     subject: 'Mail'
 });
 
 useHead({
-    title: 'Транспортер'
+    title: 'Почтовый ящик'
 });
 
 const toast = useToast('GlobalToast');

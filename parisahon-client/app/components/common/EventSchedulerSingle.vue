@@ -1,7 +1,8 @@
 <template>
     <!-- date, assignee and type; on a phone they wrap instead of squeezing to a few px -->
     <div class="flex flex-wrap lg:flex-nowrap items-center gap-2 w-full [&>*]:min-w-[9rem] [&>*]:flex-1 lg:[&>*]:min-w-[auto] lg:[&>*]:flex-initial">
-        <DatePicker v-model="date" text-input vertical :preset-dates="presetDates" @internal-model-change="handleInternalChange" :dark="isDarkMode">
+        <!-- «24.11.2026 10:00» as everywhere else (it was 11/22/2026, SCR2-4) -->
+        <DatePicker v-model="date" format="dd.MM.yyyy HH:mm" locale="ru" select-text="Выбрать" cancel-text="Отмена" text-input vertical :preset-dates="presetDates" @internal-model-change="handleInternalChange" :dark="isDarkMode">
             <template #dp-input="{ onInput, value, onBlur, onPaste }">
                 <BaseInput :size="size" :value="value" @input="onInput" @blur="onBlur" @paste="onPaste" />
             </template>
@@ -251,8 +252,9 @@ function displayUserGroup(u: UserGroup) {
     if (u.target === 'agent') return u.username;
 }
 watch(taskTypes, () => {
+    // the type the API marks as default (the one the CRM gives its own tasks), else the first one
     if (!task.value.type && taskTypes.value.length) {
-        task.value.type = taskTypes.value[0];
+        task.value.type = taskTypes.value.find((t) => (t as TaskType & {default?: boolean}).default) ?? taskTypes.value[0];
         internalEvent.value.setProp?.('title', task.value.type?.name ?? '');
     }
 });

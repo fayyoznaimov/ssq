@@ -63,6 +63,10 @@ const methods = {
     record({ method: 'editMessageText', chat_id: String(p.chat_id), message_id: p.message_id, text: p.text, keyboard: p.reply_markup?.inline_keyboard ?? null });
     return true;
   },
+  editMessageReplyMarkup(p) {
+    record({ method: 'editMessageReplyMarkup', chat_id: String(p.chat_id), message_id: p.message_id, keyboard: p.reply_markup?.inline_keyboard ?? null });
+    return true;
+  },
   answerCallbackQuery(p) {
     record({ method: 'answerCallbackQuery', id: p.callback_query_id, text: p.text ?? null });
     return true;

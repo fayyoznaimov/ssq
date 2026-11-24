@@ -38,8 +38,9 @@ export class UpdateDealDto {
   @Length(1, 255)
   label?: string;
 
+  // with cents: the column is numeric(18,2)
   @IsOptional()
-  @IsInt()
+  @IsNumber({ maxDecimalPlaces: 2, allowNaN: false, allowInfinity: false })
   @Min(0)
   @Max(Number.MAX_SAFE_INTEGER)
   budget?: number;

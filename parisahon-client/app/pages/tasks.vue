@@ -1,50 +1,27 @@
 <template>
     <div class="flex flex-col gap-3 min-h-[calc(100vh_-_100px)]">
         <div class="flex flex-wrap justify-between items-center gap-3 mb-4">
-            <nav>
-                <ul class="flex items-center gap-3">
-                    <li>
-                        <NuxtLink
-                            class="p-1"
-                            exact-active-class="text-blue-600"
-                            to="/tasks"
-                        >
-                            <Icon
-                                name="ph:list"
-                                class="text-inherit size-6"
-                            />
-                        </NuxtLink>
-                    </li>
-                    <li>
-                        <NuxtLink
-                            to="/tasks/kanban"
-                            class="p-1"
-                            exact-active-class="text-blue-600"
-                        >
-                            <Icon
-                                name="ph:kanban"
-                                class="text-inherit size-6"
-                            />
-                        </NuxtLink>
-                    </li>
-                    <li>
-                        <NuxtLink
-                            class="p-1"
-                            exact-active-class="text-blue-600"
-                            to="/tasks/calendar"
-                        >
-                            Календарь
-                        </NuxtLink>
-                    </li>
-                </ul>
-            </nav>
+            <!-- the three views of the same tasks: an icon and a word each (a phone shows the icons only) -->
+            <BaseButtonGroup>
+                <BaseButton
+                    v-for="view in views"
+                    :key="view.to"
+                    color="default"
+                    :to="{path: view.to, query: listQuery}"
+                    :title="view.label"
+                    :class="route.path === view.to ? '!bg-muted-200 dark:!bg-muted-600' : ''"
+                >
+                    <Icon :name="view.icon" class="size-5" />
+                    <span class="xs:hidden">{{ view.label }}</span>
+                </BaseButton>
+            </BaseButtonGroup>
             <!-- whose tasks: mine (me or my group) by default, the ones I gave, everybody's -->
             <BaseButtonGroup class="flex-wrap">
                 <BaseButton
                     v-for="option in scopes"
                     :key="option.value"
                     color="default"
-                    :class="scope === option.value ? '!bg-muted-200 dark:!bg-muted-600' : ''"
+                    :class="scope === option.value ? 'toggle-selected' : ''"
                     @click="scope = option.value"
                 >
                     {{ option.label }}
@@ -177,6 +154,7 @@
         <TaskTypeManageModal
             id="TaskTypeManageModal"
             :task-types="taskTypes"
+            @saved="loadTaskTypes"
         />
     </div>
 </template>
@@ -205,6 +183,11 @@ const statuses = [
         value: "overdue",
     },
     {
+        // open and not overdue: «Задачи к выполнению» of the desktop
+        label: "Предстоящие",
+        value: "upcoming",
+    },
+    {
         label: "Закрытые",
         value: "closed",
     },
@@ -229,10 +212,36 @@ const allTaskTypes = {
 const app = useAppConfig();
 const route = useRoute();
 
-// links from the desktop and the reports: ?status=overdue&scope=mine, ?user_id=5&username=..., ?type_id=..
+const views = [
+    { to: "/tasks", label: "Список", icon: "ph:list" },
+    { to: "/tasks/kanban", label: "Канбан", icon: "ph:kanban" },
+    { to: "/tasks/calendar", label: "Календарь", icon: "ph:calendar-blank" },
+];
+
+// a link from the desktop keeps its filters when the view changes
+const listQuery = computed(() => {
+    const {page, id, ...rest} = route.query;
+    return rest;
+});
+
+/** The list filters plus the dates a link may bring: when the tasks were set and when they were done. */
+type ListFilters = TaskFilters & {
+    createdFrom: string;
+    createdTill: string;
+    closedFrom: string;
+    closedTill: string;
+};
+
+const queryText = (key: string) => {
+    const value = route.query[key];
+    return typeof value === "string" ? value : "";
+};
+
+// links from the desktop and the reports: ?status=overdue&scope=mine, ?user_id=5&username=..., ?type_id=..,
+// ?from=2026-11-01&till=2026-11-23 (the deadline span touches these days), ?closed_from=..&closed_till=..
 const queryUserIds = [route.query.user_id].flat().filter(Boolean).map((id) => Number(id));
 
-const initialFilters: TaskFilters = {
+const initialFilters: ListFilters = {
     stages: [],
     assignedTo: [],
     createdBy: [],
@@ -242,11 +251,15 @@ const initialFilters: TaskFilters = {
     currentPage: route.query.page ? parseInt(route.query.page as string) : 1,
     // the nearest deadline first
     sortBy: {end_time: 1},
-    fromDate: "",
-    tillDate: "",
+    fromDate: queryText("from"),
+    tillDate: queryText("till"),
+    createdFrom: "",
+    createdTill: "",
+    closedFrom: queryText("closed_from"),
+    closedTill: queryText("closed_till"),
 };
 
-const filters = reactive<TaskFilters>({
+const filters = reactive<ListFilters>({
     ...initialFilters,
     ...(route.query.type_id && {taskType: {id: Number(route.query.type_id), name: route.query.type_name} as TaskType}),
     ...(queryUserIds.length && {assignedTo: queryUserIds.map((id) => ({id, username: queryUserIds.length === 1 ? route.query.username : ""}) as User)}),
@@ -326,7 +339,7 @@ function onNewTask() {
 /**
  * The page (list, board, calendar) adds its own part of the query and it is kept for the next loads
  * (a filter, a live update, a saved task): the calendar its dates, the board all open tasks, the list
- * its page. Before, a changed filter dropped it and the calendar showed the first 25 tasks of all.
+ * its page; `all: true` — every page of the result (allPages). Before, a changed filter dropped it and the calendar showed the first 25 tasks of all.
  */
 let viewQuery: Record<string, any> = {};
 
@@ -343,6 +356,14 @@ function fetchTasks(view?: Record<string, any>) {
         query.till_date = filters.tillDate;
     }
 
+    if (filters.createdFrom && filters.createdTill) {
+        query.created_from = filters.createdFrom;
+        query.created_till = filters.createdTill;
+    }
+
+    if (filters.closedFrom) query.closed_from = filters.closedFrom;
+    if (filters.closedTill) query.closed_till = filters.closedTill;
+
     if (filters.stages.length) {
         query.stage_ids = filters.stages.map((s) => s.id);
     }
@@ -353,10 +374,6 @@ function fetchTasks(view?: Record<string, any>) {
 
     if (filters.createdBy.length) {
         query.created_by = filters.createdBy.map((a) => a.id);
-    }
-
-    if (filters.stages.length) {
-        query.stage_ids = filters.stages.map((s) => s.id);
     }
 
     // without a status the API gives the open tasks
@@ -374,7 +391,28 @@ function fetchTasks(view?: Record<string, any>) {
         query.created_by = [currentUser.value.id];
     }
 
-    runTasks(tasksService.find({...query, ...viewQuery}).exec());
+    const {all, ...viewPart} = viewQuery;
+    runTasks(all ? allPages({...query, ...viewPart}) : tasksService.find({...query, ...viewPart}).exec());
+}
+
+/**
+ * The board and the calendar show every task of their view, not one page: pages of 500 one after
+ * another (up to 5000 tasks; past that the board says it shows a part).
+ */
+const PAGE = 500;
+const MAX_TASKS = 5000;
+let loadRun = 0;
+
+async function allPages(query: Record<string, any>): Promise<PaginatedResponse<Task>> {
+    const run = ++loadRun;
+    const first = await tasksService.find<PaginatedResponse<Task>>({...query, skip: 0, limit: PAGE}).exec();
+    const data = [...first.data];
+    while (data.length < first.count && data.length < MAX_TASKS && run === loadRun) {
+        const next = await tasksService.find<PaginatedResponse<Task>>({...query, skip: data.length, limit: PAGE}).exec();
+        if (!next.data.length) break;
+        data.push(...next.data);
+    }
+    return {...first, data, page_size: data.length, current_page: 1, last_page: 1};
 }
 
 watch(filters, () => fetchTasks());
@@ -382,10 +420,14 @@ watch(scope, () => fetchTasks());
 // live: tasks created / closed by others (and by triggers) show up by themselves
 useLive((changes) => { if (liveTouches(changes, "tasks")) fetchTasks(); });
 
-onMounted(() => {
+function loadTaskTypes() {
     runTaskTypes(taskTypeService.find().exec()).then(() => {
         taskTypes.value.unshift(allTaskTypes);
     });
+}
+
+onMounted(() => {
+    loadTaskTypes();
     runStages(stageService.find().exec());
     runUsers(staffUsers());
 

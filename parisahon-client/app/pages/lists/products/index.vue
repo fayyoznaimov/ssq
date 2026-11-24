@@ -2,7 +2,7 @@
     <div class="flex flex-col gap-8">
         <div>
             <h1 class="text-xl">Товары</h1>
-            <h2 class="text-sm text-gray-500">Список товаров</h2>
+            <h2 class="text-sm text-gray-500">Всего: {{ formatNumber(products.count ?? 0, 0, '0') }}</h2>
         </div>
         <div class="flex flex-wrap gap-5 justify-between">
             <div class="flex items-center gap-4">
@@ -74,6 +74,7 @@ import DateSelect from '~/components/common/DateSelect.vue';
 import PerPageSelect from '~/components/common/PerPageSelect.vue';
 import {type Column} from '~/components/common/types';
 import { useAsync } from '~/composables/useAsync';
+import { formatNumber } from '~/utils/format';
 import type { Filler } from '~/types/filler';
 import {type PaginatedResponse} from '~/types/generics';
 import type { Product } from '~/types/product';

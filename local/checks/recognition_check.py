@@ -234,7 +234,9 @@ run().then((r) => console.log(r));
     status, again = call("POST", "/companies", {"name": f"Audit Textile Test {STAMP} bis", "is_old": False, "fillers": required_fillers("company"), "inn": "305 123 456"}, A)
     if isinstance(again, dict) and again.get("id"):
         created_companies.append(again["id"])
-    check("second company with the same ИНН -> 400", status == 400 and "ИНН" in str(again), f"{status} {again}")
+    # SALE-11/DB-5: a duplicate name, ИНН or contact e-mail is a conflict (409) with the existing company named
+    check("second company with the same ИНН -> 409 naming the existing one",
+          status == 409 and "ИНН" in str(again) and (not dup_id or f"№{dup_id}" in str(again)), f"{status} {again}")
 
     phone_sql = ("role = 'ctr_agent' and deleted_at is null "
                  "and right(regexp_replace(coalesce(phone, ''), '[^0-9]', '', 'g'), 9) = '901234567'")

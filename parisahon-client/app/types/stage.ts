@@ -16,16 +16,37 @@ export type Stage = {
     collection_id?: number;
     // GET /stages: a closing stage («успешно реализовано», «закрыто и не реализовано»)
     is_closing?: boolean;
+    // what the stage means (the name is only its label): a system stage of every pipeline or `work`
+    kind?: StageKind;
+    // a system stage: cannot be deleted (can be renamed)
+    is_system?: boolean;
 }
+
+export type StageKind = 'new' | 'first_contact' | 'prepayment' | 'won' | 'lost' | 'work';
+
+/** What a system stage does, for the hint in «Настроить воронку» */
+export const stageKindHints: Record<StageKind, string> = {
+    new: 'Системный этап: сюда попадают новые сделки из Telegram, WhatsApp, звонков и почты, если этап для новых сделок не подходит',
+    first_contact: 'Системный этап «первичный контакт»',
+    prepayment: 'Системный этап «предоплата»',
+    won: 'Системный этап: закрывает сделку как успешную — она идёт в план/факт, аналитику и LTV',
+    lost: 'Системный этап: закрывает сделку как нереализованную',
+    work: '',
+};
 
 export type DealFilter = {
     label: string;
     is_filler: boolean;
+    // a column (agent_id, budget, label), `source` (the channel the deal came from) or a custom field
     field: string;
     value: string;
     // a custom field: its id (the API fills it in; the name may change)
     filler_id?: number;
+    // how a condition compares (not set: equal)
+    op?: FilterOp;
 }
+
+export type FilterOp = 'eq' | 'ne' | 'gt' | 'lt' | 'contains';
 
 export enum TriggerType {
     CreateTask = 0,
@@ -35,6 +56,8 @@ export enum TriggerType {
     ChangeAgent = 4,
     ChangeFields = 5,
     DeleteFiles = 6,
+    MoveStage = 7,
+    Notify = 8,
 }
 
 export enum ApplyWhenType {
@@ -48,6 +71,8 @@ export enum ApplyWhenType {
     EmailReceived = 'email_received',
     WaMessageReceived = 'wa_message_received',
     CallRecorded = 'call_recorded',
+    // the client waits for an answer N working minutes
+    NoReply = 'no_reply',
 }
 
 // how often a trigger may act for one deal (not set: the API's default for the action)
@@ -64,6 +89,7 @@ export type ApplyWhen = (
 |  {when: `${ApplyWhenType.EmailReceived}`, outgoing?: boolean, from_user_id?: number}
 |  {when: `${ApplyWhenType.WaMessageReceived}`, outgoing?: boolean, from_user_id?: number}
 |  {when: `${ApplyWhenType.CallRecorded}`, outgoing?: boolean, from_user_id?: number}
+|  {when: `${ApplyWhenType.NoReply}`, after_minutes: number}
 ) & ApplyWhenRepeat
 
 export type BaseTrigger = {
@@ -82,11 +108,17 @@ export type BaseStageTrigger = {
     deal_filters: DealFilter[];
     is_delayed: boolean;
     is_recurring: boolean;
-    status?: string; 
+    status?: string;
+    // what the trigger names and is gone (GET /stages/:id/triggers): it cannot work
+    problems?: string[];
 }
 
 export type ChangeAgentData = {
-    agent_id: number;
+    agent_id?: number;
+    // «по очереди»: each deal goes to the next of these employees (раздача заявок)
+    rotate_user_ids?: number[];
+    // the open tasks of the previous responsible go to the new one (not set = yes)
+    transfer_tasks?: boolean;
 }
 
 export type CreateTaskData = {
@@ -131,11 +163,28 @@ export type SendEmailData = {
     send_to_user_id?: number | null;
     template_id: number;
     from: 'currently_assigned' | 'creator';
+    // true: from the shared mailbox even when the sender has a mailbox of their own
+    shared_mailbox?: boolean;
+    // the deal's files of these types go with the letter (["pdf"]: the КП uploaded to the deal)
+    attach_extensions?: string[];
 }
 
 export type CreateDealData = {
     stage_id?: number;
     label?: string;
+    // the copy takes the custom fields and the products too (not set = yes)
+    copy_fields?: boolean;
+    copy_products?: boolean;
+}
+
+export type MoveStageData = {
+    stage_id?: number;
+}
+
+export type NotifyData = {
+    text: string;
+    to?: 'responsible' | 'managers' | 'both';
+    user_id?: number | null;
 }
 
 export type TaskTrigger = { type: TriggerType.CreateTask; create_task_data: CreateTaskData }
@@ -145,6 +194,8 @@ export type CloseTasksTrigger = { type: TriggerType.CloseTasks, close_tasks_data
 export type DeleteFilesTrigger = { type: TriggerType.DeleteFiles, delete_files_data: DeleteFilesData }
 export type SendEmailTrigger = { type: TriggerType.SendEmail, send_email_data: SendEmailData }
 export type CreateDealTrigger = { type: TriggerType.CreateDeal, create_deal_data: CreateDealData }
+export type MoveStageTrigger = { type: TriggerType.MoveStage, move_stage_data: MoveStageData }
+export type NotifyTrigger = { type: TriggerType.Notify, notify_data: NotifyData }
 
 export type StageTaskTrigger = { type: TriggerType.CreateTask; data: CreateTaskData }
 export type StageChangeAgentTrigger = { type: TriggerType.ChangeAgent, data: ChangeAgentData }
@@ -153,6 +204,8 @@ export type StageCloseTasksTrigger = { type: TriggerType.CloseTasks, data: Close
 export type StageDeleteFilesTrigger = { type: TriggerType.DeleteFiles, data: DeleteFilesData }
 export type StageSendEmailTrigger = { type: TriggerType.SendEmail, data: SendEmailData }
 export type StageCreateDealTrigger = { type: TriggerType.CreateDeal, data: CreateDealData }
+export type StageMoveStageTrigger = { type: TriggerType.MoveStage, data: MoveStageData }
+export type StageNotifyTrigger = { type: TriggerType.Notify, data: NotifyData }
 
 export type Triggers = 
 |  ChangeAgentTrigger
@@ -162,6 +215,8 @@ export type Triggers =
 |  DeleteFilesTrigger
 |  SendEmailTrigger
 |  CreateDealTrigger
+|  MoveStageTrigger
+|  NotifyTrigger
 
 export type Trigger = BaseTrigger & Triggers;
 
@@ -173,5 +228,7 @@ export type StageTriggers =
 |  StageDeleteFilesTrigger
 |  StageSendEmailTrigger
 |  StageCreateDealTrigger
+|  StageMoveStageTrigger
+|  StageNotifyTrigger
 
 export type StageTrigger = BaseStageTrigger & StageTriggers;

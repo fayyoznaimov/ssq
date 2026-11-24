@@ -12,6 +12,7 @@ import { createWaSocket } from './wa-socket.js'
 import { PhotoCache } from './photos.js'
 import { InboxJournal, SentStore, SessionMarks } from './stores.js'
 import { removeFiles } from './media.js'
+import { findFfmpeg } from './converter.js'
 
 const config = loadConfig()
 const logger = createLogger({ level: config.logLevel, bindings: {} })
@@ -29,9 +30,16 @@ if (!config.crmApiToken) logger.warn('CRM_API_TOKEN is not set: every request ex
 
 await ensurePrivateDir(config.sessionsDir)
 await fs.mkdir(config.uploadsDir, { recursive: true })
-if (config.ffmpegBin) {
-  // Baileys runs "ffmpeg" for video thumbnails: the static one is found through PATH
-  process.env.PATH = `${path.dirname(config.ffmpegBin)}${path.delimiter}${process.env.PATH || ''}`
+// one ffmpeg for voice notes (-> mp3) and video thumbnails: FFMPEG_BIN, else "ffmpeg" from PATH (HACK-10)
+const ffmpeg = await findFfmpeg(config.ffmpegBin)
+config.ffmpegBin = ffmpeg.bin
+config.ffmpegOk = ffmpeg.ok
+if (ffmpeg.ok) {
+  logger.info(`ffmpeg: ${ffmpeg.bin}`)
+  // Baileys runs "ffmpeg" for video thumbnails: the chosen one is found first through PATH
+  process.env.PATH = `${path.dirname(ffmpeg.bin)}${path.delimiter}${process.env.PATH || ''}`
+} else {
+  logger.error(`ffmpeg not found (${ffmpeg.tried.join('; ')}): voice messages stay .ogg, no video thumbnails; set FFMPEG_BIN`)
 }
 
 const client = new CrmClient({ baseUrl: config.crmApiUrl, token: config.crmApiToken, timeoutMs: config.crmApiTimeoutMs })

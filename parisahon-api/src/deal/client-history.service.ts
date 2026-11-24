@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Access } from '../auth/access';
 import { Deal } from './deal.entity';
+import { isWonStage } from '../deal_stage/stage-kind';
 
 /** Deals of the same client: any of the deal's contacts, or its company (also through the contacts' company). */
 export const CLIENT_DEALS_SQL = `(
@@ -28,9 +29,9 @@ export const CONTACT_DEALS_SQL = `EXISTS (SELECT 1 FROM deal_user du WHERE du."d
 export class ClientHistoryService {
   constructor(@InjectRepository(Deal) private deals: Repository<Deal>) {}
 
-  /** closed in the successful stage (DEAL_STAGE_CLOSED, "УСПЕШНО РЕАЛИЗОВАНО"), like the goals and analytics count it */
+  /** closed in the stage of kind won («успешно реализовано»), like the goals and analytics count it */
   static isWon(deal: Deal): boolean {
-    return !!deal.closed_at && !!deal.stage?.name && deal.stage.name === process.env.DEAL_STAGE_CLOSED;
+    return !!deal.closed_at && isWonStage(deal.stage);
   }
 
   private static summary(d: Deal) {

@@ -189,6 +189,8 @@ export class SessionManager {
       states,
       problems,
       inbox: this.journal?.size ?? 0,
+      // false: no working ffmpeg (voice messages stay .ogg); null: not checked (tests)
+      ffmpeg: this.config?.ffmpegOk ?? null,
     }
   }
 
@@ -756,7 +758,11 @@ export class SessionManager {
   async send({ userId, toPhone, toWaId, text, files }, ctx = {}) {
     const s = this.sessions.get(userId)
     if (!s || s.status !== 'connected' || !s.sock) {
-      throw new ServiceError(400, 'not connected', 'Ваш WhatsApp не подключён (Профиль → WhatsApp)')
+      // the manager reads this under the deal's composer: what happened and where to fix it (the text stays there)
+      const linked = s?.status === 'starting' && s.linked?.()
+      throw new ServiceError(400, 'not connected', linked
+        ? 'Ваш WhatsApp сейчас переподключается: сообщение не отправлено, попробуйте через минуту (раздел «WhatsApp»)'
+        : 'Ваш WhatsApp не подключён к CRM: подключите его в разделе «WhatsApp» и отправьте ещё раз')
     }
     const sock = s.sock
     const list = Array.isArray(files) ? files : []

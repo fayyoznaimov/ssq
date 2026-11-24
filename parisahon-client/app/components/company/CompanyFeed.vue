@@ -1,7 +1,7 @@
 <template>
     <section
-        class="col-span-12 lg:col-span-8 flex flex-col relative"
-        :class="isNew ? 'mb-6 lg:mb-0' : 'min-h-[60vh]'"
+        class="col-span-12 lg:col-span-8 flex flex-col relative min-w-0"
+        :class="isNew ? 'mb-6 lg:mb-0' : 'lg:h-full lg:min-h-0'"
     >
         <!-- a company that is not saved yet has no feed and no one to write to -->
         <div
@@ -12,6 +12,7 @@
         </div>
         <EventsList
             v-if="!isNew"
+            v-model:filters="historyFilters"
             :events="events"
             :events-loading="eventsLoading"
             :intersected="onIntersect"
@@ -19,7 +20,7 @@
         />
         <div
             v-if="!isNew"
-            class="mb-8 my-4 space-y-2"
+            class="shrink-0 mb-8 mt-3 space-y-2 lg:mb-2"
         >
             <form
                 id="compose-form"
@@ -58,6 +59,12 @@
                     dropdown
                 />
             </form>
+            <QuickNote
+                v-if="messageType.id === 'note'"
+                target="companies"
+                :id="company.id"
+                @saved="onNoteSaved"
+            />
             <EmailReplyForm
                 v-if="messageType.id === 'email'"
                 :reply-options="reply?.emails"
@@ -106,7 +113,10 @@
 
 <script lang="ts" setup>
 import EventSchedulerSingle from "~/components/common/EventSchedulerSingle.vue";
+import { confirmTaskPlan } from "~/components/task/taskPlan";
 import EventsList from "~/components/common/EventsList.vue";
+import QuickNote from "~/components/common/QuickNote.vue";
+import { type HistoryFilters, emptyHistoryFilters, historyQuery } from "~/components/history/history";
 import EmailReplyForm from "~/components/mail/EmailReplyForm.vue";
 import { useAsync } from "~/composables/useAsync";
 import {
@@ -119,7 +129,7 @@ import {
 import type { Company, Group, User } from "~/types/user";
 
 // The right column of the company card: the events feed and the message composer
-// (a task, a Telegram message to a contact or an e-mail).
+// (a note, a task, a Telegram message to a contact or an e-mail).
 const props = defineProps<{
     company: Company;
 }>();
@@ -163,6 +173,12 @@ const taskMessageType = {
     label: "Задача",
 };
 
+// a note of the card, outside any deal: the first and the default (SCR2-4)
+const noteMessageType = {
+    id: "note",
+    label: "Заметка",
+};
+
 const limit = 25;
 const toast = useToast("GlobalToast");
 const companiesService = useService("companies", { auth: true });
@@ -170,7 +186,7 @@ const telegramService = useService("telegram", { auth: true });
 const taskService = useService("tasks", { auth: true });
 
 const eventsEnded = ref(false);
-const messageType = ref<typeof emailMessageType>(taskMessageType);
+const messageType = ref<typeof emailMessageType>(noteMessageType);
 const toEmail = ref("");
 const content = ref("");
 const commentRef = ref();
@@ -181,6 +197,7 @@ const {
     data: events,
     runAsync: runEventsAsync,
     isLoading: eventsLoading,
+    reset: resetEvents,
 } = useInfiniteQuery<{
     data: DealEvent[];
     count: number;
@@ -190,8 +207,12 @@ const {
 }>({ data: [], count: 0, page_size: 0, current_page: 0, last_page: 0 });
 const { runWithId } = useAsync();
 
-const end = new Date();
-const start = new Date().toISOString();
+// a new task is due tomorrow at 10:00, not the minute the page was opened (it went overdue at once)
+const tomorrow = new Date();
+tomorrow.setDate(tomorrow.getDate() + 1);
+tomorrow.setHours(10, 0, 0, 0);
+const start = tomorrow.toISOString();
+const end = new Date(tomorrow);
 end.setMinutes(end.getMinutes() + 30);
 const endStr = end.toISOString();
 const task = ref<Partial<Task>>({
@@ -217,6 +238,7 @@ async function fetchEvents() {
         },
         skip: currentPage * limit,
         limit,
+        ...historyQuery(historyFilters.value),
     };
 
     return await promiseResult(
@@ -233,7 +255,7 @@ useLive(async (changes) => {
     if (isNew.value || !liveTouches(changes, "events")) return;
     const result = await promiseResult(
         companiesService
-            .get(`${route.params.id as string}/events`, { sort: { id: -1 }, skip: 0, limit })
+            .get(`${route.params.id as string}/events`, { sort: { id: -1 }, skip: 0, limit, ...historyQuery(historyFilters.value) })
             .exec()
     );
     if (result.ok) mergeNewestEvents(events.value.pages, result.value.data, currentUser.value?.id);
@@ -245,10 +267,30 @@ async function onIntersect() {
     if (isNew.value || eventsEnded.value || eventsLoading.value) return;
     const result = await fetchEvents();
     if (!result.ok) return;
-    if (result.value.current_page >= result.value.last_page)
+    if (result.value.current_page >= result.value.last_page || !result.value.data?.length)
         eventsEnded.value = true;
     currentPage++;
 }
+
+// «Всё / Переписка / Звонки / Задачи / Изменения» and the search above the feed: the feed again from its newest page
+const historyFilters = ref<HistoryFilters>(emptyHistoryFilters());
+let reloadPending = false;
+function reloadEvents() {
+    if (isNew.value) return;
+    if (eventsLoading.value) {
+        reloadPending = true;
+        return;
+    }
+    reloadPending = false;
+    currentPage = 0;
+    eventsEnded.value = false;
+    resetEvents();
+    onIntersect();
+}
+watch(historyFilters, reloadEvents, { deep: true });
+watch(eventsLoading, (loading) => {
+    if (!loading && reloadPending) reloadEvents();
+});
 
 async function onEvent(e: Event) {
     const form = e.target as HTMLFormElement;
@@ -413,7 +455,7 @@ async function onTask(formData: FormData) {
     const event = NewTaskEvent(values);
     const latest = events.value.pages.length - 1;
     events.value.pages[latest].data.unshift(event);
-    const result = await promiseResult(taskService.create(values).exec());
+    const result = await promiseResult(confirmTaskPlan((flags) => taskService.create({...values, ...flags}).exec()));
 
     if (!result.ok) {
         toast.show({
@@ -483,8 +525,18 @@ const reply = computed(() => {
     return out;
 });
 
+/** A saved note: at once in the feed (the live update brings it to the others). */
+function onNoteSaved(event: DealEvent) {
+    if (!events.value.pages.length) {
+        events.value.pages.push({ data: [], count: 0, page_size: limit, current_page: 1, last_page: 1 });
+    }
+    const newest = events.value.pages[events.value.pages.length - 1];
+    newest.data.unshift(event);
+    newest.count = (newest.count ?? 0) + 1;
+}
+
 const messageTypes = computed(() => {
-    let out = [taskMessageType];
+    let out = [noteMessageType, taskMessageType];
     if (reply.value?.users.length) out.push(tgMessageType);
     if (reply.value?.emails.length) out.push(emailMessageType);
 

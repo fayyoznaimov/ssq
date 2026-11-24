@@ -100,7 +100,7 @@ export default defineAppConfig({
                                 subject: "Product-Analytics"
                             },
                             {
-                                name: "Список событий",
+                                name: "История событий",
                                 icon: {
                                     name: "ph:arrows-left-right",
                                     class: "w-5 h-5"
@@ -240,7 +240,7 @@ export default defineAppConfig({
                                 subject: "Group"
                             },
                             {
-                                name: "Транспортеры",
+                                name: "Почтовые ящики",
                                 icon: {
                                     name: "ph:envelope-simple",
                                     class: "w-5 h-5"

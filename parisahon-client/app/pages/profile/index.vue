@@ -8,7 +8,8 @@
             <!-- own name and phone (PATCH /users/me): the phone is needed to connect Telegram and goes into
                  the e-mail signature; role, group and e-mail stay with the administrator -->
             <form class="flex flex-col gap-4" @submit.prevent="saveProfile">
-                <div class="grid grid-cols-2 gap-4">
+                <!-- one column on a phone (the e-mail was cut to «admin@gmail.cc»), two from sm -->
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <BaseInput
                         v-model="profile.username"
                         label="Имя"
@@ -17,50 +18,39 @@
                         :error="profile.errors.username"
                         icon="ph:user"
                     />
-                    <BaseInput
-                        v-model="profile.phone"
-                        label="Телефон"
-                        name="phone"
-                        placeholder="пр.: +998901200000"
-                        :error="profile.errors.phone"
-                        type="text"
-                        icon="ph:phone"
-                    />
-                    <BaseInput
-                        v-model="user.email"
-                        label="Почта"
-                        name="email"
-                        placeholder="пр.: shoxrux@gmail.com"
-                        :error="errors.email"
-                        type="text"
-                        icon="ph:envelope-simple"
-                        readonly
-                    />
-                    <BaseSelect :error="errors.role" v-model="user.role" label="Роль" name="role" readonly>
-                        <option value="admin">
-                            Администратор
-                        </option>
-                        <option value="manager">
-                            Менеджер
-                        </option>
-                        <option value="agent">
-                            Агент
-                        </option>
-                        <option value="ctr_agent">
-                            Контр агент
-                        </option>
-                    </BaseSelect>
-                    <BaseSelect v-if="user.group" label="Группа*" name="groupId" v-model="user.group.id" :loading="groupsLoading" readonly>
-                        <option
-                            v-for="group in groups"
-                            :value="group.id"
-                            :key="group.id"
-                        >
-                            {{ group.name }}
-                        </option>
-                        <option v-if="!groups.length">Нет компаний</option>
-                    </BaseSelect>
+                    <div class="flex flex-col gap-1">
+                        <BaseInput
+                            v-model="profile.phone"
+                            label="Телефон"
+                            name="phone"
+                            placeholder="пр.: +998901200000"
+                            :error="profile.errors.phone"
+                            type="text"
+                            icon="ph:phone"
+                        />
+                        <p class="text-xs text-muted-500 dark:text-muted-400">
+                            На этот номер приходит код при подключении Telegram, его же подключают к WhatsApp.
+                        </p>
+                    </div>
                 </div>
+                <!-- what only the administrator changes: plain text, not fields that look editable -->
+                <dl class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-2 text-sm">
+                    <div class="flex flex-wrap gap-x-2 min-w-0">
+                        <dt class="text-muted-500 dark:text-muted-400">Почта (логин):</dt>
+                        <dd class="text-muted-800 dark:text-muted-100 break-all">{{ user.email || "—" }}</dd>
+                    </div>
+                    <div class="flex flex-wrap gap-x-2">
+                        <dt class="text-muted-500 dark:text-muted-400">Роль:</dt>
+                        <dd class="text-muted-800 dark:text-muted-100">{{ roleLabel }}</dd>
+                    </div>
+                    <div class="flex flex-wrap gap-x-2">
+                        <dt class="text-muted-500 dark:text-muted-400">Группа:</dt>
+                        <dd class="text-muted-800 dark:text-muted-100">{{ groupLabel }}</dd>
+                    </div>
+                    <p class="text-xs text-muted-500 dark:text-muted-400 sm:col-span-2">
+                        Почту, роль и группу меняет администратор.
+                    </p>
+                </dl>
                 <div class="flex items-center gap-3">
                     <BaseButton color="primary" type="submit" :loading="profile.busy" :disabled="!profileChanged">Сохранить</BaseButton>
                     <span v-if="profile.done" class="text-sm text-green-600">Сохранено.</span>
@@ -137,7 +127,7 @@
                 </template>
                 <template v-else>
                     <div class="flex flex-wrap items-center gap-3">
-                        <BaseButton color="primary" :loading="bot.busy" @click="linkBot">Подключить Telegram</BaseButton>
+                        <BaseButton color="primary" :loading="bot.busy" @click="linkBot">Подключить бота</BaseButton>
                         <a v-if="bot.link" :href="bot.link" target="_blank" class="text-sm text-sky-500 hover:underline break-all">{{ bot.link }}</a>
                     </div>
                     <p v-if="bot.link" class="text-sm text-gray-500">
@@ -284,6 +274,20 @@ onMounted(() => {
     loadBot();
 });
 
+
+// the read-only part of the card, as text
+const ROLE_LABELS: Record<string, string> = {
+    admin: "Администратор",
+    manager: "Менеджер",
+    agent: "Агент",
+    ctr_agent: "Контрагент",
+};
+const roleLabel = computed(() => ROLE_LABELS[String((user.value as any)?.role ?? "")] ?? "—");
+const groupLabel = computed(() => {
+    const group = (user.value as any)?.group;
+    if (!group) return "без группы";
+    return group.name ?? (groups.value as any[])?.find((g: any) => g.id === group.id)?.name ?? "—";
+});
 </script>
 
 <style>

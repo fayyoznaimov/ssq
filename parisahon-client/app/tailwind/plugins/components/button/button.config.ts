@@ -191,9 +191,9 @@ export const defaultConfig = {
                     },
                     dark: {
                         base: 'primary-500',
-                        hover: 'primary-400',
+                        hover: 'primary-600',
                         active: 'primary-500',
-                        focus: 'primary-400',
+                        focus: 'primary-600',
                     },
                 },
                 shadow: {
@@ -367,7 +367,7 @@ export const defaultConfig = {
             primary: {
                 text: {
                     light: 'primary-500',
-                    dark: 'primary-500',
+                    dark: 'primary-200',
                 },
                 background: {
                     light: {
@@ -593,9 +593,9 @@ export const defaultConfig = {
                     },
                     dark: {
                         base: 'primary-500',
-                        hover: 'white',
-                        active: 'white',
-                        focus: 'white',
+                        hover: 'primary-invert',
+                        active: 'primary-invert',
+                        focus: 'primary-invert',
                     },
                 },
                 background: {
@@ -608,7 +608,7 @@ export const defaultConfig = {
                     dark: {
                         base: 'transparent',
                         hover: 'primary-500',
-                        active: 'primary-400',
+                        active: 'primary-600',
                         focus: 'primary-500',
                     },
                 },

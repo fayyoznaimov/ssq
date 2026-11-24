@@ -9,6 +9,9 @@ definePageMeta({
 });
 
 useHead({
-    title: ''
+    title: 'Списки'
 });
+
+// the crumb «Списки» opened an empty page: the first list is the companies
+navigateTo('/lists/companies', { replace: true });
 </script>

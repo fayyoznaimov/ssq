@@ -55,6 +55,20 @@ export interface AccessSummary {
 
 const LEVEL_TO_SCOPE: Record<number, Scope> = { 0: 'none', 1: 'own', 2: 'group', 3: 'all' };
 
+/**
+ * «Стандартные права» of an employee with the role «Агент» (levels as user.permissions stores them): their own
+ * deals, companies and contacts — see, create and change; their own tasks — change; nothing to delete.
+ * A new employee gets them in the user card; an existing one by POST /auth/standard-rights/:id (the list
+ * «Пользователи» offers it to an agent whose card forbids everything). The web client keeps the same
+ * template (STANDARD_PERMISSIONS in utils/casl.ts).
+ */
+export const STANDARD_LEVELS = {
+  deal: { view: 1, create: 3, update: 1, delete: 0, export: 0 },
+  company: { view: 1, create: 3, update: 1, delete: 0, export: 0 },
+  contact: { view: 1, create: 3, update: 1, delete: 0, export: 0 },
+  task: { update: 1, delete: 0 },
+};
+
 let paramCounter = 0;
 
 export class Access {
@@ -136,13 +150,25 @@ export class Access {
     return this.allows(this.scope('deal', action), agentId, agentGroupId);
   }
 
-  /** May the user change a task assigned to `agentId` (group `groupId`) or created by `creatorId`? */
-  allowsTask(action: 'update' | 'delete', agentId: number | null, groupId: number | null, creatorId: number | null): boolean {
+  /**
+   * May the user change a task assigned to `agentId` (group `groupId`) or created by `creatorId`?
+   * "group": a task of the user's group, or one assigned to / created by a colleague of the group —
+   * `peopleGroups` are the groups of the assignee and of the author (as a deal goes by its responsible).
+   */
+  allowsTask(
+    action: 'update' | 'delete',
+    agentId: number | null,
+    groupId: number | null,
+    creatorId: number | null,
+    peopleGroups: (number | null | undefined)[] = [],
+  ): boolean {
     const scope = this.scope('task', action);
     if (scope === 'all') return true;
     if (scope === 'none') return false;
     if (agentId === this.id || creatorId === this.id) return true;
-    return scope === 'group' && groupId !== null && groupId === this.user.group_id;
+    const mine = this.user.group_id;
+    if (scope !== 'group' || mine === null || mine === undefined) return false;
+    return groupId === mine || peopleGroups.some((g) => g !== null && g !== undefined && Number(g) === mine);
   }
 
   private allows(scope: Scope, agentId: number | null, agentGroupId: number | null): boolean {
@@ -325,11 +351,16 @@ export class RecordAccessGuard implements CanActivate {
       }
       case 'task': {
         const row = (
-          await this.dataSource.query(`SELECT agent_id, group_id, "createdById" AS created_by FROM task WHERE id = $1`, [id])
+          await this.dataSource.query(
+            `SELECT t.agent_id, t.group_id, t."createdById" AS created_by, a.group_id AS agent_group, c.group_id AS creator_group
+             FROM task t LEFT JOIN "user" a ON a.id = t.agent_id LEFT JOIN "user" c ON c.id = t."createdById"
+             WHERE t.id = $1`,
+            [id],
+          )
         )[0];
         if (!row) throw new NotFoundException();
         const verb = action === 'delete' ? 'delete' : 'update';
-        if (!access.allowsTask(verb, row.agent_id, row.group_id, row.created_by)) {
+        if (!access.allowsTask(verb, row.agent_id, row.group_id, row.created_by, [row.agent_group, row.creator_group])) {
           throw new ForbiddenException('No right to change this task');
         }
         return true;

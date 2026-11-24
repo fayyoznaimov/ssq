@@ -11,7 +11,8 @@ export class EventBus {
                 indices.push(index);
             }
         });
-        for (let i = indices.length; i >= 0; i--) {
+        // from the last one (indices[indices.length] was undefined, and splice(undefined, 1) removed the first listener)
+        for (let i = indices.length - 1; i >= 0; i--) {
             this.listeners.splice(indices[i], 1);
         }
     }
@@ -25,7 +26,8 @@ export class EventBus {
     }
 
     emit(event: string | number, data: any) {
-        this.listeners.forEach((listener) => {
+        // a copy: a `once` listener removes itself while the list is walked
+        [...this.listeners].forEach((listener) => {
             if (listener.event === event) {
                 listener.callback(data);
                 if (listener.once) {

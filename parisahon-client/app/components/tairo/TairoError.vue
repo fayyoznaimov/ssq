@@ -20,10 +20,19 @@
                     <BaseButton
                         shape="curved"
                         class="mx-auto !h-12 w-full max-w-[160px] items-center gap-2"
+                        @click="reload"
+                    >
+                        <Icon name="feather:refresh-cw" class="h-3 w-3"/>
+                        Обновить
+                    </BaseButton>
+                    <BaseButton
+                        shape="curved"
+                        color="primary"
+                        class="mx-auto !h-12 w-full max-w-[160px] items-center gap-2"
                         @click="handleError"
                     >
                         <Icon name="feather:arrow-left"/>
-                        Back to home
+                        На главную
                     </BaseButton>
                     <DevOnly>
                         <BaseButton
@@ -88,13 +97,11 @@
                         </div>
                     </div>
 
-                    <!-- eslint-disable vue/no-v-html -->
+                    <!-- text, not markup: the stack carries the message, and the message may carry an address or a name -->
                     <div
                         v-if="props.error.stack"
                         class="mt-6 overflow-auto whitespace-pre p-2 font-mono text-sm opacity-60 transition-all duration-300 group-hover:opacity-100 group-focus:opacity-100"
-                        v-html="props.error.stack"
-                    ></div>
-                    <!-- eslint-enable vue/no-v-html -->
+                    >{{ props.error.stack }}</div>
                 </BaseCard>
             </div>
         </DevOnly>
@@ -106,30 +113,39 @@ const props = defineProps<{ error: any }>();
 
 const title = computed(() => {
     if (props.error?.statusCode === 401) {
-        return 'Not authorized';
+        return 'Нужно войти заново';
     }
 
     if (props.error?.statusCode === 404) {
-        return 'Page not found';
+        return 'Страница не найдена';
     }
 
-    return 'Oops... Something went wrong';
+    if (props.error?.statusCode === 403) {
+        return 'Недостаточно прав';
+    }
+
+    return 'Что-то пошло не так';
 });
 
 const description = computed(() => {
     if (props.error?.statusCode === 401) {
-        return 'You are not authorized to access this page.';
+        return 'Сессия истекла. Войдите в CRM ещё раз.';
     }
 
     if (props.error?.statusCode === 404) {
-        return 'We couldn\'t find the page you were looking for, please contact a system administrator or try again later.';
+        return 'Такой страницы нет: возможно, запись удалена или ссылка неполная.';
     }
 
-    return 'An error has occured. If the problem persists, please contact a system administrator or try again later.';
+    if (props.error?.statusCode === 403) {
+        return 'У вашей роли нет доступа к этой странице. Если он нужен, обратитесь к администратору.';
+    }
+
+    return 'Сервер не ответил или страница не загрузилась. Обновите страницу; если ошибка повторится, сообщите администратору.';
 });
 
 const handleError = () => clearError({redirect: '/'});
 const retry = () => clearError();
+const reload = () => window.location.reload();
 
 // Show/hide demo stack trace
 const showStackTrace = ref(true);

@@ -13,9 +13,17 @@ function getPageX(e: MouseEvent | TouchEvent) {
 
 let moveFn: (e: MouseEvent | TouchEvent) => void;
 
+// the narrowest a column can be dragged to
+const MIN_WIDTH = 48;
+
+/** the width of the column now: the one set by dragging, or the one it took from its content */
+function currentWidth() {
+    return parseInt(props.th.style.width, 10) || Math.round(props.th.getBoundingClientRect().width);
+}
+
 function onStart(e: MouseEvent | TouchEvent) {
     e.preventDefault();
-    const offsetStart = parseInt(props.th.style.width, 10) - getPageX(e);
+    const offsetStart = currentWidth() - getPageX(e);
 
     moveFn = (e) => onMove(e, offsetStart);
 
@@ -28,7 +36,7 @@ function onStart(e: MouseEvent | TouchEvent) {
 function onMove(e: MouseEvent | TouchEvent, offsetStart: number) {
     e.stopPropagation();
 
-    if (offsetStart + getPageX(e) >= parseInt(props.th.style.minWidth, 10)) {
+    if (offsetStart + getPageX(e) >= (parseInt(props.th.style.minWidth, 10) || MIN_WIDTH)) {
         const newWidth = offsetStart + getPageX(e);
         requestAnimationFrame(() => {
             props.th.style.width = `${newWidth}px`;
@@ -46,7 +54,9 @@ function onEnd(e: MouseEvent | TouchEvent) {
 
     let existing = JSON.parse(window.localStorage.getItem(props.localStorageKey) || null!);
     if (existing == null) existing = {};
-    existing[props.th.getAttribute('data-col-id')!] = parseInt(props.th.style.width, 10);
+    const width = parseInt(props.th.style.width, 10);
+    if (!width) return;
+    existing[props.th.getAttribute('data-col-id')!] = width;
     window.localStorage.setItem(props.localStorageKey, JSON.stringify(existing));
 }
 

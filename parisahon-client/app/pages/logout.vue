@@ -1,6 +1,6 @@
 <template>
     <div class="container">
-        {{ everywhere ? 'Выходим на всех устройствах…' : 'Bye bye' }}
+        {{ everywhere ? 'Выходим на всех устройствах…' : 'Выходим…' }}
     </div>
 </template>
 
@@ -27,6 +27,9 @@ if (!process.server) {
     if (everywhere && useLoggedIn()) {
         // a refused token ends the session inside useService() as well
         useService('auth', {auth: true}).post('logout', {}).exec().catch(() => undefined).finally(forget);
+    } else if (useLoggedIn()) {
+        // «Выход из CRM» in the journal of changes (POST /audit/logout); the token is forgotten anyway
+        useService('audit', {auth: true}).post('logout', {}).exec().catch(() => undefined).finally(forget);
     } else {
         forget();
     }

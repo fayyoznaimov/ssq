@@ -75,9 +75,10 @@ export class CallsUploadController {
 
   @Get('recorder')
   async recorder(@Req() req: Request) {
-    const user = await this.calls.userOfToken(String(req.headers['x-recorder-token'] ?? '').trim(), false);
-    if (!user) throw new UnauthorizedException();
-    return { user_id: user.id, username: user.username };
+    const recorder = await this.calls.recorderOfToken(String(req.headers['x-recorder-token'] ?? '').trim());
+    if (!recorder) throw new UnauthorizedException();
+    // tls_required: the FTP receiver lets this token in over FTPS only (set per token on the settings page)
+    return { user_id: recorder.user.id, username: recorder.user.username, tls_required: recorder.tls_required };
   }
 
   @Post('upload')

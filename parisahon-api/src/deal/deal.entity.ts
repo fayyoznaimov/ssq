@@ -10,6 +10,7 @@ import {
   ManyToMany,
   JoinTable,
   OneToMany,
+  Check,
 } from 'typeorm';
 import { User } from '../user/user.entity';
 import { DealStage } from '../deal_stage/deal_stage.entity';
@@ -20,6 +21,7 @@ import { Event } from '../events/event.entity';
 import { File } from '../file/file.entity';
 import { DealProduct } from './deal-product.entity';
 import { DealStageRecord } from 'src/deal_stage/deal_stage.records.entity';
+import { decimalText } from './decimal';
 
 @Index('IDX_deal_stage', ['stage'])
 @Index('IDX_deal_agent', ['agent'])
@@ -30,6 +32,7 @@ import { DealStageRecord } from 'src/deal_stage/deal_stage.records.entity';
 @Index('IDX_deal_closed', { synchronize: false })
 @Index('IDX_deal_open_stage', { synchronize: false })
 @Index('IDX_deal_created_by', { synchronize: false })
+@Check('CHK_deal_budget', `"budget" >= 0`)
 @Entity()
 export class Deal {
   @PrimaryGeneratedColumn()
@@ -42,7 +45,8 @@ export class Deal {
   @Column()
   display_id: number;
 
-  @Column({ type: 'bigint', nullable: true })
+  /** numeric(18,2), given as text without trailing zeros ("16500000", "1250.5"): decimal.ts */
+  @Column({ type: 'numeric', precision: 18, scale: 2, nullable: true, transformer: decimalText })
   budget: number;
 
   @OneToMany(() => DealFiller, (dealFiller) => dealFiller.deal, {
@@ -110,6 +114,13 @@ export class Deal {
 
   @Column({ type: 'timestamp', nullable: true, default: null })
   closed_at: Date;
+
+  /** Why the deal was lost (a reason of src/history/lost-reasons.ts) and the comment: PATCH /deals/:id/lost */
+  @Column({ type: 'varchar', length: 120, nullable: true, default: null })
+  lost_reason: string | null;
+
+  @Column({ type: 'text', nullable: true, default: null })
+  lost_comment: string | null;
 
   /**
    * Soft delete = the trash of deals (DealTrashService).

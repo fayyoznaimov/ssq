@@ -5,6 +5,11 @@ Repairs: starts a stopped CRM container; restarts the API after 3 failed checks 
 once in 30 minutes). Tells: a Telegram message from the CRM bot to every admin/manager who linked
 the bot, when something breaks (after 2 failed checks), once a day while it stays broken, and when it
 is fine again. Always: /root/crm2/ops/state/status.json (current state) and watchdog.log.
+
+Recipients (HACK-9): the chats read from the database, remembered in the state after every successful
+read, plus WATCHDOG_CHAT_IDS (comma separated Telegram chat ids, in the environment or in the API .env).
+So when the database is down the last known admins and the fixed ones are still told.
+WATCHDOG_OFFSITE_OPTIONAL=1: no alarm while no storage outside the server is connected.
 """
 import json, os, re, ssl, socket, subprocess, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
@@ -144,6 +149,24 @@ def env(key):
     return ""
 
 
+def setting(key):
+    """The watchdog's own switches: the process environment first, then the API .env."""
+    return (os.environ.get(key) or env(key) or "").strip()
+
+
+def recipients():
+    """Chat ids to tell: the database (remembered in the state), else the last known ones; plus WATCHDOG_CHAT_IDS."""
+    fixed = [c for c in re.split(r"[\s,;]+", setting("WATCHDOG_CHAT_IDS")) if re.fullmatch(r"-?\d+", c)]
+    code, out = run(["docker", "exec", "-i", "crm-db", "sh", "-c", 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At'], stdin=CHATS_SQL)
+    if code == 0:
+        from_db = [c for c in out.split() if re.fullmatch(r"-?\d+", c)]
+        state["chats"] = from_db
+    else:
+        from_db = [c for c in state.get("chats") or [] if re.fullmatch(r"-?\d+", str(c))]
+        log(f"database not readable for the recipients: the last known {len(from_db)} chat(s) and WATCHDOG_CHAT_IDS")
+    return list(dict.fromkeys([str(c) for c in from_db] + fixed))
+
+
 os.makedirs(STATE_DIR, exist_ok=True)
 try:
     state = json.load(open(STATE))
@@ -169,11 +192,13 @@ checks["db"] = (code == 0, "база данных не отвечает")
 code, _ = http(SITE + "/")
 checks["site"] = (code == 200, f"сайт CRM не открывается (код {code})")
 code, body = http(SITE + "/api/v1/health")
-api_ok = 200 <= code < 500 and not (code == 200 and '"db":false' in body.replace(" ", ""))
-checks["api"] = (api_ok, f"API не отвечает (код {code})")
+# alive = /health answers 200 and reaches the database (a 4xx from nginx or the API is not "alive")
+api_ok = code == 200 and '"db":false' not in body.replace(" ", "")
+checks["api"] = (api_ok, f"API не отвечает (код {code})" if code != 200 else "API не достаёт до базы данных")
 fails = 0 if api_ok else state.get("api_fails", 0) + 1
 state["api_fails"] = fails
-if fails >= 3 and now - state.get("api_restarted", 0) > 1800:
+# a restart does not help while the database itself is down (that has its own alarm)
+if fails >= 3 and checks["db"][0] and now - state.get("api_restarted", 0) > 1800:
     c2, _ = run(["docker", "restart", "crm2-app"], 120)
     state["api_restarted"] = now
     state["api_fails"] = 0
@@ -203,6 +228,9 @@ if wa is not None:
         if key.startswith("whatsapp:") and key not in checks:
             checks[key] = (True, "")
     outbox_checks("whatsapp", "WhatsApp", wa)
+    if "ffmpeg" in wa:
+        checks["whatsapp_ffmpeg"] = (wa.get("ffmpeg") is not False,
+                                     "служба WhatsApp не нашла ffmpeg: голосовые клиентов сохраняются в .ogg (FFMPEG_BIN в whatsapp.env)")
 
 # 5. Telegram: the state of every connected account (GET /health of the service: revoked = ended in
 #    Telegram itself, error = no connection); an older service without it: its start-failure log line
@@ -226,9 +254,13 @@ if tg is not None and "problems" in tg:
         if key.startswith("telegram:") and key not in checks:
             checks[key] = (True, "")
     outbox_checks("telegram", "Telegram", tg)
+    if "ffmpeg" in tg:
+        checks["telegram_ffmpeg"] = (tg.get("ffmpeg") is not False,
+                                     "служба Telegram не нашла ffmpeg: голосовые клиентов сохраняются в .ogg (FFMPEG_BIN в telegram.env)")
 else:
+    # an older service without the states in /health: its start-failure log lines (every kind of ended session)
     code, out = run(["docker", "logs", "--since", "11m", "crm2-telegram"])
-    dead = sorted(set(re.findall(r"\(user (\d+)\)[^\n]*AUTH_KEY_UNREGISTERED", out)), key=int)
+    dead = sorted(set(re.findall(r"\(user (\d+)\)[^\n]*(?:AUTH_KEY_UNREGISTERED|SESSION_REVOKED|USER_DEACTIVATED|AuthKeyUnregistered|SessionRevoked|UserDeactivated)", out)), key=int)
     checks["telegram"] = (
         not dead,
         "Telegram отключён у пользователей CRM № " + ", ".join(dead) + ": нужно войти заново (CRM → Телеграм → Подключить)",
@@ -250,8 +282,15 @@ try:
     age = (datetime.now(timezone.utc) - made).total_seconds() / 3600
     why = f" ({b.get('error')})" if b.get("error") else f" (последняя {age:.0f} ч назад)"
     checks["backup"] = (bool(b.get("ok")) and age < 26, "ночная копия базы не сделана" + why)
-    # a storage that is connected but did not take last night's copy; "not connected" is not an alarm
-    checks["offsite"] = (b.get("offsite") != "failed", "копия бэкапа вне сервера не удалась (подробности в backup.log)")
+    # a storage that did not take last night's copy; "not connected" too (every copy is on this same disk),
+    # unless WATCHDOG_OFFSITE_OPTIONAL=1
+    offsite = b.get("offsite")
+    if offsite == "failed":
+        checks["offsite"] = (False, "копия бэкапа вне сервера не удалась (подробности в backup.log)")
+    elif offsite in (None, "", "not connected", "none") and setting("WATCHDOG_OFFSITE_OPTIONAL") != "1":
+        checks["offsite"] = (False, "внешнее хранилище для бэкапов не подключено: все копии базы лежат на этом же сервере (ops/offsite.sh)")
+    else:
+        checks["offsite"] = (True, "")
 except Exception:
     checks["backup"] = (False, "ночная копия базы ещё ни разу не сделана")
 
@@ -314,13 +353,14 @@ with open(STATUS, "w", encoding="utf-8") as f:
         indent=1,
     )
 
+# read every run, so the list kept in the state is fresh when the database goes down
+chats = recipients()
 if messages:
     text = "CRM, сторож сервера:\n" + "\n".join(messages)
     log(text.replace("\n", " | "))
     token = env("CRM_BOT_TOKEN")
-    chats = [c for c in psql(CHATS_SQL).split() if re.fullmatch(r"-?\d+", c)]
     if not token or not chats:
-        log("nobody to tell: no admin has linked the CRM bot")
+        log("nobody to tell: no admin has linked the CRM bot and WATCHDOG_CHAT_IDS is empty")
     for chat in chats:
         data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
         try:

@@ -39,4 +39,8 @@ export class RecorderToken {
 
   @Column({ type: 'timestamp', nullable: true, default: null })
   last_upload_at: Date;
+
+  // FTP logins with this token must use FTPS (explicit TLS); the FTP receiver refuses a plain one
+  @Column({ type: 'boolean', default: false })
+  tls_required: boolean;
 }

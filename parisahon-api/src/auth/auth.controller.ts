@@ -44,4 +44,18 @@ export class AuthController {
   async logoutUser(@Param('id', ParseIntPipe) id: number): Promise<void> {
     await this.authService.logoutEverywhere(id);
   }
+
+  /**
+   * «Выдать стандартные права» of the list «Пользователи»: the admin gives an agent the standard rights
+   * (own deals, companies, contacts and tasks), e.g. one whose card forbids everything and who sees nothing.
+   */
+  @Roles(AuthGuard.ADMIN_LEVEL)
+  @HttpCode(HttpStatus.OK)
+  @Post('standard-rights/:id')
+  giveStandardRights(
+    @Param('id', ParseIntPipe) id: number,
+    @Req() request: Request,
+  ): Promise<{ id: number; permissions: Record<string, any> }> {
+    return this.authService.giveStandardRights(id, request['user'].sub);
+  }
 }

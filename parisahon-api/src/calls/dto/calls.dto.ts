@@ -1,9 +1,14 @@
-import { IsIn, IsInt, IsOptional, IsString, Length, Max, Min } from 'class-validator';
+import { IsBoolean, IsIn, IsInt, IsOptional, IsString, Length, Max, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 
 export class IssueTokenDto {
   @IsInt()
   user_id: number;
+
+  // FTP logins with this token must use FTPS; not given — as the manager's previous token
+  @IsOptional()
+  @IsBoolean()
+  tls_required?: boolean;
 }
 
 /** Fields of the multipart POST /calls/upload (every value arrives as a string). */
@@ -40,6 +45,11 @@ export class RecordingsQueryDto {
   @IsInt()
   user_id?: number;
 
+  // in — incoming calls only, out — outgoing only
+  @IsOptional()
+  @IsIn(['in', 'out'])
+  direction?: 'in' | 'out';
+
   @IsOptional()
   @IsString()
   from?: string;
@@ -69,6 +79,11 @@ export class RecordingsQueryDto {
 
 /** A page of calls: the company card, a staff member's own list (GET /calls/companies/:id, /calls/staff/:id). */
 export class CallFeedQueryDto {
+  // in — incoming calls only, out — outgoing only
+  @IsOptional()
+  @IsIn(['in', 'out'])
+  direction?: 'in' | 'out';
+
   // YYYY-MM-DD, both days included
   @IsOptional()
   @IsString()
@@ -95,6 +110,20 @@ export class CallFeedQueryDto {
   @Min(1)
   @Max(200)
   limit?: number;
+}
+
+/** «Записи звонков» (GET /calls/list): a page of calls; user_id — whose (admin and manager; an agent sees their own). */
+export class CallListQueryDto extends CallFeedQueryDto {
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  user_id?: number;
+}
+
+/** Per token: FTP logins with it must use FTPS (PATCH /calls/tokens/:user_id). */
+export class TokenSettingsDto {
+  @IsBoolean()
+  tls_required: boolean;
 }
 
 export class QueueQueryDto {

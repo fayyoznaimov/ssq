@@ -69,7 +69,8 @@ export function messageKey(event: any): string | null {
         case DealEventType.NewCallRecording:
         case DealEventType.NewTelegramCall: {
             const path = event.after_state?.path;
-            return path ? `call:${path}` : null;
+            // without the signature of the link (it changes every hour): the same call is one row
+            return path ? `call:${String(path).split('?')[0]}` : null;
         }
         default:
             return null;
@@ -153,6 +154,8 @@ const FIELD_LABELS: Record<string, string> = {
     mfo: 'МФО',
     oked: 'ОКЭД',
     director: 'Директор',
+    // why a lost deal was lost (PATCH /deals/:id/lost, DEAL-11)
+    lost_reason: 'Причина проигрыша',
 };
 
 const FIELD_OF: Record<string, string> = {
@@ -175,15 +178,39 @@ export function fieldValue(field: string | null | undefined, value: unknown, lab
     if (field === 'is_old') return value === 'true' || value === true ? 'да' : value === 'false' || value === false ? 'нет' : String(value);
     if (field === 'budget' || field === 'price') {
         const number = Number(value);
+        // a budget of -1 is how the deal form stored «no budget»
+        if (field === 'budget' && number < 0) return 'не указан';
         if (Number.isFinite(number)) return number.toLocaleString('ru');
     }
     return String(value);
 }
 
+/**
+ * A stage chip: its colour as the background and a text that can be read on it (grey text on the
+ * yellow «ПРЕДОПЛАТА» was 1.7:1). Dark text on light colours, white on dark ones.
+ */
+export function stageStyle(color: string | null | undefined): Record<string, string> {
+    const hex = String(color ?? '').trim().replace(/^#/, '');
+    const full = hex.length === 3 ? hex.split('').map((c) => c + c).join('') : hex;
+    if (!/^[0-9a-f]{6}$/i.test(full)) return {};
+    const [r, g, b] = [0, 2, 4].map((i) => parseInt(full.slice(i, i + 2), 16) / 255)
+        .map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+    const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    return { 'background-color': `#${full}`, color: luminance > 0.2 ? '#1f2937' : '#ffffff' };
+}
+
+/** A note (comment) with nothing in it: no text, no files, no trace of removed files. */
+export function isEmptyNote(event: any): boolean {
+    if (event?.type !== DealEventType.NewComment) return false;
+    const data = event.after_state?.data ?? {};
+    return !String(data.comment ?? '').trim() && !(data.files?.length) && !(data.removed_files?.length) && event.id > 0;
+}
+
 /** How a file of a message is shown: played, seen or downloaded. */
 export function mediaKind(file: any): 'audio' | 'image' | 'video' | 'link' {
     const type = String(file?.type ?? '').toLowerCase();
-    const name = String(file?.path || file?.name || '').toLowerCase();
+    // a signed path ("a.ogg?e=…&s=…", FileLink of the API): the extension is before the "?"
+    const name = String(file?.path || file?.name || '').split('?')[0].toLowerCase();
     if (type === 'link' || file?.remote) return 'link';
     if (type === 'voice' || type === 'audio') return 'audio';
     if (type === 'photo') return 'image';

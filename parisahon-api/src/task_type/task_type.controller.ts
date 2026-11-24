@@ -7,6 +7,8 @@ import {
   ParseIntPipe,
   Patch,
   Post,
+  Query,
+  BadRequestException,
 } from '@nestjs/common';
 import { AuthGuard } from '../auth/auth.guard';
 import { Roles } from '../auth/decorator/roles.decorator';
@@ -45,9 +47,15 @@ export class TaskTypeController {
     return this.taskTypeService.update(id, data);
   }
 
+  // a type with tasks: 409 TASK_TYPE_IN_USE unless ?move_to=<type id> says where its tasks go
   @Roles(AuthGuard.ADMIN_LEVEL)
   @Delete(':id')
-  async delete(@Param('id', ParseIntPipe) id: number): Promise<void> {
-    return this.taskTypeService.delete(id);
+  async delete(
+    @Param('id', ParseIntPipe) id: number,
+    @Query('move_to') moveTo?: string,
+  ): Promise<{ moved: number; move_to: number | null }> {
+    const target = moveTo !== undefined && moveTo !== '' ? Number(moveTo) : null;
+    if (target !== null && !Number.isInteger(target)) throw new BadRequestException('move_to должен быть id типа задач');
+    return this.taskTypeService.delete(id, target);
   }
 }

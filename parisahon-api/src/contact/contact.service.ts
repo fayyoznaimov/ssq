@@ -326,17 +326,19 @@ export class ContactService {
     }
 
     if (data.phone) {
-      // "+998 90 111 00 03" finds "+998901110003": digits are compared
+      // "+998 90 111 00 03" finds "+998901110003" and "90 111 00 03": digits are compared, a whole number
+      // by its last 9 (helper/phone.ts phoneKey), as the duplicate checks and the q box do
       const digits = phoneDigits(data.phone);
       if (digits) {
-        queries.push(`regexp_replace(COALESCE(phone, ''), '[^0-9]', '', 'g') LIKE ${bind(`%${digits}%`)}`);
+        const tail = digits.length >= 9 ? digits.slice(-9) : digits;
+        queries.push(`regexp_replace(COALESCE(phone, ''), '[^0-9]', '', 'g') LIKE ${bind(`%${tail}%`)}`);
       } else {
         queries.push(`phone ILIKE ${bind(`%${data.phone}%`)}`);
       }
     }
 
     if (data.email) {
-      queries.push(`email ILIKE ${bind(`%${data.email}%`)}`);
+      queries.push(`email ILIKE ${bind(`%${String(data.email).trim()}%`)}`);
     }
 
     // one search box: the name, the e-mail or the phone (in any format; the last 9 digits are enough)

@@ -1,198 +1,156 @@
 <template>
-    <div>
-        <div class="border">
-            <ul class="grid grid-cols-6 p-3">
-                <li
-                    v-for="(title, index) in titles"
-                    class="col-span-1 text-[12px] font-semibold"
-                    :key="index"
-                >{{ title }}</li>
-            </ul>
-            <div
-                v-for="(p, actionKey) in ps"
-                class="grid grid-cols-6 p-2 border border-b-0"
+    <div class="flex flex-col gap-3">
+        <div class="flex flex-wrap items-center gap-2">
+            <span class="text-sm text-muted-500 dark:text-muted-400">Шаблон:</span>
+            <BaseButton
+                v-for="template in templates"
+                :key="template.key"
+                type="button"
+                size="sm"
+                :color="currentTemplate === template.key ? 'primary' : 'default'"
+                @click="applyTemplate(template.levels)"
             >
-                <div class="flex items-center col-span-1 col-start-1">
-                    <h5 class="text-sm font-semibold">
-                        {{ permissionMap[actionKey] }}
-                    </h5>
-                </div>
-                <!-- tasks have no levels to create or view: every employee sets them and sees their own, their
-                     group's and those of the deals, companies and contacts open to them (API: task/task-access.ts) -->
-                <div
-                    v-if="actionKey === 'task'"
-                    class="col-span-2 col-start-2 flex items-center pe-2 text-[12px] text-muted-500"
-                >
-                    Ставят все; видят свои, группы и по доступным сделкам и клиентам
-                </div>
-                <!-- "export" stays in the stored rights, but there is no export to allow or forbid -->
-                <template v-for="(value, key, index) in p" :key="key">
+                {{ template.label }}
+            </BaseButton>
+        </div>
+        <div class="rounded-md border border-muted-200 dark:border-muted-700 divide-y divide-muted-200 dark:divide-muted-700">
+            <div class="hidden md:grid grid-cols-5 gap-3 px-4 py-2 text-xs font-semibold text-muted-500 dark:text-muted-400">
+                <span>Раздел</span>
+                <span v-for="action in actions" :key="action.key">{{ action.label }}</span>
+            </div>
+            <div
+                v-for="entity in entities"
+                :key="entity.key"
+                class="grid grid-cols-2 md:grid-cols-5 gap-x-3 gap-y-2 px-4 py-3 md:items-center"
+            >
+                <h5 class="col-span-2 md:col-span-1 text-sm font-semibold text-muted-800 dark:text-muted-100">
+                    {{ entity.label }}
+                </h5>
+                <template v-for="action in actions" :key="action.key">
+                    <!-- tasks have no levels to see or set: every employee sets them and sees their own, their
+                         group's and those of the deals and clients open to them (API: task/task-access.ts) -->
                     <div
-                        v-if="key !== 'export'"
-                        :class="getStartCol(index, key)"
+                        v-if="entity.key === 'task' && (action.key === 'view' || action.key === 'create')"
+                        class="flex flex-col gap-1"
                     >
-                        <Level
-                            :level="value"
-                            :actionKey="actionKey"
-                            :permission="key"
-                            @update:value="updateValue(key, $event, actionKey)"
-                        />
+                        <span class="text-xs text-muted-500 dark:text-muted-400 md:hidden">{{ action.label }}</span>
+                        <span class="text-xs text-muted-500 dark:text-muted-400">
+                            {{ action.key === 'view' ? 'Свои, группы и по открытым сделкам и клиентам' : 'Да, у всех' }}
+                        </span>
                     </div>
-                </template>
-                <div class="flex flex-col gap-1 col-span-1 col-start-6">
-                    <p
-                        class="text-[12px] truncate"
-                        v-for="level in Object.values(levelsMap)"
+                    <BaseSelect
+                        v-else
+                        size="sm"
+                        :label="action.label"
+                        :name="`${entity.key}-${action.key}`"
+                        :classes="{label: 'md:sr-only'}"
+                        :model-value="level(entity.key, action.key)"
+                        @update:model-value="setLevel(entity.key, action.key, $event)"
                     >
-                        {{ level }}
-                    </p>
-                </div>
+                        <option
+                            v-for="option in optionsOf(action.key)"
+                            :key="option.value"
+                            :value="option.value"
+                        >
+                            {{ option.label }}
+                        </option>
+                    </BaseSelect>
+                </template>
             </div>
         </div>
+        <p class="text-xs text-muted-500 dark:text-muted-400">
+            «Свои» — сделки, где сотрудник ответственный; компании и контакты, которые он создал или которые связаны с
+            его сделками; задачи, которые он поставил или которые на нём. «Группы» — то же для всех сотрудников его
+            группы. «Все» — без ограничений. Изменить и удалить можно только то, что видно.
+        </p>
     </div>
 </template>
+
 <script lang="ts" setup>
-import Level from '~/components/common/Level.vue';
+import { STANDARD_PERMISSIONS } from '~/utils/casl';
+
+type Levels = Record<string, Record<string, number>>;
 
 const props = defineProps<{
-    permissions?: {
-        deal: {
-            create: number;
-            view: number;
-            update: number;
-            delete: number;
-            export: number;
-        },
-        contact: {
-            create: number;
-            view: number;
-            update: number;
-            delete: number;
-            export: number;
-        },
-        company: {
-            create: number;
-            view: number;
-            update: number;
-            delete: number;
-            export: number;
-        },
-        task: {
-            create: number;
-            view: number;
-            update: number;
-            delete: number;
-            export: number;
-        },
-    }
+    /** user.permissions: a level per section and action (0 nothing, 1 own, 2 group, 3 all; create: 0 or 3) */
+    permissions?: Levels | null;
 }>();
 
-const ps = ref({
-    deal: {
-        create: 0,
-        view: 0,
-        update: 0,
-        delete: 0,
-        export: 0,
-    },
-    contact: {
-        create: 0,
-        view: 0,
-        update: 0,
-        delete: 0,
-        export: 0,
-    },
-    company: {
-        create: 0,
-        view: 0,
-        update: 0,
-        delete: 0,
-        export: 0,
-    },
-    task: {
-        update: 0,
-        delete: 0,
-    },
-});
+const emit = defineEmits<{ 'update:permissions': [value: Levels] }>();
 
-const colOrders = {
-    create: 2,
-    view: 3,
-    update: 4,
-    delete: 5,
-};
-
-const permissionMap = {
-    deal: 'Сделки / Покупки',
-    contact: 'Контакты',
-    company: 'Компании',
-    task: 'Задачи',
-};
-
-function getStartCol(index, key) {
-    const startCol = colOrders[key] || 0;
-    return `col-span-1 col-start-${startCol} col-end-${startCol + 1}`;
-}
-
-const levelsMap = {
-    0: 'Запрещено',
-    1: 'Если ответственный',
-    2: 'Для группы',
-    3: 'Разрешено',
-};
-
-const titles = [
-    '',
-    'Создание',
-    'Просмотр',
-    'Правка',
-    'Удаление',
-    'Уровни доступа',
+const entities = [
+    {key: 'deal', label: 'Сделки'},
+    {key: 'company', label: 'Компании'},
+    {key: 'contact', label: 'Контакты'},
+    {key: 'task', label: 'Задачи'},
 ];
 
-const emit = defineEmits(['update:permissions']);
+const actions = [
+    {key: 'view', label: 'Просмотр'},
+    {key: 'create', label: 'Создание'},
+    {key: 'update', label: 'Правка'},
+    {key: 'delete', label: 'Удаление'},
+];
 
-function updateValue(key: any, value: number, actionKey: any) {
-    ps.value[actionKey][key] = value;
-    emit('update:permissions', ps.value);
+const scopeOptions = [
+    {value: 0, label: 'Нет'},
+    {value: 1, label: 'Свои'},
+    {value: 2, label: 'Группы'},
+    {value: 3, label: 'Все'},
+];
+
+// creating is either allowed or not: the API reads any level above 0 as «yes» (src/auth/access.ts)
+const createOptions = [
+    {value: 0, label: 'Нет'},
+    {value: 3, label: 'Да'},
+];
+
+function optionsOf(action: string) {
+    return action === 'create' ? createOptions : scopeOptions;
 }
 
-// Only the levels the matrix has: "mail" / "file" and a stray task.view of old cards stay out of it
-// (a stray key got its own selector on top of the task note)
-function copyLevels() {
-    if (!props.permissions) return;
-    const levels = ps.value as Record<string, Record<string, number>>;
-    for (const actionKey in levels) {
-        const stored = (props.permissions as any)[actionKey];
-        if (!stored || typeof stored !== 'object') continue;
-        for (const key in levels[actionKey]) {
-            if (typeof stored[key] === 'number') levels[actionKey][key] = stored[key];
-        }
+/** A whole set of levels: view and change at one level, creating allowed, deleting not. */
+function templateOf(scope: number): Levels {
+    const row = {view: scope, create: 3, update: scope, delete: 0, export: 0};
+    return {deal: {...row}, company: {...row}, contact: {...row}, task: {update: scope, delete: 0}};
+}
+
+const templates = [
+    {key: 'standard', label: 'Стандартные: свои записи', levels: STANDARD_PERMISSIONS as Levels},
+    {key: 'group', label: 'Записи группы', levels: templateOf(2)},
+    {key: 'all', label: 'Все записи', levels: templateOf(3)},
+];
+
+function level(entity: string, action: string): number {
+    const value = props.permissions?.[entity]?.[action];
+    if (typeof value !== 'number') return 0;
+    // creating: any level above 0 allows it, as the API reads it
+    return action === 'create' ? (value > 0 ? 3 : 0) : value;
+}
+
+function copy(): Levels {
+    return JSON.parse(JSON.stringify(props.permissions ?? {}));
+}
+
+function setLevel(entity: string, action: string, value: number | string) {
+    const next = copy();
+    next[entity] = {...(next[entity] ?? {}), [action]: Number(value)};
+    emit('update:permissions', next);
+}
+
+/** The levels of a template; the mail / file switches (outside the matrix) stay as they are. */
+function applyTemplate(levels: Levels) {
+    const next = copy();
+    for (const [entity, values] of Object.entries(levels)) {
+        next[entity] = {...(next[entity] ?? {}), ...values};
     }
+    emit('update:permissions', next);
 }
 
-onUpdated(copyLevels);
-
-onMounted(copyLevels);
-
+/** The template the current levels match, to mark its button. */
+const currentTemplate = computed(() => {
+    const matches = (levels: Levels) => Object.entries(levels).every(([entity, values]) =>
+        Object.entries(values).every(([action, value]) => action === 'export' || level(entity, action) === value));
+    return templates.find((template) => matches(template.levels))?.key ?? null;
+});
 </script>
-<style scoped>
-.col-start-1 {
-    grid-column-start: 1;
-}
-.col-start-2 {
-    grid-column-start: 2;
-}
-.col-start-3 {
-    grid-column-start: 3;
-}
-.col-start-4 {
-    grid-column-start: 4;
-}
-.col-start-5 {
-    grid-column-start: 5;
-}
-.col-start-6 {
-    grid-column-start: 6;
-}
-</style>

@@ -47,7 +47,7 @@
  * (and the contacts), every row a link to the deal. Used by the "Клиент" block of the
  * deal card, the "Сделки" tab of a company and of a contact.
  */
-import moment from 'moment';
+import { formatDateAs } from '~/utils/format';
 
 import Money from '~/components/common/Money.vue';
 
@@ -87,7 +87,8 @@ function contactsOf(deal: MiniDeal) {
     return deal.contacts ?? deal.ctr_agents ?? [];
 }
 
+// the one date format of the CRM (utils/format.ts): «21 нояб. 2026», with the time on hover
 function formatDate(value: string | null | undefined, format: string) {
-    return value ? moment(value).format(format) : '';
+    return formatDateAs(value, format, '');
 }
 </script>

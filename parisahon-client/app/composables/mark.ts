@@ -11,9 +11,12 @@ export function useNinjaMark(
     const classes = toRef(_classes);
     const search = toRef(_search);
 
+    // The result goes into v-html (BaseAutocompleteItem): every piece of the text is escaped, the marks are
+    // the only markup. A label is a name from a client (Telegram, WhatsApp) and may look like HTML.
     return computed(() => {
-        const txt = unref(text);
-        const srch = unref(search);
+        const raw = unref(text);
+        const txt = raw === null || raw === undefined ? '' : String(raw);
+        const srch = String(unref(search) ?? '').trim();
         if (!txt) {
             return '';
         }

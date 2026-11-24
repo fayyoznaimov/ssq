@@ -33,3 +33,28 @@ export class LinkLetterContactsDto {
   @IsInt({ each: true })
   user_ids: number[];
 }
+
+/** POST /emails/:id/link: «Привязать» — the letter into a deal and / or its sender to a contact. */
+export class LinkLetterDto {
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt({ message: 'Неверная сделка' })
+  @Min(1)
+  deal_id?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt({ message: 'Неверный контакт' })
+  @Min(1)
+  contact_id?: number;
+}
+
+/** PATCH /emails/read: «прочитано» for the user. */
+export class MarkReadDto {
+  @IsArray()
+  @ArrayMinSize(1, { message: 'Отметьте письма' })
+  @ArrayMaxSize(200)
+  @Type(() => Number)
+  @IsInt({ each: true })
+  ids: number[];
+}

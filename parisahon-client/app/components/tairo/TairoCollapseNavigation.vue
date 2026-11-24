@@ -49,12 +49,18 @@
                         :item="item"
                         @clicked="isOpen = true"
                     />
+                    <!-- the section of the open page is lit (also on its cards: /deals/35, /tasks/kanban) -->
                     <NuxtLink
                         v-else-if="item.to"
-                        :class="!isOpen ? 'px-1 justify-center' : 'px-4'"
+                        :class="[
+                            !isOpen ? 'px-1 justify-center' : 'px-4',
+                            isCurrent(item.to)
+                                ? 'nav-current bg-muted-100 !text-muted-800 font-semibold dark:bg-muted-700 dark:!text-white'
+                                : 'text-white dark:text-muted-300',
+                        ]"
                         :to="item.to"
-                        class="nui-focus text-white dark:text-muted-400/80 hover:bg-muted-100 dark:hover:bg-muted-700/60 hover:text-muted-600 dark:hover:text-muted-200 flex cursor-pointer items-center gap-4 rounded-lg py-3 transition-colors duration-300"
-                        exact-active-class="!text-muted-600 bg-muted-100 dark:bg-muted-700/60  dark:text-white"
+                        :aria-current="isCurrent(item.to) ? 'page' : undefined"
+                        class="nui-focus relative hover:bg-muted-100 dark:hover:bg-muted-700/60 hover:text-muted-700 dark:hover:text-white flex cursor-pointer items-center gap-4 rounded-lg py-3 transition-colors duration-300"
                     >
                         <Icon
                             :class="item.icon?.class"
@@ -87,7 +93,7 @@
                     <button
                         v-else
                         :class="!isOpen ? 'px-1 justify-center' : 'px-4'"
-                        class="nui-focus text-white dark:text-muted-400/80 hover:bg-muted-100 dark:hover:bg-muted-700/60 hover:text-muted-600 dark:hover:text-muted-200 flex w-full cursor-pointer items-center gap-4 rounded-lg py-3 transition-colors duration-300"
+                        class="nui-focus text-white dark:text-muted-300 hover:bg-muted-100 dark:hover:bg-muted-700/60 hover:text-muted-600 dark:hover:text-muted-200 flex w-full cursor-pointer items-center gap-4 rounded-lg py-3 transition-colors duration-300"
                         @click="item.click"
                     >
                         <Icon
@@ -118,6 +124,12 @@ const { notificationCount } = storeToRefs(commonStore);
 const { $socket } = useNuxtApp();
 const route = useRoute();
 
+/** the menu item of the open page: its own address or a page under it (/deals → /deals/35, /deals/trash) */
+function isCurrent(to: string) {
+    if (!to || to === '/') return route.path === '/';
+    return route.path === to || route.path.startsWith(to + '/');
+}
+
 // on("connect") without a handler registered `undefined` as a listener, and
 // socket.io threw "Cannot read properties of undefined (reading 'apply')"
 // every time the socket (re)connected after this component was mounted.
@@ -135,3 +147,19 @@ onUnmounted(() => {
     ($socket as any)?.off("notification", onNotification);
 });
 </script>
+
+<style>
+/* a bar at the left edge of the item of the open page */
+.nav-current::before {
+    content: '';
+    position: absolute;
+    inset-block: 0.5rem;
+    inset-inline-start: 0;
+    width: 3px;
+    border-radius: 9999px;
+    background: rgb(var(--color-primary-500));
+}
+.dark .nav-current::before {
+    background: rgb(var(--color-primary-200));
+}
+</style>

@@ -20,9 +20,9 @@
             ].filter(Boolean).join(' · ') }}
         </NuxtLink>
         <button @click="() => taskModal.open(task)" class="text-[15px] py-0.5 px-1.5 rounded-sm bg-primary-600/10 text-slate-900 block mt-1 dark:text-white dark:bg-primary-400" v-if="task">
-            <span>{{ task.allDay ? new Date(task.start).toLocaleDateString('ru') : new Date(task.start).toLocaleString('ru') }}</span>
+            <span>{{ taskWhen(task.start, task.allDay) }}</span>
             <span class="ml-2">для {{ task.agent?.username || task.group?.name }}</span>
-            <strong class="ml-2">{{ task.type?.name }} </strong>&nbsp;&minus;&nbsp;<span>{{ task.label }}</span>
+            <strong class="ml-2">{{ task.type?.name ?? 'Задача' }} </strong>&nbsp;&minus;&nbsp;<span>{{ task.label }}</span>
         </button>
         <form class="flex flex-col mt-2" id="task-result-form" @submit.prevent="onSave">
             <BaseInput label="Результат" name="result" required />
@@ -47,6 +47,8 @@
 <script lang="ts" setup>
 import Modal from '~/components/common/Modal.vue';
 import type { Task } from '~/types/deal';
+
+import { taskWhen } from './taskText';
 
 const props = defineProps<{ id: string; }>();
 const emit = defineEmits(['saved']);

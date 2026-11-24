@@ -1,9 +1,8 @@
 <script lang="ts" setup>
-import moment from 'moment';
-import DatePicker from '@vuepic/vue-datepicker';
 import BaseButton from '~/components/base/BaseButton.vue';
-import Money from '~/components/common/Money.vue';
+import PeriodPicker from '~/components/analytics/PeriodPicker.vue';
 import type { DealStats } from '~/types/stats';
+import { countOf, formatSum } from '~/utils/format';
 
 definePageMeta({
     authRoute: true,
@@ -27,205 +26,130 @@ enum By {
 }
 
 const route = useRoute();
-const status = ref(route.query.status || Status.Active);
-const by = ref(route.query.by || By.Budget);
+// all deals by default: the same numbers as «Сводный отчёт» for the same period
+const status = computed(() => Number(route.query.status) || Status.All);
+const by = computed(() => Number(route.query.by) || By.Budget);
 const analyticsService = useService('analytics/deals', {auth: true});
-const colorMode = useColorMode();
-// deals created in the period; by default all of them
-const ALL_TIME = [moment().set('year', 2020).startOf('year'), moment().set('year', 2100).endOf('year')];
-const dateRange = ref([ALL_TIME[0].format('YYYY-MM-DD'), ALL_TIME[1].format('YYYY-MM-DD')]);
-const presetDates = ref([
-    { label: 'За этот месяц', value: [moment().startOf('month'), moment().endOf('month')] },
-    { label: 'За прошлый месяц', value: [moment().subtract(1, 'month').startOf('month'), moment().subtract(1, 'month').endOf('month')] },
-    { label: 'За квартал', value: [moment().startOf('quarters'), moment().endOf('quarters')] },
-    { label: 'За этот год', value: [moment().startOf('year'), moment().endOf('year')] },
-    { label: 'За прошлый год', value: [moment().subtract(1, 'year').startOf('year'), moment().subtract(1, 'year').endOf('year')] },
-    { label: 'За все время', value: ALL_TIME },
-]);
+const { period, params: periodParams } = useReportPeriod('all');
 
-function format(dates: Date[]) {
-    const fromStr = moment(dates[0]).format('YYYY-MM-DD');
-    const toStr = moment(dates[1]).format('YYYY-MM-DD');
-    for (const preset of presetDates.value) {
-        if (preset.value[0].format('YYYY-MM-DD') === fromStr && preset.value[1].format('YYYY-MM-DD') === toStr) {
-            return preset.label;
-        }
-    }
-    return `${fromStr} - ${toStr}`;
-}
-const {data: deals, run: runDeals} = useAsync<DealStats>({
+const {data: deals, run: runDeals, isLoading} = useAsync<DealStats>({
     stages: [],
-    average_deal_duration_in_minutes: "0",
-    total_deal_count: "0",
+    average_deal_duration_in_minutes: null,
+    total_deal_count: 0,
+    total_deal_budget: 0,
+    closed_deal_count: 0,
 });
 
 function fetchStats() {
-    const query: Record<string, any> = {}
-    if (status.value === Status.Active) {
-        query.is_active = true
-    }
-    if (status.value === Status.Closed) {
-        query.is_active = false;
-    }
-    if (dateRange.value?.[0] && dateRange.value?.[1]) {
-        query.from_date = dateRange.value[0];
-        query.till_date = dateRange.value[1];
-    }
-    runDeals(analyticsService.find(query).exec())
+    const query: Record<string, any> = { ...periodParams.value };
+    if (status.value === Status.Active) query.is_active = true;
+    if (status.value === Status.Closed) query.is_active = false;
+    runDeals(analyticsService.find(query).exec());
 }
 
-const sortedStages = computed(() => deals.value.stages.sort((a, b) => a.order - b.order));
+const sortedStages = computed(() => [...deals.value.stages].sort((a, b) => a.order - b.order));
+
+// the share of a stage in the deals shown (the stages add up to the whole: a deal is in one stage)
 const totals = computed(() => {
     let budget = 0;
-    let duration = 0;
+    let count = 0;
     for (const stage of sortedStages.value) {
-        budget += Number(stage.total_deal_budget);
-        duration += Number(stage.average_time_in_stage);
+        budget += Number(stage.total_deal_budget) || 0;
+        count += Number(stage.deal_count) || 0;
     }
-
-    return {budget, duration}
+    return { budget, count };
 });
-
-function formatTime(minutes: string) {
-    const n = Number(minutes);
-    if (n >= 1440) return `${Math.round(n / 1440)}д.`
-    else return `${Math.round(n / 60)}ч.`
-}
 
 function getPercent(stage: DealStats['stages'][0]) {
-    let value = 0;
-    if (by.value === By.Budget) value = Math.floor(Number(stage.total_deal_budget) / totals.value.budget * 100);
-    if (by.value === By.Count) value =  Math.floor(Number(stage.deal_count) / Number(deals.value.total_deal_count) * 100);
-
-    return isNaN(value) ? 0 : value;
+    const part = by.value === By.Budget ? Number(stage.total_deal_budget) : Number(stage.deal_count);
+    const whole = by.value === By.Budget ? totals.value.budget : totals.value.count;
+    if (!whole || !part) return 0;
+    return Math.min(100, Math.round((part / whole) * 100));
 }
 
-const durationRangeMap = computed(() => {
-    const range: Record<number, [number, number]> = {}
-    let prevTime = 0;
-    for (let i = 0, len = sortedStages.value.length; i < len; i++) {
-        const currentStage = sortedStages.value[i];
-        const prevStage = sortedStages.value[i - 1];
-        let currentTime = Math.floor(Number(currentStage.average_time_in_stage || 0) / 1440);
-        if (!prevStage) {
-            range[currentStage.id] = [0, currentTime];
-            continue;
-        }
-        if (prevStage.average_time_in_stage) prevTime = Math.floor(Number(prevStage.average_time_in_stage) / 1440);
-        range[currentStage.id] = [prevTime, currentTime]
-    }
+/** Minutes as people say it: «45 мин», «5 ч», «2 д»; no data — a dash. */
+function formatTime(minutes: number | string | null | undefined) {
+    if (minutes === null || minutes === undefined || minutes === '') return '—';
+    const n = Number(minutes);
+    if (!Number.isFinite(n)) return '—';
+    if (n < 60) return `${Math.max(1, Math.round(n))} мин`;
+    if (n < 1440) return `${Math.round(n / 60)} ч`;
+    return `${Math.round(n / 1440)} д`;
+}
 
-    return range;
-});
+const statusLink = (value: Status) => ({ path: '/analytics/sales', query: { ...route.query, status: value } });
+const byLink = (value: By) => ({ path: '/analytics/sales', query: { ...route.query, by: value } });
 
-watchEffect(() => {
-    status.value = Number(route.query.status) || Status.Active;
-});
-
-watchEffect(() => {
-    by.value = Number(route.query.by) || By.Budget;
-});
-
-watch([status, dateRange], fetchStats);
+watch([status, period], fetchStats);
 onMounted(fetchStats);
 </script>
 <template>
-    <div class="flex flex-col gap-8">
-        <div class="flex flex-wrap items-center gap-4">
-            <h1 class="text-xl whitespace-nowrap">Анализ продаж</h1>
-            <div class="max-w-xs w-full shrink-0">
-                <DatePicker
-                    v-model="dateRange"
-                    :format="format"
-                    range
-                    text-input
-                    vertical
-                    :preset-dates="presetDates"
-                    auto-apply
-                    :enable-time-picker="false"
-                    model-type="yyyy-MM-dd"
-                    :teleport="true"
-                    :dark="colorMode.value === 'dark'"
-                >
-                    <template #dp-input="{ onInput, value, onBlur, onPaste }">
-                        <BaseInput :value="value" @input="onInput" @blur="onBlur" @paste="onPaste" placeholder="Сделки, созданные за все время" />
-                    </template>
-                </DatePicker>
+    <div class="flex flex-col gap-6">
+        <div class="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:gap-4">
+            <h1 class="text-xl">Анализ продаж</h1>
+            <PeriodPicker v-model="period" />
+        </div>
+        <div class="flex flex-wrap justify-between gap-3">
+            <div class="overflow-x-auto max-w-full">
+                <BaseButtonGroup class="whitespace-nowrap">
+                    <BaseButton color="default" :to="statusLink(Status.All)" :class="status === Status.All ? 'toggle-selected' : ''">
+                        <span>Все</span>
+                    </BaseButton>
+                    <BaseButton color="default" :to="statusLink(Status.Active)" :class="status === Status.Active ? 'toggle-selected' : ''">
+                        <span>Открытые</span>
+                    </BaseButton>
+                    <BaseButton color="default" :to="statusLink(Status.Closed)" :class="status === Status.Closed ? 'toggle-selected' : ''">
+                        <span>Закрытые</span>
+                    </BaseButton>
+                </BaseButtonGroup>
+            </div>
+            <div class="overflow-x-auto max-w-full">
+                <BaseButtonGroup class="whitespace-nowrap">
+                    <BaseButton color="default" :to="byLink(By.Budget)" :class="by === By.Budget ? 'toggle-selected' : ''">
+                        <span>По бюджету</span>
+                    </BaseButton>
+                    <BaseButton color="default" :to="byLink(By.Count)" :class="by === By.Count ? 'toggle-selected' : ''">
+                        <span>По количеству</span>
+                    </BaseButton>
+                </BaseButtonGroup>
             </div>
         </div>
-        <div class="flex justify-between">
-            <BaseButtonGroup>
-                <BaseButton color="default" :to="{path: '/analytics/sales', query: {...route.query, status: Status.All}}" 
-                    :class="status === Status.All ? '!bg-muted-200 dark:!bg-muted-600' : ''">
-                    <span>Все</span>
-                </BaseButton>
-                <BaseButton color="default" :to="{path: '/analytics/sales', query: {...route.query, status: Status.Active}}"  
-                    :class="status === Status.Active ? '!bg-muted-200 dark:!bg-muted-600' : ''">
-                    <span>Активные</span>
-                </BaseButton>
-                <BaseButton color="default" :to="{path: '/analytics/sales', query: {...route.query, status: Status.Closed}}" 
-                    :class="status === Status.Closed ? '!bg-muted-200 dark:!bg-muted-600' : ''">
-                    <span>Закрытые</span>
-                </BaseButton>
-            </BaseButtonGroup>
-            <BaseButtonGroup>
-                <BaseButton color="default" :to="{path: '/analytics/sales', query: {...route.query, by: By.Budget}}" 
-                    :class="by === By.Budget ? '!bg-muted-200 dark:!bg-muted-600' : ''">
-                    <span>По бюджету</span>
-                </BaseButton>
-                <BaseButton color="default" :to="{path: '/analytics/sales', query: {...route.query, by: By.Count}}"  
-                    :class="by === By.Count ? '!bg-muted-200 dark:!bg-muted-600' : ''">
-                    <span>По количеству</span>
-                </BaseButton>
-            </BaseButtonGroup>
+        <p class="text-sm text-muted-500 -mt-2">
+            Сделки активной воронки, созданные за период, — по этапу, на котором они сейчас (как в «Сводном отчёте»).
+            Всего: {{ countOf(totals.count, 'сделка', 'сделки', 'сделок') }}, {{ formatSum(totals.budget) }}.
+        </p>
+
+        <div class="hidden lg:flex items-center gap-4 px-4 text-xs uppercase text-muted-400 font-semibold">
+            <span class="w-64 shrink-0">Этап</span>
+            <span class="w-28 shrink-0 text-right" title="Сколько в среднем сделка была на этапе, прежде чем перейти дальше">Ср. время в этапе</span>
+            <span class="flex-1">Доля {{ by === By.Budget ? 'бюджета' : 'сделок' }}</span>
         </div>
-        <ul class="flex flex-col gap-4 px-4">
-            <li v-for="stage of sortedStages" :key="stage.id" class="flex items-end w-full border-b dark:border-muted-700">
-                <div class="relative flex-1">
-                    <div class="h-1 absolute bg-primary-400" :style="{
-                        width: (durationRangeMap[stage.id][1] - durationRangeMap[stage.id][0]) / totals.duration * 100 + '%',
-                        left: durationRangeMap[stage.id][0] / totals.duration * 100 + '%'
-                    }">
-                        <span 
-                            class="absolute bottom-1 text-sm text-muted-600 font-light dark:text-muted-200"
-                            :class="[getPercent(stage) > 0 && Math.floor(stage.average_time_in_stage / 1440) > 0 ? 'right-0' : 'left-0']"
-                        >{{ Math.floor(stage.average_time_in_stage / 1440) }}д.</span>
-                    </div>
+        <ul class="flex flex-col gap-4 lg:px-4" :class="isLoading ? 'opacity-60' : ''">
+            <li v-for="stage of sortedStages" :key="stage.id" class="flex flex-col gap-2 border-b pb-3 dark:border-muted-700 lg:flex-row lg:items-center lg:gap-4">
+                <div class="flex flex-col gap-0.5 text-sm text-muted-900 lg:w-64 lg:shrink-0 dark:text-white min-w-0">
+                    <span class="break-words">{{ stage.name }}</span>
+                    <p class="text-xs text-muted-600 dark:text-muted-200">
+                        <NuxtLink :to="{name: 'deals', query: {stage_id: stage.id, stage_name: stage.name}}" class="underline">{{ countOf(Number(stage.deal_count), 'сделка', 'сделки', 'сделок') }}</NuxtLink>
+                        · {{ formatSum(stage.total_deal_budget) }}
+                    </p>
                 </div>
-                <div class="flex items-start gap-4 flex-1">
-                    <div class="flex gap-3 justify-end w-full">
-                        <span class="text-lg font-light">{{getPercent(stage)}}%</span>
-                        <div class="h-8 relateve transition-[width] duration-500" :style="{width: getPercent(stage) + '%', 'background-color': stage.color || '#04574d'}">
-                            <span v-if="getPercent(stage) > 0" class="decoration" :style="{'--color': stage.color }"></span>
-                        </div>
+                <div class="text-sm text-muted-600 dark:text-muted-300 lg:w-28 lg:shrink-0 lg:text-right" :title="stage.stage_time_count ? `по ${stage.stage_time_count} переходам` : 'ни одна сделка ещё не ушла с этапа'">
+                    <span class="lg:hidden text-muted-400">Ср. время в этапе: </span>{{ formatTime(stage.average_time_in_stage) }}
+                </div>
+                <div class="flex items-center gap-3 flex-1 min-w-0">
+                    <div class="h-6 flex-1 rounded-sm bg-muted-100 dark:bg-muted-800 overflow-hidden">
+                        <div class="h-full transition-[width] duration-500" :style="{ width: getPercent(stage) + '%', 'background-color': stage.color || '#04574d' }"></div>
                     </div>
-                    <div class="flex flex-col gap-0.5 text-xs text-muted-900 max-w-xs w-full shrink-0 dark:text-white">
-                        {{ stage.name }}
-                        <p class="text-muted-600 dark:text-muted-200">
-                            <NuxtLink :to="{name: 'deals', query: {stage_id: stage.id, stage_name: stage.name}}" class="underline"> {{ stage.deal_count }} </NuxtLink> сделок <Money :value="stage.total_deal_budget" />
-                        </p>
-                    </div>
+                    <span class="w-12 shrink-0 text-right text-lg font-light">{{ getPercent(stage) }}%</span>
                 </div>
             </li>
         </ul>
-        <div>
-            <h2 class="text-6xl font-extralight text-muted-900 dark:text-white">{{ Math.floor(Number(deals.average_deal_duration_in_minutes) / 1440) }}д.</h2>
-            <span class="text-xl font-light mt-1">Средняя длительность сделки</span>
-        </div>
+        <p class="text-sm text-muted-700 dark:text-muted-200">
+            <template v-if="deals.closed_deal_count && deals.average_deal_duration_in_minutes !== null">
+                Средний цикл закрытой сделки: <b>{{ formatTime(deals.average_deal_duration_in_minutes) }}</b>
+                (по {{ countOf(deals.closed_deal_count, 'сделке', 'сделкам', 'сделкам') }})
+            </template>
+            <template v-else>Средний цикл сделки: нет закрытых сделок за этот период</template>
+        </p>
     </div>
 </template>
-
-<style scoped>
-.decoration {
-    --color: #04574d;
-    width: 0;
-    height: 0;
-    border-style: solid;
-    border-width: 0 10px 32px 0;
-    position: absolute;
-    left: -10px;
-    bottom: 0;
-    border-color: transparent var(--color, #04574d) transparent transparent;
-}
-
-</style>

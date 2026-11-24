@@ -129,8 +129,28 @@ def main():
         status, _ = http("PATCH", f"/groups/{g4}", {"name": f" {TAG}-g3 "}, admin)
         check("renaming a group to the name of another one -> 400, the name stays",
               status == 400 and psql(f"select name from \"group\" where id = {g4}") == f"{TAG}-g4", status)
+        print("== groups: the members (the group page «Участники», the column «Участников» of the list)")
+        status, _ = http("POST", f"/groups/{g4}/members/{A['id']}", {}, A["token"])
+        check("an agent cannot move people between groups -> 403", status == 403, status)
+        status, usage = http("POST", f"/groups/{g4}/members/{A['id']}", {}, admin)
+        check("admin adds an employee to a group -> 200 with the new counts, the account is in the group",
+              status == 200 and isinstance(usage, dict) and usage.get("users") == 1
+              and psql(f"select group_id from \"user\" where id = {A['id']}") == str(g4), (status, usage))
+        status, body = http("GET", "/groups", token=admin)
+        row = next((g for g in body if g.get("id") == g4), {}) if status == 200 and isinstance(body, list) else {}
+        check("GET /groups: users_count of every group (the staff that are not deleted)", row.get("users_count") == 1, row)
+        status, _ = http("POST", f"/groups/{g4}/members/999999999", {}, admin)
+        check("... a missing (or not a staff) account -> 404", status == 404, status)
+        status, usage = http("DELETE", f"/groups/{g4}/members/{A['id']}", token=admin)
+        check("admin takes the employee out of the group -> 200, the account has no group",
+              status == 200 and isinstance(usage, dict) and usage.get("users") == 0
+              and psql(f"select coalesce(group_id::text, 'none') from \"user\" where id = {A['id']}") == "none", (status, usage))
+        status, _ = http("DELETE", f"/groups/{g4}/members/{A['id']}", token=admin)
+        check("... once more: the employee is not in the group -> 404", status == 404, status)
         psql(f"update \"user\" set group_id = {g3} where id = {A['id']}")
-        task_id = psql(f"insert into task (label, start_time, end_time, group_id) values ('{TAG}-task', now(), now() + interval '1 hour', {g3}) returning id")
+        # every task has a type (HACK-13: task.type_id NOT NULL) - a test type of its own, removed in the cleanup
+        gtype = psql(f"insert into task_type (name) values ('{TAG}-gt') returning id").split()[0]
+        task_id = psql(f"insert into task (label, start_time, end_time, group_id, type_id) values ('{TAG}-task', now(), now() + interval '1 hour', {g3}, {gtype}) returning id").split()[0]
         status, usage = http("GET", f"/groups/{g3}/usage", token=admin)
         check("GET /groups/:id/usage: the staff and the open tasks of the group",
               status == 200 and isinstance(usage, dict) and usage.get("users") == 1 and usage.get("open_tasks") == 1, (status, usage))
@@ -169,6 +189,10 @@ def main():
         check("a company is found by a part of its name (Cyrillic)", status == 200 and found, (status, body if status != 200 else len(items(body))))
         status, _ = http("GET", "/linkables", token=admin)
         check("search without a name -> 400", status == 400, status)
+        psql(f"update company set deleted_at = now() where id = {cid}")
+        status, body = http("GET", f"/linkables?name={urllib.request.quote(TAG + ' Пои')}", token=admin)
+        found = [x for x in items(body) or [] if str(x.get("id")) == str(cid) and x.get("type") == "company"] if status == 200 else []
+        check("... a deleted company is not offered any more (ACL-10)", status == 200 and not found, (status, found))
         psql(f"delete from company where id = {cid}")
 
         print("== files, log, desktop")

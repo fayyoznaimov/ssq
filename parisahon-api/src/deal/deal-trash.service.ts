@@ -15,6 +15,7 @@ import { FileService } from '../file/file.service';
 import { File } from '../file/file.entity';
 import { PaginationResponseDto } from '../helper/dto/pagination.dto';
 import { SearchDealTrashDto } from './dto/search.deal.trash.dto';
+import { AuditJournal } from '../audit/audit-journal';
 
 /** What GET /deals/trash returns with every deal */
 const TrashRelations = ['stage', 'agent', 'company', 'deleted_by'];
@@ -115,20 +116,26 @@ export class DealTrashService {
         throw new NotFoundException(`Deal with id ${id} is not in the trash`);
       }
 
-      await manager.query(
-        `UPDATE deal SET deleted_at = NULL, deleted_by = NULL WHERE id = $1`,
-        [id],
-      );
+      // the journal (src/audit): «Восстановление» (and the stage it comes back to), who and when
+      await AuditJournal.around(manager, 'deal', 't.id = $1', [id], async () => {
+        await manager.query(
+          `UPDATE deal SET deleted_at = NULL, deleted_by = NULL WHERE id = $1`,
+          [id],
+        );
+
+        if (defaultStage) {
+          // the stage for new deals is a working one: the deal is open there
+          await manager.query(
+            `UPDATE deal SET stage_id = $2, last_stage_change = $3, closed_at = NULL WHERE id = $1`,
+            [id, defaultStage.id, new Date()],
+          );
+        }
+      });
 
       if (defaultStage) {
-        // the stage for new deals is a working one: the deal is open there
         await manager.query(
-          `UPDATE deal SET stage_id = $2, last_stage_change = $3, closed_at = NULL WHERE id = $1`,
-          [id, defaultStage.id, new Date()],
-        );
-        await manager.query(
-          `INSERT INTO deal_stage_record (deal_id, stage_id) VALUES ($1, $2)`,
-          [id, defaultStage.id],
+          `INSERT INTO deal_stage_record (deal_id, stage_id, moved_by) VALUES ($1, $2, $3)`,
+          [id, defaultStage.id, user.sub],
         );
       }
     });
@@ -249,7 +256,10 @@ export class DealTrashService {
 
       await this.dataSource.transaction(async (manager) => {
         await manager.query(`DELETE FROM deal_file WHERE "dealId" = $1`, [dealId]);
-        await manager.query(`DELETE FROM deal WHERE id = $1`, [dealId]);
+        // the journal (src/audit): «Удаление» for good, the last state of the deal stays in the journal
+        await AuditJournal.around(manager, 'deal', 't.id = $1', [dealId], () =>
+          manager.query(`DELETE FROM deal WHERE id = $1`, [dealId]),
+        );
       });
 
       return true;

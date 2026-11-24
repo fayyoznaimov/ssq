@@ -1,5 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { CallsService } from './calls.service';
+import { AuditJournal } from '../audit/audit-journal';
 
 /** Processes the queue of received call recordings every CALLS_SCHEDULER_SEC seconds (default 30; 0 = off). */
 @Injectable()
@@ -32,7 +33,8 @@ export class CallsScheduler implements OnModuleInit, OnModuleDestroy {
 
   async tick(): Promise<void> {
     try {
-      const result = await this.calls.processPending();
+      // the journal (src/audit): what the queue of recordings writes is the receiver's (source «FTP»)
+      const result = await AuditJournal.job('ftp', 'call-uploads', () => this.calls.processPending());
       if (result.done || result.failed) {
         this.logger.log(`call uploads: done ${result.done}, failed ${result.failed}`);
       }

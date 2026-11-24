@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the regression checks against the dev copy on the server.
 #   local/dev/check.sh            all five sets, one after another
-#   local/dev/check.sh auth bot   only these (schema auth smoke deals trash files recognition bot modules platform telegram whatsapp triggers analytics mail calls ftp live ui)
+#   local/dev/check.sh auth bot   only these (schema auth smoke deals history trash files recognition bot modules platform telegram whatsapp triggers analytics mail calls ftp live ui ai audit)
 #   local/dev/check.sh -v auth    extra flags go to the scripts
 #   local/dev/check.sh --changed  only the sets that cover files changed since the last green run
 set -uo pipefail
@@ -9,7 +9,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 # shellcheck disable=SC1091
 source "$HERE/env.sh"
-ALL=(schema auth smoke deals trash files recognition bot modules platform telegram whatsapp triggers analytics mail calls ftp live ui)
+ALL=(schema auth smoke deals history trash files recognition bot modules platform telegram whatsapp triggers analytics mail calls ftp live ui ai audit)
 STAMP="$HERE/.last-green"
 
 # Which sets cover a changed file (see the module map in CLAUDE.md)
@@ -17,11 +17,15 @@ sets_for() {
   case "$1" in
     local/checks/*_check.py) basename "$1" _check.py ;;
     parisahon-api/src/auth/*|parisahon-api/src/app.module.ts|parisahon-api/src/main.ts|parisahon-client/app/middleware/*|parisahon-client/app/utils/casl.ts) echo auth ;;
+    parisahon-api/src/history/*|parisahon-client/app/components/history/*) echo history deals ui ;;
     parisahon-api/src/deal/deal-trash*|parisahon-api/src/deal/deal-access.ts|parisahon-client/app/pages/deals/trash.vue|parisahon-api/src/helper/*) echo deals trash ;;
     parisahon-api/src/deal/*|parisahon-api/src/deal_stage/*|parisahon-client/app/pages/deals/*) echo deals trash ;;
     parisahon-api/src/file/*|parisahon-client/app/components/deal/files-tab.vue|parisahon-client/app/pages/lists/files/*|parisahon-client/app/utils/files.ts|parisahon-client/app/composables/useUpload.ts) echo files platform ;;
-    parisahon-api/src/events/*) echo deals telegram whatsapp ;;
-    parisahon-api/src/recognition/*|parisahon-client/app/components/company/CardRecognition*) echo recognition bot ;;
+    parisahon-api/src/events/*) echo deals history telegram whatsapp ;;
+    parisahon-api/src/ai/*|parisahon-api/src/ai/*/*|parisahon-client/app/components/ai/*|parisahon-client/app/composables/useDealAi.ts) echo ai ;;
+    parisahon-api/src/audit/*|parisahon-api/src/audit/*/*|parisahon-client/app/components/audit/*) echo audit ;;
+    local/fake-claude/*) echo recognition bot ai ;;
+    parisahon-api/src/recognition/*|parisahon-client/app/components/company/CardRecognition*) echo recognition bot ai ;;
     parisahon-api/src/bot/*|parisahon-client/app/pages/profile/*|parisahon-stt/*|local/fake-telegram/*) echo bot ;;
     parisahon-api/src/company/*|parisahon-api/src/contact/*|parisahon-api/src/user/*|parisahon-api/src/product/*|parisahon-api/src/filler/*|parisahon-api/src/task/*|parisahon-api/src/task_type/*|parisahon-api/src/desktop/*) echo modules ;;
     parisahon-client/app/pages/lists/*|parisahon-client/app/components/company/*|parisahon-client/app/stores/*|parisahon-client/app/pages/tasks*|parisahon-client/app/pages/index.vue) echo modules ;;
@@ -39,7 +43,7 @@ sets_for() {
     parisahon-api/src/gateway/*|parisahon-client/app/composables/useLive.ts|parisahon-client/app/composables/useAsync.ts|parisahon-client/app/plugins/socket*|local/checks/live_socket.mjs|local/dev/live-browser.mjs) echo live ;;
     parisahon-client/app/components/deal/*) echo deals ui live ;;
     parisahon-client/app/components/trigger/*) echo triggers ui ;;
-    parisahon-client/app/components/common/Event*) echo deals telegram whatsapp ui ;;
+    parisahon-client/app/components/common/Event*) echo deals history telegram whatsapp ui ;;
     *Controller*.ts|*.controller.ts) echo auth ;;
   esac
   # a controller anywhere changes the route sweeps (auth: rights, smoke: every GET answers)

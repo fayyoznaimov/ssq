@@ -172,8 +172,14 @@ export class MailAssistService {
     }
     if (!parsed) throw new ServiceUnavailableException('Помощник ответил не по формату, попробуйте ещё раз');
 
+    // an answer without its fields is an error, not «Замечаний нет» / an empty text
+    if (action === 'check' ? !Array.isArray(parsed.issues) : !String(parsed.text ?? '').trim()) {
+      this.logger.warn(`assist ${action}: the answer has no ${action === 'check' ? 'issues' : 'text'}`);
+      throw new ServiceUnavailableException('Помощник ответил не по формату, попробуйте ещё раз');
+    }
+
     if (action === 'check') {
-      const issues: AssistIssue[] = (Array.isArray(parsed.issues) ? parsed.issues : [])
+      const issues: AssistIssue[] = parsed.issues
         .filter((i: any) => ['spelling', 'meaning', 'tone'].includes(i?.kind) && typeof i?.message === 'string')
         .slice(0, 30)
         .map((i: any) => ({

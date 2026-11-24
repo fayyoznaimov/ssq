@@ -4,7 +4,7 @@
             <h1 class="text-xl">Компании</h1>
             <h2 class="text-sm text-gray-500">
                 <template v-if="showTrash">Удалённые компании: {{ trash.count }}. Восстановленная компания возвращается в списки со своими контактами и сделками.</template>
-                <template v-else>Список компаний</template>
+                <template v-else>Всего: {{ formatNumber(companies.count ?? 0, 0, '0') }}</template>
             </h2>
         </div>
         <div class="flex flex-wrap gap-5 justify-between">
@@ -23,7 +23,7 @@
                                 <BaseSwitchThin v-model="isOld" label="Старый клиент" color="primary" name="is_old" />
                             </div>
                             <p class="text-xs text-muted-400 max-w-xs">
-                                «Впервые в периоде» — у компании не было сделок до периода. LTV — сумма успешных сделок компании и её контактов.
+                                «Впервые в периоде» — у компании не было сделок до периода. «Сумма продаж» — сумма успешных сделок компании и её контактов.
                             </p>
                         </div>
                     </template>
@@ -128,6 +128,7 @@ import type { Filler } from '~/types/filler';
 import {type PaginatedResponse} from '~/types/generics';
 import { type Company, type User, UserRole } from '~/types/user';
 import {debounce} from '~/utils/search';
+import { formatNumber, formatPhone } from '~/utils/format';
 
 definePageMeta({
     authRoute: true,
@@ -193,12 +194,12 @@ const toCard = (value: Company) => ({name: 'lists-companies-id', params: {id: va
 
 const columns = computed(() => {
     const out: Column[] = [
-        { label: 'Название', name: 'name', resizable: true, sortable: true, link: toCard },
-        { label: 'Номер телефона', name: 'phone', resizable: true, sortable: true, link: toCard },
-        { label: 'Электронная почта', name: 'email', resizable: true, sortable: true, link: toCard },
-        { label: 'Кол-во сделок', name: 'deal_count', resizable: true, sortable: true, link: toCard },
+        { label: 'Название', name: 'name', resizable: true, sortable: true, link: toCard, maxWidth: 360, mobile: 'title' },
+        { label: 'Телефон', name: 'phone', resizable: true, sortable: true, link: toCard, field: (company: Company) => formatPhone(company.phone) },
+        { label: 'Почта', name: 'email', resizable: true, sortable: true, link: toCard },
+        { label: 'Сделок', name: 'deal_count', resizable: true, sortable: true, link: toCard, align: 'right' },
         // the successful deals of the company and of its contacts, as in the card
-        { label: 'LTV', name: 'live_time_value', resizable: true, sortable: true, money: true, link: toCard },
+        { label: 'Сумма продаж', name: 'live_time_value', resizable: true, sortable: true, money: true, link: toCard },
         {
             label: 'Статус',
             name: 'is_old',
@@ -219,6 +220,8 @@ const columns = computed(() => {
             name: `filler-${filler.id}`,
             resizable: true,
             link: toCard,
+            // the extra fields stay off the phone cards (the card is the name, phone, deals and sum)
+            mobile: 'hide',
             field: (company: Company) => company.company_fillers?.find((f) => f.filler?.id === filler.id)?.value,
         });
     }

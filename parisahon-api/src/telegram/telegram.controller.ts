@@ -25,10 +25,11 @@ import { UploadFiles } from '../file/upload-files.decorator';
 export class TelegramController {
   constructor(private telegramService: TelegramService) {}
 
-  // the connected accounts, each with `telegram`: the state of its session (works / error / ended in Telegram)
+  // the connected accounts, each with `telegram`: the state of its session (works / error / ended in Telegram);
+  // admin and manager: everybody's, an agent: only their own
   @Get('/active-sessions')
-  async fetchSessions(): Promise<Record<string, any>> {
-    return instanceToPlain(await this.telegramService.fetchActiveSessions());
+  async fetchSessions(@Req() request: Request): Promise<Record<string, any>> {
+    return instanceToPlain(await this.telegramService.fetchActiveSessions(request));
   }
 
   @Post('/send-code')

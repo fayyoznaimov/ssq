@@ -24,6 +24,7 @@ import { WhichFiles } from '../trigger/dto/assign.trigger.dto';
 import { User } from '../user/user.entity';
 import { SearchFileDto } from './dto/search.file.dto';
 import { File } from './file.entity';
+import { AuditJournal } from '../audit/audit-journal';
 
 /**
  * Extensions a browser opens as a page, with scripts running in the CRM origin
@@ -149,8 +150,9 @@ export class FileService {
     } else {
       qb.leftJoinAndSelect('t0.deals', 'deal');
     }
+    // the role: the list names a client (a contact who sent the file in a messenger) apart from a colleague
     qb.leftJoin('t0.uploaded_by', 'uploader')
-      .addSelect(['uploader.id', 'uploader.username'])
+      .addSelect(['uploader.id', 'uploader.username', 'uploader.role'])
       .leftJoin('t0.email', 'email')
       .addSelect(['email.id'])
       .orderBy('t0.id', 'DESC');
@@ -198,7 +200,53 @@ export class FileService {
       qb.andWhere('LOWER(t0.extension) IN (:...extensions)', { extensions });
     }
 
-    return this.helperService.withPagination(qb, query);
+    const page = await this.helperService.withPagination(qb, query);
+    await this.addMessageSources(page.data as unknown as File[], access);
+    return page;
+  }
+
+  /**
+   * The list names where a file of a message came from: `message` = {at, type, deal: {id, label} | null,
+   * client: {id, username} | null} — the history row that holds the file (Telegram, WhatsApp, a note), its
+   * time, its deal (only when the user may see that deal) and the client (the contact who wrote or was
+   * written to). Files of the files tab and of e-mails have their deals already; null when none is found.
+   */
+  private async addMessageSources(files: File[], access: Access | null): Promise<void> {
+    const paths = [...new Set((files ?? []).map((f) => f.path).filter(Boolean))];
+    if (paths.length === 0) return;
+    const rows: any[] = await this.fileRepository.query(
+      `SELECT p.path, e.created_at AS at, e.type, d.id AS deal_id, d.label AS deal_label, d.agent_id, a.group_id AS agent_group_id,
+              CASE WHEN o.role = 'ctr_agent' THEN o.id WHEN t.role = 'ctr_agent' THEN t.id END AS client_id,
+              CASE WHEN o.role = 'ctr_agent' THEN o.username WHEN t.role = 'ctr_agent' THEN t.username END AS client_name
+         FROM unnest($1::text[]) AS p(path)
+         JOIN LATERAL (
+           SELECT e.* FROM event e
+            WHERE (e.after_state->'files' @> jsonb_build_array(jsonb_build_object('path', p.path))
+                   OR e.after_state->'data'->'files' @> jsonb_build_array(jsonb_build_object('path', p.path)))
+            ORDER BY e.id LIMIT 1
+         ) e ON TRUE
+         LEFT JOIN deal d ON d.id = e.deal_id AND d.deleted_at IS NULL
+         LEFT JOIN "user" a ON a.id = d.agent_id
+         LEFT JOIN "user" o ON o.id = e.user_id
+         LEFT JOIN "user" t ON t.id = e.target_user_id`,
+      [paths],
+    );
+    const byPath = new Map<string, any>(rows.map((row) => [row.path, row]));
+    for (const file of files) {
+      const row = byPath.get(file.path);
+      if (!row) {
+        (file as any).message = null;
+        continue;
+      }
+      const dealVisible =
+        row.deal_id && (!access || access.isManager || access.allowsDeal('view', row.agent_id ?? null, row.agent_group_id ?? null));
+      (file as any).message = {
+        at: row.at,
+        type: Number(row.type),
+        deal: dealVisible ? { id: Number(row.deal_id), label: row.deal_label } : null,
+        client: row.client_id ? { id: Number(row.client_id), username: row.client_name } : null,
+      };
+    }
   }
 
   /** fetchFiles for a user who does not see everything: see there. */
@@ -350,6 +398,8 @@ export class FileService {
       .of(file.id)
       .remove(deal_id);
     file.deals = file.deals.filter((deal) => deal.id !== deal_id);
+    // the journal (src/audit): who took which file off the deal (a person, the trigger «удалить файлы»)
+    await AuditJournal.fileLink(this.fileRepository.manager, 'remove', deal_id, file);
     await this.removeFromHistory(deal_id, file.id);
     await this.removeIfUnused(file);
   }
@@ -408,6 +458,18 @@ export class FileService {
     );
     if (!disk.in_rows && !disk.telegram) {
       await this.unlink(file.path);
+    }
+  }
+
+  /**
+   * The size of a file in the uploads folder (for the rows the messengers make: their services save the
+   * file there); the size the service reported when the file is not readable; 0 when neither is known.
+   */
+  static sizeOnDisk(path: string, reported?: number | null): number {
+    try {
+      return fs.statSync(join(FileService.UPLOADS_DIR, basename(path || ''))).size;
+    } catch {
+      return Number.isFinite(Number(reported)) && Number(reported) > 0 ? Math.round(Number(reported)) : 0;
     }
   }
 

@@ -3,20 +3,20 @@
         <div class="flex flex-wrap gap-5 justify-between">
             <div class="flex flex-wrap items-center gap-4">
                 <PerPageSelect v-model="perPage" />
-                <div class="flex space-x-2 items-center">
-                    <NuxtLink to="/deals?view=list" class="text-gray-300 dark:text-white" exact-active-class="text-gray-600">
-                        <Icon
-                            name="ph:list"
-                            size="22"
-                            class="text-inherit"
-                        />
-                    </NuxtLink>
-                    <NuxtLink to="/deals?view=kanban" class="text-gray-300 dark:text-white" exact-active-class="text-gray-600">
-                        <Icon
-                            name="ph:kanban"
-                            size="22"
-                            class="text-inherit"
-                        />
+                <!-- «Список | Канбан»: the view that is on is highlighted (/deals without ?view is the list) -->
+                <div class="flex items-center rounded-lg border border-muted-200 dark:border-muted-700 bg-white dark:bg-muted-800 p-0.5 text-sm">
+                    <NuxtLink
+                        v-for="option in viewOptions"
+                        :key="option.value"
+                        :to="{ path: '/deals', query: { ...route.query, view: option.value } }"
+                        class="flex items-center gap-1 rounded-md px-2.5 py-1 transition-colors"
+                        :class="currentView === option.value
+                            ? 'bg-primary-500 text-white'
+                            : 'text-muted-500 hover:text-muted-800 dark:text-muted-400 dark:hover:text-white'"
+                        :aria-current="currentView === option.value ? 'page' : undefined"
+                    >
+                        <Icon :name="option.icon" class="size-4" />
+                        {{ option.label }}
                     </NuxtLink>
                 </div>
                 <TairoPopover fixed size="2md">
@@ -332,11 +332,6 @@
                 </div>
             </template>
             <template v-else>
-                <DealActionsNav
-                    :selected="selectedDeals"
-                    :totalAmount="totalAmount"
-                    @update="fetchDeals"
-                />
                 <BaseTable
                     v-model:sortBy="sortBy"
                     v-model:selected="selectedDeals"
@@ -364,6 +359,14 @@
                         </BaseButtonIcon>
                     </template>
                 </BaseTable>
+                <!-- the bulk actions appear when deals are ticked, stuck to the bottom of the screen -->
+                <div v-show="selectedDeals.length" class="sticky bottom-2 z-20">
+                    <DealActionsNav
+                        :selected="selectedDeals"
+                        :totalAmount="totalAmount"
+                        @update="fetchDeals"
+                    />
+                </div>
             </template>
             <BasePagination
                 v-if="!kanban && deals.count / perPage > 1"
@@ -375,6 +378,8 @@
                 shape="rounded"
             />
         </div>
+        <!-- a card dropped into «Закрыто и не реализовано»: «Почему сделка не реализована?» (ProgressColumn) -->
+        <LostReasonModal />
     </div>
 </template>
 
@@ -386,6 +391,7 @@ import Draggable from 'vuedraggable';
 
 import BaseTable from '~/components/common/BaseTable.vue';
 import DealActionsNav from '~/components/common/DealActionsNav.vue';
+import LostReasonModal from '~/components/history/LostReasonModal.vue';
 import PerPageSelect from '~/components/common/PerPageSelect.vue';
 import ProgressColumn from '~/components/common/ProgressColumn.vue';
 import {type Column} from '~/components/common/types';
@@ -465,7 +471,7 @@ const perPage = ref(app.pagination.defaultPageSize);
 const currentPage = ref(route.query.page ? parseInt(route.query.page as string) : 1);
 const dateFilter = reactive({start: '', end: ''});
 const sortBy = ref<Record<string, any>>({id: -1});
-const preset = ref<Preset>(Preset.All);
+const preset = ref<Preset>(route.query.preset === Preset.NoTask ? Preset.NoTask : Preset.All);
 const shouldRevealStats = ref(false);
 
 const initialFilters: Filters = {
@@ -491,6 +497,12 @@ const filters = reactive<Filters>({
     ...initialFilters, 
     ...(route.query.stage_id && {stages: [{id: Number(route.query.stage_id), name: route.query.stage_name} as Stage]}),
     ...(route.query.user_id && {agent: {id: Number(route.query.user_id), username: route.query.username} as User}),
+    // links of the desktop: ?preset=no-task («Сделки без задач»), ?closed_from=..&closed_till=.. (won in a period)
+    ...(route.query.preset === Preset.NoTask && {tasks: [{ id: 'no_task', name: 'Нет задач' }]}),
+    ...(route.query.closed_from && route.query.closed_till && {
+        dealDates: [String(route.query.closed_from), String(route.query.closed_till)],
+        dealDateType: DealDateType.Closed,
+    }),
 });
 
 const label = ref();
@@ -541,6 +553,7 @@ const tableColumns = ref<Column[]>([
         sortable: true,
         resizable: true,
         rowAnchor: true,
+        maxWidth: 360,
     },
     {
         // name, phone and company of the client in their own colors, "повторный" for a repeat request
@@ -556,6 +569,8 @@ const tableColumns = ref<Column[]>([
         name: 'stage',
         sortable: true,
         field: (item) => item.stage?.name,
+        // the stage in its colour, as in the card of the deal (it was a grey «ПЕРВИЧНЫЙ...»)
+        stage: (item) => item.stage,
         resizable: true,
     },
     {
@@ -795,6 +810,11 @@ function fetchStages() {
 
 // The list is paged by the page size; the kanban asks GET /deals/board column by column.
 const kanban = computed(() => route.query.view === 'kanban');
+const currentView = computed(() => (kanban.value ? 'kanban' : 'list'));
+const viewOptions = [
+    { value: 'list', label: 'Список', icon: 'ph:list' },
+    { value: 'kanban', label: 'Канбан', icon: 'ph:kanban' },
+];
 
 // The next load was asked for by the user (a filter, a preset): if it fails, a toast says so
 let notifyNext = false;

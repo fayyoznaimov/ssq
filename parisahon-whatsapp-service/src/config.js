@@ -16,7 +16,8 @@ export function loadConfig(env = process.env) {
     sessionsDir: path.resolve(env.SESSIONS_DIR || 'sessions'),
     uploadsDir: path.resolve(env.UPLOADS_DIR || 'uploads'),
     sessionKey: (env.SESSION_ENCRYPTION_KEY || '').trim(),
-    ffmpegBin: env.FFMPEG_BIN ? path.resolve(env.FFMPEG_BIN) : '',
+    // FFMPEG_BIN: a path or a name in PATH (default "ffmpeg"); index.js checks it at start (src/converter.js)
+    ffmpegBin: (env.FFMPEG_BIN || 'ffmpeg').trim(),
     maxFileMb: positive(env.MAX_FILE_MB, 50),
     pollSec: positive(env.POLL_SEC, 10),
     maxBackoffSec: positive(env.MAX_BACKOFF_SEC, 300),

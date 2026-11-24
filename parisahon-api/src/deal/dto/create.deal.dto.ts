@@ -22,16 +22,21 @@ export class CreateDealFillerDto implements ChildFiller {
   value: string;
 }
 
+/** The largest quantity numeric(14,3) holds */
+export const MAX_QUANTITY = 99_999_999_999;
+
 export class LinkProductsDto {
   @IsNumber()
   product_id: number;
 
-  @IsNumber()
+  // metres and kilos: up to 3 decimals (numeric(14,3))
+  @IsNumber({ maxDecimalPlaces: 3, allowNaN: false, allowInfinity: false })
   @Min(0)
-  @Max(Number.MAX_SAFE_INTEGER)
+  @Max(MAX_QUANTITY)
   quantity: number;
 
-  @IsNumber()
+  // the price of one unit, with cents (numeric(18,2))
+  @IsNumber({ maxDecimalPlaces: 2, allowNaN: false, allowInfinity: false })
   @Min(0)
   @Max(Number.MAX_SAFE_INTEGER)
   price: number;
@@ -44,8 +49,8 @@ export class CreateDealDto {
   @Length(0, 255)
   label: string;
 
-  // a whole amount: the column is bigint
-  @IsInt()
+  // with cents: the column is numeric(18,2)
+  @IsNumber({ maxDecimalPlaces: 2, allowNaN: false, allowInfinity: false })
   @Min(0)
   @Max(Number.MAX_SAFE_INTEGER)
   budget: number;

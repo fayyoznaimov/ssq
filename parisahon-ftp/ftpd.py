@@ -8,6 +8,8 @@ With a certificate explicit FTPS (AUTH TLS) is offered. Plain FTP stays for the 
 app cannot do TLS, but it can be narrowed: FTP_PLAIN_NETWORKS (plain logins only from the office
 network or the VPN, refused at USER, before the token is sent), FTP_PLAIN_DOWNLOAD=0 (a plain
 session uploads only, the recordings cannot be read back), FTP_TLS_REQUIRED=1 (no plain FTP at all).
+Per token: the admin marks a token "FTPS only" in the CRM (GET /calls/recorder answers tls_required),
+and a session with that token must be FTPS with an encrypted data channel (AUTH TLS, PROT P).
 """
 import hashlib
 import logging
@@ -44,14 +46,14 @@ class TokenAuthorizer:
         self.cache_sec = cache_sec
         self.clock = clock
         self._lock = threading.Lock()
-        self._known: Dict[str, Tuple[int, str, float]] = {}   # sha256(token) -> (user id, CRM name, asked at)
+        self._known: Dict[str, Tuple[int, str, float, bool]] = {}   # sha256(token) -> (user id, CRM name, asked at, FTPS only)
         self._denied: Dict[str, float] = {}                   # sha256(token) -> refused at
 
     def home_of(self, user_id) -> str:
         return os.path.join(self.root, str(int(user_id)))
 
-    def resolve(self, token: str) -> Tuple[int, str]:
-        """(user id, CRM name) of a recorder token; AuthenticationFailed otherwise."""
+    def resolve(self, token: str) -> Tuple[int, str, bool]:
+        """(user id, CRM name, FTPS only) of a recorder token; AuthenticationFailed otherwise."""
         if not (16 <= len(token) <= 256):
             raise AuthenticationFailed("Authentication failed.")
         key = hashlib.sha256(token.encode("utf-8", "replace")).hexdigest()
@@ -60,15 +62,15 @@ class TokenAuthorizer:
             known = self._known.get(key)
             denied_at = self._denied.get(key)
         if known and now - known[2] < self.cache_sec:
-            return known[0], known[1]
+            return known[0], known[1], known[3]
         if denied_at is not None and now - denied_at < DENIED_CACHE_SEC:
             raise AuthenticationFailed("Authentication failed.")
         answer = self.api.recorder(token)
         with self._lock:
             if answer.kind == "ok":
                 self._denied.pop(key, None)
-                self._known[key] = (answer.user_id, answer.username, now)
-                return answer.user_id, answer.username
+                self._known[key] = (answer.user_id, answer.username, now, answer.tls_required)
+                return answer.user_id, answer.username, answer.tls_required
             if answer.kind == "denied":
                 self._known.pop(key, None)
                 self._denied[key] = now
@@ -78,18 +80,25 @@ class TokenAuthorizer:
         # the API did not answer the question
         if known and now - known[2] < STALE_WHEN_API_DOWN_SEC:
             log.warning("the API cannot check a token (%s): user=%s is let in on its earlier answer", answer.detail, known[0])
-            return known[0], known[1]
+            return known[0], known[1], known[3]
         log.warning("the API cannot check a token (%s): login refused for now", answer.detail)
         raise AuthenticationFailed("Service not available, try again later.")
 
     # --- what pyftpdlib asks
 
     def validate_authentication(self, username, password, handler):
-        user_id, name = self.resolve(password or "")
+        user_id, name, tls_only = self.resolve(password or "")
+        if tls_only and not bool(getattr(handler, "_ssl_established", False)):
+            # the admin made this token FTPS-only: a plain session gets nothing (the phone must be switched to FTPS;
+            # the token went over the network in clear just now - the log says so, the admin may issue a new one)
+            log.warning("login refused user=%s ip=%s: this token is FTPS only (settings -> calls), the session is plain FTP",
+                        user_id, getattr(handler, "remote_ip", "?"))
+            raise AuthenticationFailed("This token needs FTPS (explicit TLS, AUTH TLS).")
         os.makedirs(self.home_of(user_id), mode=0o700, exist_ok=True)
         handler.username = str(user_id)
         handler.crm_user_id = user_id
         handler.crm_user_name = name
+        handler.crm_tls_only = tls_only
 
     def get_home_dir(self, username):
         return self.home_of(username)
@@ -129,6 +138,7 @@ class RecorderSession:
     kick: Callable[[], None] = staticmethod(lambda: None)
     crm_user_id: Optional[int] = None
     crm_user_name: str = ""
+    crm_tls_only: bool = False     # the token is FTPS only: transfers need an encrypted data channel (PROT P)
     tls_offered: bool = False      # a certificate is configured (FTPS can be used)
     plain_networks = None          # Config.plain_networks: where plain FTP may log in from (None: anywhere)
     plain_download: bool = True    # Config.plain_download: RETR without TLS
@@ -163,7 +173,16 @@ class RecorderSession:
             return
         return super().ftp_USER(line)
 
+    def _data_refused(self) -> bool:
+        """An FTPS-only token without PROT P: the recordings would cross the network in clear."""
+        if self.crm_tls_only and not self._data_secured():
+            self.respond("550 This token needs an encrypted data channel (PROT P).")
+            return True
+        return False
+
     def ftp_RETR(self, file):
+        if self._data_refused():
+            return None
         # FTP_PLAIN_DOWNLOAD=0: a token read off the network uploads at most, the recordings are not read back
         if not self.plain_download and not self._data_secured():
             self.respond("550 Downloads need FTPS (AUTH TLS and PROT P).")
@@ -177,12 +196,16 @@ class RecorderSession:
     # --- uploads: marked from the first byte to the last
 
     def ftp_STOR(self, file, mode="w"):
+        if self._data_refused():
+            return None
         path = super().ftp_STOR(file, mode)
         if path:
             self.state.receiving_start(path)
         return path
 
     def ftp_STOU(self, line):
+        if self._data_refused():
+            return None
         name = super().ftp_STOU(line)
         if name:
             queued = getattr(self, "_in_dtp_queue", None)

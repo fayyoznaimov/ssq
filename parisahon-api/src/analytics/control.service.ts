@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { EventTypes } from '../events/event.entity';
+import { CLOSING_STAGE_KINDS } from '../deal_stage/stage-kind';
 
 /**
  * "Контроль менеджеров": how fast and whether the managers answer the clients.
@@ -250,7 +251,7 @@ export class ControlService implements OnModuleInit, OnModuleDestroy {
                                             WHERE o.deal_id = d.id AND ${answerSql('o', '$2')}), '-infinity')
             ORDER BY e.created_at, e.id LIMIT 1
          ) q ON TRUE
-        WHERE d.deleted_at IS NULL AND d.closed_at IS NULL AND NOT (COALESCE(s.name, '') = ANY($3))
+        WHERE d.deleted_at IS NULL AND d.closed_at IS NULL AND NOT (COALESCE(s.kind, '') = ANY($3))
           AND q.created_at > now() - make_interval(days => $4::int)
           AND d.id IN (SELECT r.deal_id FROM event r
                         WHERE ${clientMessageSql('r', '$1')} AND r.created_at > now() - make_interval(days => $4::int))`,
@@ -263,8 +264,8 @@ export class ControlService implements OnModuleInit, OnModuleDestroy {
     const now = new Date();
     const sla = q.slaMinutes * 60;
     const waitLimit = q.waitingHours * 3600;
-    // DEAL_STAGE_CLOSED* are stage names
-    const closedStages = [process.env.DEAL_STAGE_CLOSED, process.env.DEAL_STAGE_CLOSED_NOT_REALIZED].filter(Boolean);
+    // the kinds of the closing stages (deal_stage/stage-kind.ts)
+    const closedStages: string[] = CLOSING_STAGE_KINDS;
 
     const [turns, staff, deals, calls, waitingRows] = await Promise.all([
       this.turns(q),

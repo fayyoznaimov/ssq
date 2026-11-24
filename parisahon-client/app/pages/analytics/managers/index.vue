@@ -1,29 +1,11 @@
 <template>
     <div class="flex flex-col gap-8">
-        <div class="flex flex-wrap items-center gap-4">
+        <div class="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:gap-4">
             <div>
                 <h1 class="text-xl">Аналитика по менеджерам</h1>
                 <h2 class="text-sm text-gray-500">Все сотрудники за период: сделки, выигранные, клиенты, звонки, ответы</h2>
             </div>
-            <div class="max-w-xs w-full shrink-0">
-                <DatePicker
-                    v-model="dateRange"
-                    :format="format"
-                    range
-                    text-input
-                    vertical
-                    :preset-dates="presetDates"
-                    auto-apply
-                    :enable-time-picker="false"
-                    model-type="yyyy-MM-dd"
-                    :teleport="true"
-                    :dark="colorMode.value === 'dark'"
-                >
-                    <template #dp-input="{ onInput, value, onBlur, onPaste }">
-                        <BaseInput :value="value" @input="onInput" @blur="onBlur" @paste="onPaste" placeholder="Период" />
-                    </template>
-                </DatePicker>
-            </div>
+            <PeriodPicker v-model="period" />
         </div>
         <div class="relative overflow-x-auto">
             <BaseTable
@@ -36,6 +18,10 @@
             >
             </BaseTable>
         </div>
+        <!-- the empty state under the table: inside it the text was centred across nine columns and cut off -->
+        <div v-if="!isLoading && !sorted.length" class="rounded-md border border-dashed border-muted-300 dark:border-muted-700 p-4 text-sm text-muted-500">
+            За этот период у сотрудников нет ни сделок, ни звонков, ни ответов клиентам. Выберите другой период.
+        </div>
         <p class="text-sm text-muted-500 max-w-4xl">
             Новые сделки — созданные за период, где сотрудник ответственный; выиграно — закрытые за период на этапе успеха
             (как в сводном отчёте и целях); звонки — записи звонков за период (как в «Звонках» и «Контроле»); время ответа —
@@ -46,9 +32,9 @@
 </template>
 
 <script lang="ts" setup>
-import moment from 'moment';
-import DatePicker from '@vuepic/vue-datepicker';
 import BaseTable from '~/components/common/BaseTable.vue';
+import PeriodPicker from '~/components/analytics/PeriodPicker.vue';
+import { spoken } from '~/utils/duration';
 import {type Column} from '~/components/common/types';
 
 definePageMeta({
@@ -93,40 +79,11 @@ const ROLES: Record<string, string> = { admin: 'администратор', man
 const statsService = useService('analytics/managers', {auth: true});
 const { data: stats, isLoading, run } = useAsync<ManagerStats>({ data: [] });
 const sortBy = ref<Record<string, number>>({});
-const colorMode = useColorMode();
-const dateRange = ref([moment().startOf('month').format('YYYY-MM-DD'), moment().endOf('month').format('YYYY-MM-DD')]);
-
-const presetDates = ref([
-    { label: 'За сегодня', value: [moment().startOf('day'), moment().startOf('day')] },
-    { label: 'За вчера', value: [moment().subtract(1, 'day').startOf('day'), moment().subtract(1, 'day').startOf('day')] },
-    { label: 'За последние 30 дней', value: [moment().subtract(30, 'day').startOf('day'), moment().startOf('day')] },
-    { label: 'За эту неделю', value: [moment().startOf('week'), moment().endOf('week')] },
-    { label: 'За прошлую неделю', value: [moment().subtract(1, 'week').startOf('week'), moment().subtract(1, 'week').endOf('week')] },
-    { label: 'За этот месяц', value: [moment().startOf('month'), moment().endOf('month')] },
-    { label: 'За прошлый месяц', value: [moment().subtract(1, 'month').startOf('month'), moment().subtract(1, 'month').endOf('month')] },
-    { label: 'За квартал', value: [moment().startOf('quarters'), moment().endOf('quarters')] },
-    { label: 'За этот год', value: [moment().startOf('year'), moment().endOf('year')] },
-]);
-
-function format(dates: Date[]) {
-    const fromStr = moment(dates[0]).format('YYYY-MM-DD');
-    const toStr = moment(dates[1]).format('YYYY-MM-DD');
-    for (const preset of presetDates.value) {
-        if (preset.value[0].format('YYYY-MM-DD') === fromStr && preset.value[1].format('YYYY-MM-DD') === toStr) {
-            return preset.label;
-        }
-    }
-    return `${fromStr} - ${toStr}`;
-}
+// the current month unless another report chose a period (the API's default is the current month too)
+const { period, bounds } = useReportPeriod('month');
 
 /** Seconds of working time as people say it: "40 с", "12 мин", "3 ч 05 мин"; no value — a dash. */
-function duration(seconds: number | null) {
-    if (seconds === null || seconds === undefined) return '—';
-    if (seconds < 60) return `${Math.round(seconds)} с`;
-    if (seconds < 3600) return `${Math.round(seconds / 60)} мин`;
-    const minutes = Math.round(seconds / 60);
-    return `${Math.floor(minutes / 60)} ч ${String(minutes % 60).padStart(2, '0')} мин`;
-}
+const duration = spoken;
 
 const columns = ref<Column<ManagerRow>[]>([
     {
@@ -190,11 +147,12 @@ const columns = ref<Column<ManagerRow>[]>([
         subtitle: (item) => `↗ ${item.outgoing_call_count} · ↙ ${item.incoming_call_count}`,
     },
     {
-        label: 'Минут разговора',
+        label: 'Время разговоров',
         name: 'call_minutes',
         icon: 'ph:headset',
         resizable: true,
         sortable: true,
+        field: (item) => (item.call_count ? spoken(Math.round(Number(item.call_minutes) * 60)) : '—'),
     },
     {
         label: 'Первый ответ (медиана)',
@@ -238,15 +196,11 @@ const sorted = computed(() => {
 });
 
 function fetchStats() {
-    // the field cleared: the API's default, the current month
-    if (!dateRange.value?.[0] || !dateRange.value?.[1]) return run(statsService.find().exec());
-    run(statsService.find({
-        from_date: dateRange.value[0],
-        till_date: dateRange.value[1],
-    }).exec());
+    // «за всё время»: both far ends (without dates the API counts the current month)
+    run(statsService.find(bounds.value).exec());
 }
 
-watch(dateRange, fetchStats);
+watch(period, fetchStats);
 onMounted(fetchStats);
 </script>
 

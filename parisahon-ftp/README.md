@@ -14,7 +14,7 @@ lines), `forwarder.py` (what is sent and when), `crm.py` (the two API calls), `s
 
 - User name: anything. **Password: the manager's recorder token** (CRM → settings → calls). The
   service asks the API whose token it is: `GET {CRM_API_URL}/calls/recorder` with `X-Recorder-Token`
-  → `{"user_id": 5, "username": "…"}`, `401` = unknown or revoked.
+  → `{"user_id": 5, "username": "…", "tls_required": false}`, `401` = unknown or revoked.
 - An accepted token is not asked about again for ~5 minutes (`FTP_AUTH_CACHE_SEC`), a refused one for
   30 seconds. A revoked token therefore still logs in for up to 5 minutes; a session that is already
   open is not cut. While the API is unreachable, a token it accepted earlier (since the service
@@ -41,10 +41,29 @@ lines), `forwarder.py` (what is sent and when), `crm.py` (the two API calls), `s
     (`RETR` → `550`): a token read off the network does not give the recordings back. FTPS sessions
     with `PROT P` always may. Leave it `1` for a sync app that reads files back to compare them.
   - `FTP_TLS_REQUIRED=1` — no plain FTP at all (needs the certificate), when every phone does FTPS.
+  - **Per token**: the admin ticks «Только FTPS» for a manager's token in the CRM (settings → calls;
+    `PATCH /calls/tokens/:user_id {"tls_required": true}`, or when issuing it). A plain login with that
+    token is refused (`530 This token needs FTPS`, a `WARNING` line), and an FTPS session with it must
+    switch on `PROT P` before it uploads or downloads (`550` otherwise). Tick it as soon as that phone is
+    set to FTPS: a token read off the network then gives nothing. (The token went over the network in
+    that one refused plain login: issue a new one if that phone ever used plain FTP outside the office.)
 
 Phone app settings: server and port from the CRM settings page (`CALLS_FTP_ADDRESS` of the API),
 any user name, the token as the password, passive mode, one-way upload of the recorder's folder to `/`.
 If the app can upload under a temporary name and rename afterwards, turn that on.
+
+## A folder of an old FTP server (`FTP_EXTRA_HOMES`)
+
+A phone that still uploads to another FTP server (the old vsftpd on port 21 of production, until the
+phone is switched to this service) leaves its recordings in that server's folder. `FTP_EXTRA_HOMES`
+names such folders and their manager, e.g. `47=/legacy/47` (several: separated by spaces or commas);
+they are forwarded exactly like a home: the same rules, the same state (their names get
+`@extra-<n>/` in front in the state and the log), removed after `FTP_RETAIN_DAYS` once sent. Nothing
+of a path or a manager is built into the service or its compose file: in production
+`deploy/prod/compose.yml` mounts `${LEGACY_RECORDINGS_DIR}` (the old server's folder of homes, set in
+the `.env` next to the compose file) at `/legacy`, and `ftp.env` says `FTP_EXTRA_HOMES=47=/legacy/47`.
+A folder that is not there (not mounted) is skipped. When the phone has moved to this service with
+its token, drop the key, the mount and the old server's account.
 
 ## What is forwarded
 
@@ -104,6 +123,7 @@ ftp.forward: forwarded user=5 file="…" size=412044 upload_id=812 [duplicate (t
 ftp.forward: already sent user=5 file="copy.wav" size=412044 upload_id=812 (same content as "…")
 ftp.forward: rejected user=5 file="…" size=3 status=400 reason="…" (will not be sent again; the file stays in the folder: this call is not in the CRM)
 ftp.server: login refused ip=203.0.113.7: plain FTP from outside FTP_PLAIN_NETWORKS
+ftp.server: login refused user=5 ip=203.0.113.7: this token is FTPS only (settings -> calls), the session is plain FTP
 ftp.forward: retry user=5 file="…" size=… attempt=2 next_try_in=60s reason="HTTP 500: …"
 ftp.forward: removed old user=5 file="…" size=… (older than 30 days)
 ```
@@ -127,6 +147,7 @@ transfer). `LOG_LEVEL=debug` adds every command of the phone app (the password i
 | `FTP_TLS_REQUIRED` | `0` | `1`: FTPS only, plain FTP refused (needs the certificate) |
 | `FTP_PLAIN_NETWORKS` | — | plain FTP only from these addresses / networks (`192.168.1.0/24 10.8.0.0/24`); empty: from anywhere |
 | `FTP_PLAIN_DOWNLOAD` | `1` | `0`: a plain (not TLS) session cannot download files |
+| `FTP_EXTRA_HOMES` | — | folders of another FTP server to forward too: `<user_id>=<absolute path>`, e.g. `47=/legacy/47`; outside `FTP_ROOT` and `FTP_STATE_DIR` |
 | `FTP_RETAIN_DAYS` | `30` | `0` = never remove files |
 | `FTP_SETTLE_SEC` | `5` | how long size and mtime must hold still |
 | `FTP_SCAN_SEC` | `10` | pause between scans |

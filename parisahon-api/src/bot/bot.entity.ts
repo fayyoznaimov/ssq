@@ -57,8 +57,9 @@ export class BotLinkCode {
 }
 
 /**
- * A task the bot already reminded about (its assignee or its group). TaskService.update removes
- * the row when the task is moved to another time or handed over, so the new time is reminded again.
+ * A task the bot already reminded about (its assignee or its group), and for which start time:
+ * a task moved to another time is reminded again before the new start, whoever moved it.
+ * TaskService.update also removes the row when the task is handed to someone else.
  */
 @Entity('bot_reminder')
 export class BotReminder {
@@ -68,6 +69,10 @@ export class BotReminder {
   @OneToOne(() => Task, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'task_id' })
   task: Task;
+
+  /** the start time of the task that was reminded */
+  @Column({ type: 'timestamp', nullable: true })
+  start_time: Date | null;
 
   @CreateDateColumn()
   sent_at: Date;

@@ -208,6 +208,8 @@ DELETE FROM bot_account WHERE user_id IN (SELECT id FROM _u);
 DELETE FROM bot_link_code WHERE user_id IN (SELECT id FROM _u);
 DELETE FROM "user" WHERE id IN (SELECT id FROM _u);
 DELETE FROM company WHERE id IN (SELECT id FROM _c);
+DELETE FROM deal_product WHERE product_id IN (SELECT id FROM product WHERE name LIKE 'AUDITAN-%');
+DELETE FROM product WHERE name LIKE 'AUDITAN-%';
 """
 
 LEFTOVERS_SQL = r"""
@@ -215,6 +217,7 @@ SELECT 'deal', count(*) FROM deal WHERE label LIKE 'AUDITAN-%'
 UNION ALL SELECT 'task', count(*) FROM task WHERE label LIKE 'AUDITAN-%'
 UNION ALL SELECT 'company', count(*) FROM company WHERE name LIKE 'AUDITAN-%'
 UNION ALL SELECT 'user', count(*) FROM "user" WHERE username LIKE 'AUDITAN-%'
+UNION ALL SELECT 'product', count(*) FROM product WHERE name LIKE 'AUDITAN-%'
 UNION ALL SELECT 'recording', count(*) FROM recording r WHERE NOT EXISTS (SELECT 1 FROM "user" u WHERE u.id = r.user_id)
 UNION ALL SELECT 'event', count(*) FROM event WHERE after_state::text LIKE '%AUDITAN-%' OR before_state::text LIKE '%AUDITAN-%'
 """
@@ -434,6 +437,10 @@ def main():
           and sum(b.get("lost_count", 0) for b in graph) == EXPECTED_LOST, graph)
     check("weekly: new and won of the same week are merged into one bucket (Map keyed by Date never matched)",
           len(starts) == len(set(starts)), starts)
+    import datetime as _dt
+    days = [_dt.date.fromisoformat(x) for x in starts]
+    check("weekly: every week of the period is there, the empty ones as zeros (SCR3-7: one lone week was a vertical line)",
+          len(days) >= 5 and all((b - a).days == 7 for a, b in zip(days, days[1:])) and days[0] <= _dt.date(2031, 3, 1) and days[-1] >= _dt.date(2031, 3, 25), starts)
     status, body = http("GET", "/analytics/consolidated-report?period=yearly&" + PERIOD)
     check("yearly: 200, one bucket", status == 200 and len((body or {}).get("graph", [])) == 1, (body or {}).get("graph"))
     status, body = http("GET", "/analytics/consolidated-report?period=daily&" + PERIOD)
@@ -482,6 +489,9 @@ def main():
     check("call_count 2, outgoing 1, incoming 1",
           me and num(me.get("call_count")) == 2 and num(me.get("outgoing_call_count")) == 1 and num(me.get("incoming_call_count")) == 1, me)
     check("the unit is stated: duration_unit = 'minutes'", me and me.get("duration_unit") == "minutes", me)
+    check("... and the same in seconds (the page shows «1:30», «3 мин»): avg 90, total 180, out 120, in 60",
+          me and num(me.get("avg_duration_sec")) == 90 and num(me.get("total_call_sec")) == 180
+          and num(me.get("total_outgoing_sec")) == 120 and num(me.get("total_incoming_sec")) == 60, me)
     check("the key the page reads is 'avg_duration' (the API used to answer 'avg_duration_in_minutes')", me and "avg_duration" in me and "avg_duration_in_minutes" not in me)
 
     # ================================================================= one definition of the numbers (CALL-13)
@@ -554,6 +564,53 @@ def main():
     # the five of the agent and the two of the goals section above
     check("with a period: 200, the deals created in it", status == 200 and isinstance((body or {}).get("stages"), list)
           and num((body or {}).get("total_deal_count")) == EXPECTED_NEW + 2, (status, body and body.get("total_deal_count")))
+    sales = body if status == 200 and isinstance(body, dict) else {}
+    sales_rows = sales.get("stages", [])
+    check("the stages add up to the total (a deal is in one stage)",
+          sum(num(r.get("deal_count")) or 0 for r in sales_rows) == num(sales.get("total_deal_count")), [(r.get("name"), r.get("deal_count")) for r in sales_rows])
+    status_c, body_c = http("GET", "/analytics/consolidated-report?period=monthly&" + PERIOD)
+    cons_rows = (body_c or {}).get("deals", {}).get("stage_stats", []) if status_c == 200 else []
+    mismatch = [(r.get("name"), num(r.get("deal_count")), num((row_of(cons_rows, "id", r.get("id")) or {}).get("deal_count_in_stage")))
+                for r in sales_rows if num(r.get("deal_count")) != num((row_of(cons_rows, "id", r.get("id")) or {}).get("deal_count_in_stage"))]
+    check("«Анализ продаж» and «Сводный отчёт» give the same deals per stage for the same period (SCR3-4)", status_c == 200 and not mismatch, mismatch)
+    won_sales = row_of(sales_rows, "id", won_stage) or {}
+    check("won stage: 4 deals, 1080 — the deleted one (900) is out, a deal is counted where it is now",
+          num(won_sales.get("deal_count")) == 4 and num(won_sales.get("total_deal_budget")) == 300 + 700 + 50 + 30, won_sales)
+    # a deal that passed through the won stage and went back: one stay of 60 minutes there, counted in its current stage only
+    open_deal = int(scalar("SELECT id FROM deal WHERE label = '%s-open'" % P))
+    sql("INSERT INTO deal_stage_record (deal_id, stage_id, moved_after_minutes, created_at) VALUES (%d, %d, 60, '2031-03-08 10:00'), (%d, %d, NULL, '2031-03-08 11:00')"
+        % (open_deal, won_stage, open_deal, open_stage))
+    status, body = http("GET", "/analytics/deals?" + PERIOD)
+    rows2 = (body or {}).get("stages", []) if status == 200 else []
+    won2 = row_of(rows2, "id", won_stage) or {}
+    check("a deal with two passes in the stage history is one deal, in its current stage (was: every pass, budget twice)",
+          num(won2.get("deal_count")) == 4 and num((row_of(rows2, "id", open_stage) or {}).get("deal_count")) == num((row_of(sales_rows, "id", open_stage) or {}).get("deal_count")), won2)
+    check("average time in the stage: 60 minutes from the one finished stay (stage_time_count = 1)",
+          num(won2.get("average_time_in_stage")) == 60 and num(won2.get("stage_time_count")) == 1, won2)
+    check("closed deals among them: 5 (won-in, won-later, lost-in and the two of the goals), the cycle is a number",
+          num((body or {}).get("closed_deal_count")) == 5 and num((body or {}).get("average_deal_duration_in_minutes")) is not None, body and {k: body.get(k) for k in ("closed_deal_count", "average_deal_duration_in_minutes")})
+    status, body = http("GET", "/analytics/deals?is_active=true&" + PERIOD)
+    check("is_active=true: the open deals only (open, last-day)", status == 200 and num((body or {}).get("total_deal_count")) == 2, body and body.get("total_deal_count"))
+    status, body = http("GET", "/analytics/deals?from_date=2031-06-01&till_date=2031-06-30")
+    check("a period without deals: total 0, no average cycle (null, not «0д.»)",
+          status == 200 and num(body.get("total_deal_count")) == 0 and body.get("average_deal_duration_in_minutes") is None, body)
+
+    # ================================================================= products (HACK-18)
+    section("По товарам (GET /products/statistics): the total is counted before the page is cut")
+    values = ", ".join("('%s-prod-%02d', now())" % (P, i) for i in range(30))
+    sql("INSERT INTO product (name, created_at) VALUES %s" % values)
+    sql("INSERT INTO deal_product (deal_id, product_id, price, quantity) SELECT %d, id, 10, 2 FROM product WHERE name LIKE '%s-prod-%%'" % (open_deal, P))
+    status, body = http("GET", "/products/statistics?limit=25&skip=0&" + PERIOD)
+    check("30 products in the period: count 30, a page of 25, last_page 2 (the LIMIT was inside the count)",
+          status == 200 and body.get("count") == 30 and len(body.get("data", [])) == 25 and body.get("last_page") == 2, (status, body and body.get("count"), body and body.get("last_page")))
+    status, body = http("GET", "/products/statistics?limit=25&skip=25&" + PERIOD)
+    check("... the second page holds the other 5", status == 200 and len(body.get("data", [])) == 5, (status, body and len(body.get("data", []))))
+    status, body = http("GET", "/products/statistics?limit=25&from_date=2031-06-01&till_date=2031-06-30")
+    check("... another period without them: none", status == 200 and body.get("count") == 0, (status, body and body.get("count")))
+    row = next((r for r in (http("GET", "/products/statistics?limit=100&" + PERIOD)[1] or {}).get("data", []) if r.get("name") == P + "-prod-00"), None)
+    check("... a product: 1 deal, 10 a unit, 20 a deal (quantity × price)",
+          row and row.get("deal_count") == 1 and num(row.get("average_price_per_product")) == 10 and num(row.get("total_price_sold")) == 20, row)
+
     status, body = http("GET", "/analytics/deals")
     check("200 with the stages of the active pipeline", status == 200 and isinstance((body or {}).get("stages"), list) and body["stages"], "%s %s" % (status, message_of((status, body))))
     status, body = http("GET", "/analytics/deals?is_active=maybe")
@@ -575,9 +632,16 @@ def main():
           not os.path.exists(os.path.join(CLIENT, "pages", "analytics", "managers", "[id].vue"))
           and not os.path.exists(os.path.join(CLIENT, "pages", "analytics", "events", "[id].vue")))
     calls_vue = client_file(os.path.join("pages", "analytics", "calls", "index.vue"))
-    check("calls page: durations are labelled in minutes", calls_vue.count("(мин)") == 4 and "name: 'avg_duration'" in calls_vue)
+    check("calls page: durations as «м:сс» / «1 ч 05 мин» from the seconds (was «0.2» minutes)",
+          "clock(" in calls_vue and "spoken(" in calls_vue and "avg_duration_sec" in calls_vue)
+    for page in ("sales/index.vue", "calls/index.vue", "managers/index.vue", "employees/index.vue", "products/index.vue", "consolidated.vue"):
+        text = client_file(os.path.join("pages", "analytics", *page.split("/")))
+        check("%s: the one period picker (PeriodPicker + useReportPeriod)" % page, "<PeriodPicker" in text and "useReportPeriod(" in text)
     consolidated_vue = client_file(os.path.join("pages", "analytics", "consolidated.vue"))
-    check("consolidated page: the chart has the third line 'Закрытых без успеха'", "Закрытых без успеха" in consolidated_vue and "item.lost_count" in consolidated_vue)
+    check("consolidated page: the chart has the third series 'Закрытые без успеха' (bars), tasks without an assignee are named",
+          "Закрытые без успеха" in consolidated_vue and "item.lost_count" in consolidated_vue and "Без ответственного" in consolidated_vue)
+    index_vue = client_file(os.path.join("pages", "analytics", "index.vue"))
+    check("/analytics is not empty: links to the reports (SCR3-18)", "/analytics/consolidated" in index_vue and "/analytics/sales" in index_vue)
     goals_vue = client_file(os.path.join("pages", "analytics", "goals", "index.vue"))
     check("goals page reads the group plan from 'objectives'", "objetives" not in goals_vue and "group.objectives" in goals_vue)
 

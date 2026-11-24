@@ -12,6 +12,7 @@ Usage: py local/checks/bot_check.py      (exit code 1 on any FAIL)
 """
 import base64
 import json
+import math
 import os
 import random
 import secrets
@@ -273,7 +274,8 @@ def main():
             status, task = api("POST", "/tasks", {"label": f"{TAG} {key}", "type_id": type_id,
                                                   "assign_to": {"target": "agent", "id": A["id"]},
                                                   "link_to": {"target": "company", "id": company_id},
-                                                  "start_time": iso(start), "end_time": iso(end), "allDay": False}, A["token"])
+                                                  "start_time": iso(start), "end_time": iso(end), "allDay": False,
+                                                  "allow_past": True}, A["token"])  # the overdue one on purpose (TASK_IN_PAST)
             task_ids[key] = task.get("id") if isinstance(task, dict) else None
         check("test tasks created through the API", all(task_ids.values()), task_ids)
 
@@ -310,8 +312,9 @@ def main():
         print("== digest and reminders")
         LOG_SEQ[0] = 0
         digest = tg_wait(lambda e: e["method"] == "sendMessage" and e["chat_id"] == str(A["chat"]) and "Доброе утро" in e["text"], 20)
-        check("morning digest to A lists the overdue task with a done button",
-              digest is not None and f"{TAG} overdue" in digest["text"] and button(digest, "done:"), digest)
+        check("morning digest to A lists the overdue task with a button that opens it (time and task on the button)",
+              digest is not None and f"{TAG} overdue" in digest["text"] and button(digest, "tk:")
+              and any(f"{TAG} overdue"[:20] in b["text"] for row in digest["keyboard"] for b in row), digest)
         reminder = tg_wait(lambda e: e["method"] == "sendMessage" and e["chat_id"] == str(A["chat"]) and e["text"].startswith("⏰"), 20)
         check("reminder ~5 minutes before the task, to A", reminder is not None and f"{TAG} soon" in reminder["text"], reminder)
         time.sleep(8)
@@ -321,13 +324,26 @@ def main():
         check("B has no tasks: no digest", not any("Доброе утро" in e["text"] for e in tg_entries(B["chat"])))
         check("digest date is stored", psql(f"select digest_on is not null from bot_account where user_id = {A['id']}") == "t")
 
-        press(A["chat"], f"done:{task_ids['soon']}", reminder["message_id"])
+        check("the reminder has the task's buttons: done, move, edit (no delete without the right)",
+              reminder is not None and button(reminder, f"dn:{task_ids['soon']}") and button(reminder, "mv:") and button(reminder, "ed:")
+              and not button(reminder, "dl:"), reminder)
+        press(A["chat"], f"dn:{task_ids['soon']}", reminder["message_id"])
+        asked = reply(A["chat"], "Напишите итог")
+        check("'Выполнено' does not close the task at once: it asks for the outcome (or 'Закрыть без итога')",
+              asked is not None and button(asked, f"dc:{task_ids['soon']}") and button(asked, "ax:")
+              and psql(f"select closed_at is null from task where id = {task_ids['soon']}") == "t", asked)
+        send_text(A["chat"], f"{TAG} договорились об отгрузке")
+        done = reply(A["chat"], "Задача закрыта")
+        check("the next message is the outcome: the task is closed with it (not sent to the assistant)",
+              done is not None and psql(f"select result from task where id = {task_ids['soon']}") == f"{TAG} договорились об отгрузке"
+              and not reply(A["chat"], "FAKE ANSWER", timeout=2), done)
+        time.sleep(1)
+        ev = psql(f"select task_id, after_state->'data'->>'via' from event where type = 7 and task_id = {task_ids['soon']} order by id desc limit 1")
+        check("the history entry of the closing names the task and that it was done in the bot (BOT-5)", ev == f"{task_ids['soon']}|bot", ev)
+        press(B["chat"], f"dn:{task_ids['overdue']}", 1)
         ans = tg_wait(lambda e: e["method"] == "answerCallbackQuery", 15)
-        check("'Выполнено' under the reminder closes the task", ans and ans["text"] == "Задача закрыта"
-              and psql(f"select result from task where id = {task_ids['soon']}") == "Выполнено (отмечено в Telegram)", ans)
-        press(B["chat"], f"done:{task_ids['overdue']}", 1)
-        ans = tg_wait(lambda e: e["method"] == "answerCallbackQuery", 15)
-        check("B cannot close A's task", ans and "нет прав" in (ans["text"] or "") and psql(f"select closed_at is null from task where id = {task_ids['overdue']}") == "t", ans)
+        check("B cannot close A's task", ans and ("нет прав" in (ans["text"] or "").lower() or "нет доступа" in (ans["text"] or ""))
+              and psql(f"select closed_at is null from task where id = {task_ids['overdue']}") == "t", ans)
 
         print("== commands")
         send_text(A["chat"], "/tasks")
@@ -349,12 +365,14 @@ def main():
         check("Claude CLI: no built-in tools, only this MCP config, one-run settings",
               args[args.index("--tools") + 1] == "" and "--strict-mcp-config" in args and "--setting-sources" in args
               and "--no-session-persistence" in args, args)
+        # 11 CRM tools, and deal_summary of the AI (src/ai) while AI_FEATURES and AI_SUMMARY are on
+        tool_count = 11 + ("mcp__crm__deal_summary" in (rec.get("allowedTools") or []))
         check("Claude CLI: allowed tools are only the CRM tools",
-              rec.get("allowedTools") and all(t.startswith("mcp__crm__") for t in rec["allowedTools"]) and len(rec["allowedTools"]) == 8, rec.get("allowedTools"))
+              rec.get("allowedTools") and all(t.startswith("mcp__crm__") for t in rec["allowedTools"]) and len(rec["allowedTools"]) == tool_count, rec.get("allowedTools"))
         check("MCP config is a private file (0600), removed after the run",
               rec.get("mcpFileMode") == "600" and in_app("ls /tmp | grep -c crm-mcp- || true") == "0", rec.get("mcpFileMode"))
-        check("MCP endpoint is on 127.0.0.1 and lists 8 tools with plain JSON schemas",
-              rec.get("mcpUrl", "").startswith("http://127.0.0.1:") and len(rec.get("toolsListed", [])) == 8 and rec.get("schemasOk") and rec.get("notifyStatus") == 202, rec)
+        check(f"MCP endpoint is on 127.0.0.1 and lists {tool_count} tools with plain JSON schemas",
+              rec.get("mcpUrl", "").startswith("http://127.0.0.1:") and len(rec.get("toolsListed", [])) == tool_count and rec.get("schemasOk") and rec.get("notifyStatus") == 202, rec)
         check("model Opus with medium effort", rec.get("model") == "claude-opus-5-5" and rec.get("effort") == "medium", rec)
         check("our system prompt, current date, no API key passed",
               rec.get("systemIsBot") and rec.get("textHasNow") and rec.get("envHasApiKey") is False, rec)
@@ -400,6 +418,9 @@ def main():
         prepared = confirm_message(A["chat"])
         check("prepare_task saves nothing yet", psql(f"select count(*) from task where label = '{label}'") == "0")
         check("bot shows the task with confirm/cancel buttons", prepared and button(prepared, "ok:") and button(prepared, "no:") and "15:00" in prepared["text"], prepared)
+        weekday = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"][datetime.strptime(day, "%Y-%m-%d").weekday()]
+        check("the confirmation has the weekday, the start and the end: 'вт 24.11.2026 15:00–15:30' (BOT-13)",
+              prepared and f"{weekday} {datetime.strptime(day, '%Y-%m-%d').strftime('%d.%m.%Y')} 15:00–15:30" in prepared["text"], prepared)
         ok_data = button(prepared, "ok:")
         press(B["chat"], ok_data, prepared["message_id"])
         ans = tg_wait(lambda e: e["method"] == "answerCallbackQuery", 15)
@@ -438,6 +459,8 @@ def main():
         psql(f"update deal set closed_at = now() where id = {deal_a2}")
 
         print("== reminders: a task of a group, a task moved after its reminder")
+        # A may change the tasks of the group (task level "group"); C (banned) may not: only A is reminded
+        psql(f"""update "user" set permissions = jsonb_set(permissions, '{{task,update}}', '2') where id = {A['id']}""")
         tg_mark()
         soon = datetime.now(timezone.utc) + timedelta(minutes=5)
         status, gtask = api("POST", "/tasks", {"label": f"{TAG} group-task", "type_id": type_id,
@@ -447,24 +470,56 @@ def main():
         status2, mtask = api("POST", "/tasks", {"label": f"{TAG} moved-task", "type_id": type_id,
                                                 "assign_to": {"target": "agent", "id": A["id"]},
                                                 "link_to": {"target": "deal", "id": deal_a},
-                                                "start_time": iso(soon), "end_time": iso(soon + timedelta(minutes=30)), "allDay": False}, A["token"])
+                                                "start_time": iso(soon), "end_time": iso(soon + timedelta(minutes=30)), "allDay": False,
+                                                "allow_duplicate": True}, A["token"])  # same deal, same time on purpose (TASK_DUPLICATE)
         check("tasks for the reminders created", status == 201 and status2 == 201, (status, gtask, status2, mtask))
         r = tg_wait(lambda e: e["method"] == "sendMessage" and e["chat_id"] == str(A["chat"]) and f"{TAG} group-task" in e["text"], 40)
-        check("a task of A's group is reminded to A (it used to be reminded to nobody)",
-              r is not None and r["text"].startswith("⏰") and "Задача группы" in r["text"] and button(r, "done:"), r)
-        r = tg_wait(lambda e: e["method"] == "sendMessage" and e["chat_id"] == str(A["chat"]) and f"{TAG} moved-task" in e["text"], 40)
-        check("A's task is reminded", r is not None, r)
+        check("a task of A's group is reminded to A, who may close it (it used to be reminded to nobody)",
+              r is not None and r["text"].startswith("⏰") and "задача группы" in r["text"].lower() and button(r, "tk:"), r)
+        check("two tasks of the same minute come in one message with a button per task (BOT-15)",
+              r is not None and f"{TAG} moved-task" in r["text"] and "Скоро 2 задачи" in r["text"]
+              and len([b for row in r["keyboard"] for b in row if b["callback_data"].startswith("tk:")]) == 2, r)
+        time.sleep(3)
+        check("C of the same group may not close the group's tasks: no reminder to C (BOT-6)",
+              not any(f"{TAG} group-task" in e.get("text", "") for e in tg_entries(C["chat"])), tg_entries(C["chat"]))
+        if isinstance(gtask, dict) and gtask.get("id"):
+            send_text(C["chat"], "/tasks")
+            e = reply(C["chat"])
+            check("... and C's /tasks does not list it", e is not None and f"{TAG} group-task" not in e["text"], e)
+            send_text(A["chat"], "/tasks")
+            e = reply(A["chat"])
+            check("A's /tasks lists the group's task", e is not None and f"{TAG} group-task" in e["text"], e)
+        stored = psql(f"select r.start_time = t.start_time from bot_reminder r join task t on t.id = r.task_id where r.task_id = {mtask.get('id') if isinstance(mtask, dict) else 0}")
+        check("bot_reminder keeps the start time it reminded for", stored == "t", stored)
         if isinstance(mtask, dict) and mtask.get("id"):
             later = datetime.now(timezone.utc) + timedelta(minutes=8)
             tg_mark()
             # moved with the times only, as a drag in the calendar sends it
-            status, _ = api("PATCH", f"/tasks/{mtask['id']}", {"start_time": iso(later), "end_time": iso(later + timedelta(minutes=30)), "allDay": False}, A["token"])
+            status, _ = api("PATCH", f"/tasks/{mtask['id']}", {"start_time": iso(later), "end_time": iso(later + timedelta(minutes=30)), "allDay": False,
+                                                               "allow_duplicate": True}, A["token"])
             r = tg_wait(lambda e: e["method"] == "sendMessage" and e["chat_id"] == str(A["chat"]) and f"{TAG} moved-task" in e["text"], 40)
             check("moved to a new time -> reminded again before the new time (the 'reminded' mark stayed for good)",
                   status == 200 and r is not None, (status, r))
             check("... and the moved task is still on its deal", psql(f"select deal_id from task where id = {mtask['id']}") == str(deal_a))
+            # moved not through the task service (a trigger, SQL): the reminder is keyed by the start time too (BOT-2)
+            tg_mark()
+            psql(f"update task set start_time = now() + interval '6 minutes', end_time = now() + interval '36 minutes' where id = {mtask['id']}")
+            r = tg_wait(lambda e: e["method"] == "sendMessage" and e["chat_id"] == str(A["chat"]) and f"{TAG} moved-task" in e["text"], 40)
+            check("moved by SQL to a new time -> reminded again before the new time (BOT-2)", r is not None, r)
+        # a task that started minutes ago is not reminded with «сейчас» (BOT-15)
+        tg_mark()
+        started = datetime.now(timezone.utc) - timedelta(minutes=5)
+        api("POST", "/tasks", {"label": f"{TAG} started-task", "type_id": type_id, "assign_to": {"target": "agent", "id": A["id"]},
+                               "link_to": {"target": "company", "id": company_id}, "start_time": iso(started),
+                               "end_time": iso(started + timedelta(minutes=30)), "allDay": False, "allow_past": True}, A["token"])
+        time.sleep(15)
+        check("a task that started 5 minutes ago gets no '⏰ сейчас' reminder (BOT-15)",
+              not any(f"{TAG} started-task" in e.get("text", "") for e in tg_entries(A["chat"])), tg_entries(A["chat"]))
+        psql(f"""update "user" set permissions = jsonb_set(permissions, '{{task,update}}', '1') where id = {A['id']}""")
         e = ask(C["chat"], f'[[tool prepare_company {{"name": "{TAG} Новая"}}]]')
         check("C (no right to create companies) cannot prepare one", e and "нет права создавать" in e["text"], e)
+
+        task_buttons(A, B, C, admin, type_id, company_id, deal_a, deal_b, groups)
 
         print("== card photo")
         psql(f"delete from \"user\" where company_id in (select id from company where name = '{CARD_NAME}'); delete from company where name = '{CARD_NAME}'")
@@ -537,16 +592,21 @@ def main():
             check("broken audio: clear answer", reply(A["chat"], "Не смог прочитать звук", timeout=30) is not None)
 
             status, _ = http("POST", stt_url + "/_test/outage", {"seconds": 60})
-            check("the dev speech service can simulate an outage (STT_TEST_HOOKS=1 in crm-dev-stt)", status == 200, status)
-            try:
-                send_voice(A["chat"], sample, 3)
-                e = reply(A["chat"], "недоступно", timeout=60)
-                sent = [x["text"] for x in tg_entries(A["chat"]) if x["method"] == "sendMessage"]
-                check("speech service down: clear answer, nothing shown or sent to the assistant",
-                      e is not None and not any(t.startswith("🎤") or "FAKE ANSWER" in t for t in sent), sent)
-                check("speech service down: typed messages still work", ask(A["chat"], "привет") is not None)
-            finally:
-                http("POST", stt_url + "/_test/outage", {"seconds": 0})
+            if status == 404:
+                # the speech service of this stand has no test hooks (STT_TEST_HOOKS is off: the production service,
+                # shared by the QA stand, must never have them): the outage cannot be simulated here, only on the dev copy
+                print("SKIP  speech service outage (STT_TEST_HOOKS=1 only in crm-dev-stt; this stand's service answers 404)")
+            else:
+                check("the dev speech service can simulate an outage (STT_TEST_HOOKS=1 in crm-dev-stt)", status == 200, status)
+                try:
+                    send_voice(A["chat"], sample, 3)
+                    e = reply(A["chat"], "недоступно", timeout=60)
+                    sent = [x["text"] for x in tg_entries(A["chat"]) if x["method"] == "sendMessage"]
+                    check("speech service down: clear answer, nothing shown or sent to the assistant",
+                          e is not None and not any(t.startswith("🎤") or "FAKE ANSWER" in t for t in sent), sent)
+                    check("speech service down: typed messages still work", ask(A["chat"], "привет") is not None)
+                finally:
+                    http("POST", stt_url + "/_test/outage", {"seconds": 0})
             send_voice(A["chat"], sample, 3)
             check("speech service back: voice works again", reply(A["chat"], "🎤", timeout=60) is not None and reply(A["chat"], "FAKE ANSWER", timeout=60))
 
@@ -568,12 +628,16 @@ def main():
 
         print("== linked again in another chat: the previous chat is told (it used to be dropped silently)")
         other = 7_950_000_000 + random.randint(1, 10**6)
+        psql(f"update bot_account set digest_on = (now())::date where user_id = {C['id']}")
         status, link = api("POST", "/bot/link", token=C["token"])
         e = ask(other, "/start " + link["url"].split("start=")[1], contains="вы вошли как") if status == 201 else None
         told = reply(C["chat"], "подключил бота CRM в другом чате")
         check("C links the bot in another chat: the new chat is linked, the previous one is told and unlinked",
               e is not None and told is not None and psql(f"select chat_id from bot_account where user_id = {C['id']}") == str(other),
               (status, e, told))
+        check("... the previous chat is told the new Telegram account (BOT-14)", told is not None and "@tester" in told["text"], told)
+        check("... and today's digest is not sent again: the digest date stays (BOT-14)",
+              psql(f"select digest_on = (now())::date from bot_account where user_id = {C['id']}") == "t")
         status, link = api("POST", "/bot/link", token=C["token"])
         e = ask(C["chat"], "/start " + link["url"].split("start=")[1], contains="вы вошли как") if status == 201 else None
         check("... and back in the first chat", e is not None and psql(f"select chat_id from bot_account where user_id = {C['id']}") == str(C["chat"]), e)
@@ -592,6 +656,215 @@ def main():
     passed = sum(results)
     print(f"\nRESULT: {passed} passed, {len(results) - passed} failed")
     return 1 if passed != len(results) else 0
+
+
+KAR = timezone(timedelta(hours=5))  # the CRM's zone (Asia/Karachi, like Tashkent)
+
+
+def set_perm(user, path, value):
+    psql(f"""update "user" set permissions = jsonb_set(permissions, '{{{path}}}', '{value}') where id = {user['id']}""")
+
+
+def buttons_of(entry):
+    return [b for row in (entry or {}).get("keyboard") or [] for b in row]
+
+
+def task_row(task_id):
+    return psql(f"select to_char(start_time, 'YYYY-MM-DD HH24:MI'), \"allDay\", label, closed_at is null from task where id = {task_id}")
+
+
+def task_buttons(A, B, C, admin, type_id, company_id, deal_a, deal_b, groups):
+    """The bot as a full way to work with tasks: the card and its buttons, the list, assigning, personal and contact tasks."""
+    print("== task buttons: /tasks, the card, move, edit, delete")
+    now = datetime.now(timezone.utc)
+
+    def make(label, start, minutes=30, user=A, link=None):
+        status, task = api("POST", "/tasks", {"label": label, "type_id": type_id, "assign_to": {"target": "agent", "id": user["id"]},
+                                              "link_to": link or {"target": "company", "id": company_id},
+                                              "start_time": iso(start), "end_time": iso(start + timedelta(minutes=minutes)), "allDay": False,
+                                              "allow_past": True, "allow_duplicate": True}, user["token"])
+        return task.get("id") if isinstance(task, dict) else None
+
+    # two tasks whose names differ only at the end, and enough overdue ones for a second page (BOT-9)
+    twin1 = make(f"{TAG} Позвонить клиенту по оплате счёта №101 и уточнить сроки", now - timedelta(hours=40))
+    twin2 = make(f"{TAG} Позвонить клиенту по оплате счёта №102 и уточнить сроки", now - timedelta(hours=39))
+    extra = [make(f"{TAG} list-{i}", now - timedelta(hours=30 + i)) for i in range(8)]
+    check("tasks for the list created", twin1 and twin2 and all(extra), (twin1, twin2, extra))
+    send_text(A["chat"], "/tasks")
+    lst = reply(A["chat"], "Просрочено")
+    labels = [b["text"] for b in buttons_of(lst) if b["callback_data"].startswith("tk:")]
+    check("/tasks: numbered task buttons with the time, at most 60 characters, all different (BOT-9)",
+          lst is not None and len(labels) == 8 and all(len(t) <= 60 for t in labels) and len(set(labels)) == len(labels)
+          and labels[0].startswith("1. ") and any(":" in t for t in labels), labels)
+    more = button(lst, "tp:")
+    check("/tasks: more than a page -> 'Ещё' button", more == "tp:1", buttons_of(lst))
+    if more:
+        press(A["chat"], more, lst["message_id"])
+        page = tg_wait(lambda e: e["method"] == "editMessageReplyMarkup" and e["message_id"] == lst["message_id"], 15)
+        nums = [b["text"].split(".")[0] for b in buttons_of(page) if b["callback_data"].startswith("tk:")]
+        check("'Ещё' shows the next tasks (9., 10., …) and 'Назад'", page is not None and nums and nums[0] == "9" and button(page, "tp:0"), page)
+
+    # the card
+    press(A["chat"], f"tk:{twin1}", lst["message_id"] if lst else 1)
+    card = reply(A["chat"], "Позвонить клиенту по оплате счёта №101")
+    check("a task button opens its card: client, time with the weekday, buttons done / move / edit, no delete without the right",
+          card is not None and "клиент" in card["text"] and button(card, f"dn:{twin1}") and button(card, f"mv:{twin1}")
+          and button(card, f"ed:{twin1}") and not button(card, "dl:"), card)
+    unmoved = task_row(twin1)
+    press(B["chat"], f"mh:{twin1}", 1)
+    ans = tg_wait(lambda e: e["method"] == "answerCallbackQuery", 15)
+    check("B cannot move A's task", ans is not None and "Нет прав" in (ans["text"] or "") and task_row(twin1) == unmoved, (ans, unmoved))
+
+    # «Перенести» -> +1 час, then «Вернуть как было» (BOT-1)
+    before = task_row(twin1).split("|")[0]
+    press(A["chat"], f"mv:{twin1}", card["message_id"])
+    menu = tg_wait(lambda e: e["method"] == "editMessageReplyMarkup" and e["message_id"] == card["message_id"], 15)
+    check("'Перенести': +1 час, завтра 10:00, своя дата", menu is not None and button(menu, "mh:") and button(menu, "mt:") and button(menu, "mc:"), menu)
+    press(A["chat"], f"mh:{twin1}", card["message_id"])
+    moved = reply(A["chat"], "Задача перенесена")
+    after = task_row(twin1).split("|")[0]
+    expected = datetime.fromtimestamp(math.ceil((time.time() + 3600) / 300) * 300, KAR)
+    check("+1 час: a task whose time has passed goes to an hour from now; the answer has the old and the new time and 'Вернуть'",
+          moved is not None and button(moved, "ub:") and after != before
+          and abs((datetime.strptime(after, "%Y-%m-%d %H:%M").replace(tzinfo=KAR) - expected).total_seconds()) <= 600, (moved, before, after))
+    if moved and button(moved, "ub:"):
+        press(A["chat"], button(moved, "ub:"), moved["message_id"])
+        tg_wait(lambda e: e["method"] == "editMessageText" and "Вернул" in (e.get("text") or ""), 15)
+        check("'Вернуть как было' puts the old time back", task_row(twin1).split("|")[0] == before, (before, task_row(twin1)))
+    press(A["chat"], f"mt:{twin1}", card["message_id"])
+    reply(A["chat"], "Задача перенесена")
+    tomorrow = (datetime.now(KAR) + timedelta(days=1)).strftime("%Y-%m-%d")
+    check("'Завтра 10:00' moves the task to tomorrow 10:00", task_row(twin1).split("|")[0] == f"{tomorrow} 10:00", task_row(twin1))
+    ev = psql(f"select count(*) from event where type = 17 and task_id = {twin1} and after_state->'data'->>'via' = 'bot'")
+    check("the moves are in the task's history as made in the bot", ev not in ("", "0"), ev)
+
+    # «Своя дата»: typed date, confirmation with the weekday (BOT-1, BOT-13)
+    press(A["chat"], f"mc:{twin1}", card["message_id"])
+    check("'Своя дата' asks for the date", reply(A["chat"], "Новые дата и время") is not None)
+    send_text(A["chat"], "послезавтра 15:30")
+    conf = confirm_message(A["chat"])
+    day2 = datetime.now(KAR) + timedelta(days=2)
+    weekday = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"][day2.weekday()]
+    check("the typed date becomes a confirmation 'было → стало' with the weekday",
+          conf is not None and f"{weekday} {day2.strftime('%d.%m.%Y')} 15:30" in conf["text"] and "→" in conf["text"], conf)
+    if conf:
+        press(A["chat"], button(conf, "ok:"), conf["message_id"])
+        tg_wait(lambda e: e["method"] == "editMessageText" and "Задача изменена" in (e.get("text") or ""), 15)
+    check("confirmed: the task is on the new date", task_row(twin1).split("|")[0] == f"{day2.strftime('%Y-%m-%d')} 15:30", task_row(twin1))
+    press(A["chat"], f"mc:{twin1}", card["message_id"])
+    reply(A["chat"], "Новые дата и время")
+    send_text(A["chat"], "когда-нибудь потом")
+    check("a text that is not a date: the bot says so and waits", reply(A["chat"], "Не понял дату") is not None)
+    press(A["chat"], f"ax:{twin1}", 1)
+    tg_wait(lambda e: e["method"] == "answerCallbackQuery", 15)
+    check("'Не переносить' ends it: the next text goes to the assistant", ask(A["chat"], "привет") is not None)
+
+    # «Изменить» -> «Текст» (BOT-1)
+    press(A["chat"], f"ed:{twin1}", card["message_id"])
+    menu = tg_wait(lambda e: e["method"] == "editMessageReplyMarkup" and e["message_id"] == card["message_id"], 15)
+    check("'Изменить': text, date and time, back", menu is not None and button(menu, "et:") and button(menu, "mc:") and button(menu, "bk:"), menu)
+    press(A["chat"], f"et:{twin1}", card["message_id"])
+    reply(A["chat"], "новый текст")
+    send_text(A["chat"], f"{TAG} Позвонить по оплате, новый текст")
+    conf = confirm_message(A["chat"])
+    if conf:
+        press(A["chat"], button(conf, "ok:"), conf["message_id"])
+        tg_wait(lambda e: e["method"] == "editMessageText" and "Задача изменена" in (e.get("text") or ""), 15)
+    check("the new text is saved after the confirmation", task_row(twin1).split("|")[2] == f"{TAG} Позвонить по оплате, новый текст", task_row(twin1))
+
+    # «Удалить» with a confirmation, only with the right (BOT-1)
+    press(A["chat"], f"dl:{twin2}", 1)
+    ans = tg_wait(lambda e: e["method"] == "answerCallbackQuery", 15)
+    check("without the right to delete tasks: 'Удалить' is refused", ans is not None and "Нет прав" in (ans["text"] or "") and task_row(twin2), ans)
+    set_perm(A, "task,delete", 1)
+    try:
+        press(A["chat"], f"tk:{twin2}", 1)
+        card2 = reply(A["chat"], "№102")
+        check("with the right the card has 'Удалить'", card2 is not None and button(card2, f"dl:{twin2}"), card2)
+        press(A["chat"], f"dl:{twin2}", card2["message_id"] if card2 else 1)
+        conf = confirm_message(A["chat"])
+        check("'Удалить' asks first and saves nothing yet", conf is not None and "Удалить задачу" in conf["text"] and task_row(twin2), conf)
+        if conf:
+            press(A["chat"], button(conf, "ok:"), conf["message_id"])
+            tg_wait(lambda e: e["method"] == "editMessageText" and "удалена" in (e.get("text") or ""), 15)
+        check("confirmed: the task is deleted", psql(f"select count(*) from task where id = {twin2}") == "0")
+    finally:
+        set_perm(A, "task,delete", 0)
+
+    # «Выполнено» -> «Закрыть без итога» (BOT-3)
+    press(A["chat"], f"dn:{extra[0]}", 1)
+    asked = reply(A["chat"], "Напишите итог")
+    press(A["chat"], f"ax:{extra[0]}", asked["message_id"] if asked else 1)
+    tg_wait(lambda e: e["method"] == "answerCallbackQuery", 15)
+    check("'Не закрывать' leaves the task open", task_row(extra[0]).endswith("|t"), task_row(extra[0]))
+    press(A["chat"], f"dn:{extra[0]}", 1)
+    asked = reply(A["chat"], "Напишите итог")
+    press(A["chat"], f"dc:{extra[0]}", asked["message_id"] if asked else 1)
+    tg_wait(lambda e: e["method"] == "answerCallbackQuery", 15)
+    check("'Закрыть без итога' closes it with 'Выполнено (отмечено в Telegram)'",
+          psql(f"select result from task where id = {extra[0]}") == "Выполнено (отмечено в Telegram)")
+
+    print("== tasks through the assistant: personal, on a contact, to a colleague, on a colleague's deal")
+    day = (datetime.now(KAR) + timedelta(days=4)).strftime("%Y-%m-%d")
+    e = ask(A["chat"], f'[[tool prepare_task {{"title": "{TAG} личный отчёт", "date": "{day}", "time": "09:30"}}]]')
+    conf = confirm_message(A["chat"])
+    check("a personal task without a client is prepared (BOT-12)", conf is not None and "личная задача" in conf["text"], (e, conf))
+    if conf:
+        press(A["chat"], button(conf, "ok:"), conf["message_id"])
+        tg_wait(lambda e: e["method"] == "editMessageText" and "Задача создана" in (e.get("text") or ""), 15)
+    row = psql(f"select agent_id, deal_id is null and company_id is null and ctr_agent_id is null from task where label = '{TAG} личный отчёт'")
+    check("... and created for A, linked to nothing", row == f"{A['id']}|t", row)
+    contact = psql(f"insert into \"user\" (username, role, company_id) values ('{TAG} контакт', 'ctr_agent', {company_id}) returning id").split("\n")[0]
+    e = ask(A["chat"], f'[[tool prepare_task {{"title": "{TAG} контакт-задача", "date": "{day}", "time": "10:00", "contact_id": {contact}}}]]')
+    conf = confirm_message(A["chat"])
+    if conf:
+        press(A["chat"], button(conf, "ok:"), conf["message_id"])
+        tg_wait(lambda e: e["method"] == "editMessageText" and "Задача создана" in (e.get("text") or ""), 15)
+    check("a task on a contact person (BOT-12)", psql(f"select ctr_agent_id from task where label = '{TAG} контакт-задача'") == contact, (e, conf))
+
+    e = ask(A["chat"], f'[[tool prepare_task {{"title": "{TAG} коллеге", "date": "{day}", "time": "11:00", "assignee_user_id": {B["id"]}}}]]')
+    check("A (tasks: own) cannot give a task to B: the web's rule (BOT-11)", e is not None and "Задачу можно поставить только" in e["text"], e)
+    set_perm(A, "task,update", 3)
+    set_perm(A, "deal,update", 3)
+    set_perm(A, "deal,view", 3)
+    try:
+        e = ask(A["chat"], f'[[tool prepare_task {{"title": "{TAG} коллеге", "date": "{day}", "time": "11:00", "assignee_user_id": {B["id"]}}}]]')
+        conf = confirm_message(A["chat"])
+        check("with the right: the confirmation names the colleague (BOT-11)", conf is not None and f"Исполнитель: {B['username']}" in conf["text"], (e, conf))
+        if conf:
+            press(A["chat"], button(conf, "ok:"), conf["message_id"])
+            told = reply(B["chat"], "поручил(а) вам задачу")
+            check("B gets the task in the bot with its buttons", told is not None and f"{TAG} коллеге" in told["text"] and button(told, "dn:"), told)
+        check("... saved for B", psql(f"select agent_id from task where label = '{TAG} коллеге'") == str(B["id"]))
+        # a task on B's deal: the confirmation names B as the responsible, one press gives it to B (BOT-10)
+        e = ask(A["chat"], f'[[tool prepare_task {{"title": "{TAG} по сделке B", "date": "{day}", "time": "12:00", "deal_id": {deal_b}}}]]')
+        conf = confirm_message(A["chat"])
+        check("a task on a colleague's deal shows its responsible and 'Поручить ответственному'",
+              conf is not None and f"Ответственный по сделке: {B['username']}" in conf["text"] and button(conf, "rs:"), (e, conf))
+        if conf:
+            press(A["chat"], button(conf, "rs:"), conf["message_id"])
+            edited = tg_wait(lambda e: e["method"] == "editMessageText" and e["message_id"] == conf["message_id"], 15)
+            check("'Поручить ответственному' makes B the assignee", edited is not None and f"Исполнитель: {B['username']}" in edited["text"], edited)
+            press(A["chat"], button(conf, "no:"), conf["message_id"])
+            tg_wait(lambda e: e["method"] == "answerCallbackQuery", 15)
+    finally:
+        set_perm(A, "task,update", 1)
+        set_perm(A, "deal,update", 1)
+        set_perm(A, "deal,view", 1)
+
+    # limit 2: the fake assistant cuts a tool result at 1500 characters (local/fake-claude/claude), and A's
+    # overdue list (the list-N tasks above) is longer than that, so the cut JSON would not parse
+    e = ask(A["chat"], f'[[tool list_tasks {{"period": "overdue", "limit": 2}}]]')
+    tasks = tool_result(e, "list_tasks")
+    target = extra[1]
+    e = ask(A["chat"], f'[[tool prepare_update_task {{"task_id": {target}, "time": "16:45"}}]]')
+    conf = confirm_message(A["chat"])
+    check("prepare_update_task: a new time for confirmation (it was 'Нет такого инструмента')",
+          isinstance(tasks, dict) and len(tasks.get("tasks") or []) == 2 and all(t.get("overdue") for t in tasks["tasks"])
+          and conf is not None and "16:45" in conf["text"] and "→" in conf["text"], (tasks if not isinstance(tasks, dict) else "", e, conf))
+    e = ask(A["chat"], f'[[tool prepare_close_task {{"task_id": {target}, "result": "сделано"}}]]')
+    conf = confirm_message(A["chat"])
+    check("the close confirmation names the client and the time (BOT-13)", conf is not None and "клиент" in conf["text"] and "Итог: сделано" in conf["text"], conf)
 
 
 def cleanup():

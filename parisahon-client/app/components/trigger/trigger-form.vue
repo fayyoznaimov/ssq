@@ -1,4 +1,8 @@
 <script setup lang="ts">
+// The form of one trigger of a stage: conditions, when, what it does, the history of its runs. It opens
+// as a wide panel over the page (it used to be a narrow dropdown inside the stage column, cut off by the
+// scrolling list and hard to read); read-only for those who may not change triggers.
+import { onKeyStroke } from '@vueuse/core';
 import type { Filler } from '~/types/filler';
 import { type ApplyWhen, type DealFilter, type Stage, type Trigger, TriggerType } from '~/types/stage';
 import { type User, UserRole } from '~/types/user';
@@ -9,9 +13,11 @@ import CloseTaskTrigger from './close-task-trigger.vue';
 import CreateDealTrigger from './create-deal-trigger.vue';
 import DeleteFilesTrigger from './delete-files-trigger.vue';
 import EmailTrigger from './email-trigger.vue';
+import MoveStageTrigger from './move-stage-trigger.vue';
+import NotifyTrigger from './notify-trigger.vue';
 import TaskTrigger from './task-trigger.vue';
 import TriggerRuns from './trigger-runs.vue';
-import { toStageTrigger } from './trigger';
+import { actionNames, sourceNames, toStageTrigger } from './trigger';
 
 const props = defineProps<{
     trigger: Trigger;
@@ -19,6 +25,10 @@ const props = defineProps<{
     stages?: Stage[];
     users: User[];
     fillers: Filler[];
+    // what the saved trigger names and is gone (GET /stages/:id/triggers): shown on top
+    problems?: string[];
+    // the user may change triggers (admin, manager); otherwise the form only shows the trigger
+    readonly?: boolean;
 }>();
 
 const emits = defineEmits<{
@@ -31,16 +41,13 @@ const dealFilter = ref<DealFilter>();
 const whenPicker = ref<HTMLDetailsElement>();
 const error = ref('');
 
-const afterMinuteMap: Record<number, string> = {
-    0: 'Сразу',
-    5: 'Через 5 минут',
-    10: 'Через 10 минут',
-    30: 'Через 30 минут',
-    60: 'Через час',
-    1440: 'Через день',
-    4320: 'Через 3 дня',
-    10080: 'Через неделю',
-};
+// the delay after entering the stage: any number of minutes, hours or days (0 = at once)
+const UNITS: [number, string][] = [[1, 'мин'], [60, 'ч'], [1440, 'дн.']];
+function delayText(minutes: number): string {
+    if (!minutes) return 'Сразу';
+    const [unit, name] = [...UNITS].reverse().find(([u]) => minutes % u === 0) ?? UNITS[0];
+    return `Через ${minutes / unit} ${name}`;
+}
 const weekDays = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье'];
 const months = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
 
@@ -71,9 +78,14 @@ function savedRepeat(): string {
     return defaultRepeat();
 }
 
+const savedMinutes = Number(saved.after_minutes ?? 0);
+const savedUnit = [...UNITS].reverse().find(([u]) => savedMinutes > 0 && savedMinutes % u === 0)?.[0] ?? 1;
 const when = reactive({
     kind: INTERVALS.includes(saved.when) ? 'interval' : saved.when as string,
-    afterMinutes: Number(saved.after_minutes ?? 0),
+    // right_away: the delay as a number and a unit; no_reply: minutes the client waits
+    delayAmount: saved.when === 'no_reply' ? 0 : savedMinutes / savedUnit,
+    delayUnit: saved.when === 'no_reply' ? 1 : savedUnit,
+    waitMinutes: saved.when === 'no_reply' ? savedMinutes || 30 : 30,
     date: saved.date ? String(saved.date).slice(0, 10) : `${today.getFullYear()}-${pad(today.getMonth() + 1)}-${pad(today.getDate())}`,
     time: saved.time || '10:00',
     interval: INTERVALS.includes(saved.when) ? saved.when as string : 'every_day',
@@ -88,8 +100,10 @@ const when = reactive({
     repeat: savedRepeat(),
 });
 
+const afterMinutes = computed(() => Math.max(0, Math.round(Number(when.delayAmount) * when.delayUnit)) || 0);
+
 // repeats are about events and entering the stage; a schedule repeats by itself, an exact time is once
-const repeatApplies = computed(() => when.kind === 'right_away' || isEvent(when.kind));
+const repeatApplies = computed(() => when.kind === 'right_away' || when.kind === 'no_reply' || isEvent(when.kind));
 
 function withRepeat(value: any): ApplyWhen {
     if (!repeatApplies.value) return value as ApplyWhen;
@@ -117,7 +131,9 @@ function buildApplyWhen(): ApplyWhen {
             return withRepeat(value);
         }
         case 'right_away':
-            return withRepeat({ when: 'right_away', after_minutes: Number(when.afterMinutes) });
+            return withRepeat({ when: 'right_away', after_minutes: afterMinutes.value });
+        case 'no_reply':
+            return withRepeat({ when: 'no_reply', after_minutes: Math.max(1, Math.round(Number(when.waitMinutes)) || 1) });
         default:
             // unknown here: saved as it came
             return { ...saved } as ApplyWhen;
@@ -151,14 +167,16 @@ const whenSummary = computed(() => {
         case 'call_recorded':
             return directionWord('При записи входящего звонка', 'При записи исходящего звонка', 'При записи звонка') + by;
         case 'right_away':
-            return when.afterMinutes ? `${afterMinuteMap[when.afterMinutes] ?? `Через ${when.afterMinutes} мин`} после создания или перехода в этап` : 'Сразу после создания или перехода в этап';
+            return afterMinutes.value ? `${delayText(afterMinutes.value)} после создания или перехода в этап` : 'Сразу после создания или перехода в этап';
+        case 'no_reply':
+            return `Если клиент ждёт ответа ${when.waitMinutes} мин (рабочее время)`;
         default:
             return `Условие «${when.kind}» (настроено вне этой формы)`;
     }
 });
 
 const repeatOptions = computed(() => {
-    const list: [string, string][] = isEvent(when.kind)
+    const list: [string, string][] = isEvent(when.kind) || when.kind === 'no_reply'
         ? [['every', 'каждый раз'], ['60', 'не чаще раза в час'], ['180', 'не чаще раза в 3 часа'], ['1440', 'не чаще раза в сутки'], ['once', 'только один раз для сделки']]
         : [['every', 'при каждом входе в этап'], ['1440', 'не чаще раза в сутки'], ['once', 'только один раз для сделки']];
     if (!list.some(([value]) => value === when.repeat)) list.push([when.repeat, `не чаще раза в ${when.repeat} мин`]);
@@ -170,7 +188,8 @@ const employees = computed(() => props.users.filter((u) => u.role !== UserRole.C
 const conditions = computed(() => {
     const data: DealFilter[] = [
         {label: 'Ответственный', field: 'agent_id', is_filler: false, value: ''},
-        {label: 'Бюджет', field: 'budget', is_filler: false, value: ''}
+        {label: 'Бюджет', field: 'budget', is_filler: false, value: ''},
+        {label: 'Источник сделки', field: 'source', is_filler: false, value: ''},
     ];
     for (const filler of props.fillers) {
         data.push({ label: filler.field, field: filler.field, is_filler: true, value: '', filler_id: filler.id });
@@ -188,24 +207,96 @@ function onFilterRemove(idx: number) {
     props.trigger.deal_filters.splice(idx, 1);
 }
 
+// how a condition compares: the responsible and the source are equal or not, numbers and texts more
+const OPS: Record<string, string> = { eq: 'равно', ne: 'не равно', gt: 'больше', lt: 'меньше', contains: 'содержит' };
+function opsOf(filter: DealFilter): string[] {
+    if (!filter.is_filler && (filter.field === 'agent_id' || filter.field === 'source')) return ['eq', 'ne'];
+    if (!filter.is_filler && filter.field === 'budget') return ['eq', 'ne', 'gt', 'lt'];
+    return ['eq', 'ne', 'gt', 'lt', 'contains'];
+}
+const isNumber = (value: unknown) => /^-?[0-9]+([.,][0-9]+)?$/.test(String(value ?? '').replace(/[ ]+/g, ''));
+
 function closeWhenPicker() {
     whenPicker.value?.removeAttribute('open');
 }
 
+/** Everything the trigger needs, before it is kept (the API checks again and names what is wrong). */
 function validate(): string {
     const t = props.trigger as any;
     if (when.kind === 'at_exact_time' && !when.date) return 'Укажите дату';
-    if ((when.kind === 'at_exact_time' || when.kind === 'interval') && !/^\d{2}:\d{2}$/.test(when.time)) return 'Укажите время';
-    if (t.type === TriggerType.CreateDeal && !t.create_deal_data?.stage_id) return 'Выберите этап для новой сделки';
-    if (t.type === TriggerType.SendEmail && !t.send_email_data?.template_id) return 'Выберите шаблон письма';
-    if (t.type === TriggerType.ChangeAgent && !t.change_agent_data?.agent_id) return 'Выберите ответственного';
-    if (t.type === TriggerType.ChangeFields && !t.change_fields_data?.fields?.length) return 'Добавьте хотя бы одно поле';
-    if (t.type === TriggerType.CreateTask && !t.create_task_data?.type_id) return 'Выберите тип задачи';
-    for (const f of props.trigger.deal_filters) if (!String(f.value ?? '').trim()) return `Заполните условие «${filterLabel(f)}»`;
+    if ((when.kind === 'at_exact_time' || when.kind === 'interval') && !/^[0-9]{2}:[0-9]{2}$/.test(when.time)) return 'Укажите время';
+    if (when.kind === 'right_away' && (!Number.isFinite(Number(when.delayAmount)) || Number(when.delayAmount) < 0)) return 'Задержка — число не меньше 0';
+    if (when.kind === 'no_reply' && !(Number(when.waitMinutes) >= 1)) return 'Укажите, сколько минут клиент ждёт ответа';
+    if ((when.kind === 'interval') && (when.interval === 'every_month' || when.interval === 'every_year') && !(when.day >= 1 && when.day <= 31)) return 'Число месяца — от 1 до 31';
+    for (const f of props.trigger.deal_filters) {
+        const value = String(f.value ?? '').trim();
+        if (!value) return `Заполните условие «${filterLabel(f)}»`;
+        if ((f.op === 'gt' || f.op === 'lt' || (!f.is_filler && f.field === 'budget')) && !isNumber(value)) return `Условие «${filterLabel(f)}»: укажите число`;
+    }
+    switch (t.type) {
+        case TriggerType.CreateDeal:
+            if (!t.create_deal_data?.stage_id) return 'Выберите этап для новой сделки';
+            break;
+        case TriggerType.MoveStage:
+            if (!t.move_stage_data?.stage_id) return 'Выберите этап, куда перевести сделку';
+            break;
+        case TriggerType.SendEmail:
+            if (!t.send_email_data?.template_id) return 'Выберите шаблон письма';
+            break;
+        case TriggerType.ChangeAgent: {
+            const rotation = t.change_agent_data?.rotate_user_ids ?? [];
+            if (rotation.length === 1) return 'Для раздачи по очереди выберите хотя бы двух сотрудников';
+            if (!rotation.length && !t.change_agent_data?.agent_id) return 'Выберите ответственного';
+            break;
+        }
+        case TriggerType.ChangeFields:
+            if (!t.change_fields_data?.fields?.length) return 'Добавьте хотя бы одно поле';
+            for (const f of t.change_fields_data.fields as DealFilter[]) {
+                const value = String(f.value ?? '').trim();
+                if (!f.is_filler && f.field === 'agent_id' && !value) return 'Выберите нового ответственного';
+                if (!f.is_filler && f.field === 'budget' && !isNumber(value)) return 'Бюджет — число';
+                if (!f.is_filler && f.field === 'label' && !value) return 'Укажите новое название сделки';
+            }
+            break;
+        case TriggerType.CreateTask:
+            if (!String(t.create_task_data?.label ?? '').trim()) return 'Напишите текст задачи, например «Позвонить клиенту»';
+            if (!t.create_task_data?.type_id) return 'Выберите тип задачи';
+            break;
+        case TriggerType.CloseTasks:
+            if (!String(t.close_tasks_data?.result ?? '').trim()) return 'Укажите результат закрытия задач';
+            break;
+        case TriggerType.DeleteFiles: {
+            const d = t.delete_files_data ?? {};
+            if (!d.which_files?.length && !d.with_extensions?.length && !d.from_bytes && !d.till_bytes) return 'Выберите, какие файлы удалять: без условий триггер ничего не удалит';
+            break;
+        }
+        case TriggerType.Notify:
+            if (!String(t.notify_data?.text ?? '').trim()) return 'Напишите текст уведомления';
+            break;
+    }
     return '';
 }
 
+// «что произойдёт»: the trigger in one sentence, under the form
+function valueText(filter: DealFilter): string {
+    if (!filter.is_filler && filter.field === 'agent_id') return employees.value.find((e) => String(e.id) === String(filter.value))?.username ?? String(filter.value ?? '');
+    if (!filter.is_filler && filter.field === 'source') return sourceNames[String(filter.value)] ?? String(filter.value ?? '');
+    return String(filter.value ?? '');
+}
+const conditionsSummary = computed(() => props.trigger.deal_filters
+    .filter((f) => String(f.value ?? '').trim())
+    .map((f) => `${filterLabel(f)} ${OPS[f.op ?? 'eq']} «${valueText(f)}»`)
+    .join(' и '));
+const summary = computed(() => {
+    const action = actionNames[props.trigger.type] ?? 'действие';
+    const deals = conditionsSummary.value ? `для сделок, у которых ${conditionsSummary.value}` : 'для каждой сделки этапа';
+    return `${whenSummary.value} — «${action}» ${deals}.`;
+});
+
+onKeyStroke('Escape', () => emits('cancel'));
+
 async function onTriggerSave() {
+    if (props.readonly) return;
     error.value = validate();
     if (error.value) return;
     const values = toStageTrigger(props.trigger);
@@ -231,12 +322,30 @@ watch(dealFilter, () => {
         label: dealFilter.value.label || '',
         ...(dealFilter.value.filler_id ? { filler_id: dealFilter.value.filler_id } : {}),
     });
+    nextTick(() => (dealFilter.value = undefined));
 });
 </script>
 <template>
-    <div class="absolute bottom-0 translate-y-full bg-white border border-muted-200 rounded-md z-10 w-[32rem] max-w-[calc(100vw-2rem)] trigger-dropdown dark:bg-muted-800 dark:border-muted-700">
+    <Teleport to="body">
+    <div class="fixed inset-0 z-[60] overflow-y-auto bg-muted-900/50 px-2 py-4 sm:px-6 sm:py-10">
+    <div class="trigger-dropdown relative mx-auto w-full max-w-2xl rounded-lg border border-muted-200 bg-white text-[15px] shadow-xl dark:border-muted-700 dark:bg-muted-800">
+        <header class="flex items-start justify-between gap-3 border-b border-muted-200 px-4 py-3 dark:border-muted-700">
+            <div class="min-w-0">
+                <p class="text-xs text-muted-500 dark:text-muted-400">Триггер этапа «{{ stage.name || 'новый этап' }}»{{ readonly ? ' · только просмотр' : '' }}</p>
+                <h3 class="text-lg font-semibold text-muted-800 dark:text-white">{{ actionNames[trigger.type] ?? 'Триггер' }}</h3>
+            </div>
+            <BaseButtonClose size="sm" rounded="full" @click="emits('cancel')" />
+        </header>
         <form @submit.prevent="onTriggerSave">
-            <section class="bg-muted-100 p-3 dark:bg-muted-900 rounded-t-md">
+            <div v-if="problems?.length" class="px-4 py-2 text-sm text-rose-700 bg-rose-50 dark:bg-rose-500/10 dark:text-rose-300">
+                <p class="font-medium">Триггер не сможет сработать:</p>
+                <ul class="list-disc ps-5">
+                    <li v-for="problem in problems" :key="problem">{{ problem }}</li>
+                </ul>
+                <p v-if="!readonly" class="text-xs">Исправьте настройку и нажмите «Готово», затем «Сохранить».</p>
+            </div>
+            <fieldset :disabled="readonly" class="min-w-0">
+            <section class="bg-muted-100 p-3 dark:bg-muted-900">
                 <span class="text-muted-700 text-sm dark:text-muted-200">
                     Для всех сделок у которых:
                 </span>
@@ -246,8 +355,23 @@ watch(dealFilter, () => {
                             <span class="text-sm text-muted-700 ms-3 whitespace-nowrap dark:text-muted-200"> {{ idx >= 1 ? 'И ' : '' }}
                                 {{ filterLabel(filter) }}
                             </span>
+                            <select
+                                :value="filter.op ?? 'eq'"
+                                class="bg-transparent text-primary-600 text-sm underline underline-offset-2 outline-none ms-2 dark:text-primary-200"
+                                @change="(e) => filter.op = ((e.target as HTMLSelectElement).value === 'eq' ? undefined : (e.target as HTMLSelectElement).value) as DealFilter['op']"
+                            >
+                                <option v-for="op in opsOf(filter)" :key="op" :value="op">{{ OPS[op] }}</option>
+                            </select>
+                            <select
+                                v-if="filter.field === 'source' && !filter.is_filler"
+                                v-model="filter.value"
+                                class="w-full bg-transparent px-2 py-2 text-sm outline-none"
+                            >
+                                <option value="" disabled>Выберите канал</option>
+                                <option v-for="(name, key) in sourceNames" :key="key" :value="key">{{ name }}</option>
+                            </select>
                             <BaseAutocomplete
-                                v-if="filter.field === 'agent_id'"
+                                v-else-if="filter.field === 'agent_id'"
                                 :classes="{input: 'border-none !outline-none'}"
                                 :items="employees"
                                 :properties="{label: 'username', value: 'id'}"
@@ -278,12 +402,14 @@ watch(dealFilter, () => {
                     </summary>
                     <div class="absolute top-full left-1 bg-white w-full z-20 border border-muted-200 max-h-96 overflow-y-auto dark:bg-muted-800 dark:border-muted-700 text-sm">
                         <div class="uppercase text-xs font-semibold py-2 px-7 bg-muted-200 dark:bg-muted-900">Триггеры воронки</div>
-                        <label class="flex items-center gap-2 p-2 cursor-pointer hover:bg-muted-100 dark:hover:bg-muted-700">
+                        <label class="flex items-center gap-2 p-2 cursor-pointer hover:bg-muted-100 dark:hover:bg-muted-700 flex-wrap">
                             <input type="radio" value="right_away" v-model="when.kind" class="accent-primary-600" />
-                            <select v-model.number="when.afterMinutes" class="bg-transparent text-primary-600 underline underline-offset-2 outline-none dark:text-primary-200" @click="when.kind = 'right_away'">
-                                <option v-for="(label, minutes) in afterMinuteMap" :key="minutes" :value="Number(minutes)">{{ label }}</option>
+                            <span>Через</span>
+                            <input type="number" min="0" step="1" v-model.number="when.delayAmount" class="border border-muted-300 outline-none px-2 py-1 rounded-[4px] w-20 dark:border-muted-700 dark:bg-muted-900" @focus="when.kind = 'right_away'" />
+                            <select v-model.number="when.delayUnit" class="bg-transparent text-primary-600 underline underline-offset-2 outline-none dark:text-primary-200" @click="when.kind = 'right_away'">
+                                <option v-for="[unit, name] in UNITS" :key="unit" :value="unit">{{ name }}</option>
                             </select>
-                            <span>после создания или перехода в этап</span>
+                            <span>после создания или перехода в этап (0 — сразу)</span>
                         </label>
                         <div class="uppercase text-xs font-semibold py-2 px-7 bg-muted-200 dark:bg-muted-900">Триггеры по времени</div>
                         <label class="flex items-center gap-2 p-2 cursor-pointer hover:bg-muted-100 dark:hover:bg-muted-700 flex-wrap">
@@ -355,6 +481,12 @@ watch(dealFilter, () => {
                             </select>
                             <span>звонка</span>
                         </label>
+                        <label class="flex items-center gap-2 p-2 cursor-pointer hover:bg-muted-100 dark:hover:bg-muted-700 flex-wrap">
+                            <input type="radio" value="no_reply" v-model="when.kind" class="accent-primary-600" />
+                            <span>Если клиент ждёт ответа</span>
+                            <input type="number" min="1" step="1" v-model.number="when.waitMinutes" class="border border-muted-300 outline-none px-2 py-1 rounded-[4px] w-20 dark:border-muted-700 dark:bg-muted-900" @focus="when.kind = 'no_reply'" />
+                            <span>мин (рабочее время): написал и ему не ответили и не перезвонили</span>
+                        </label>
                         <label v-if="isEvent(when.kind)" class="flex items-center gap-2 p-2 ps-8 flex-wrap text-muted-600 dark:text-muted-300">
                             <span>Сотрудник:</span>
                             <select v-model.number="when.staffId" class="bg-transparent text-primary-600 underline underline-offset-2 outline-none dark:text-primary-200 max-w-[14rem]">
@@ -380,19 +512,27 @@ watch(dealFilter, () => {
             <CloseTaskTrigger v-else-if="trigger.type === TriggerType.CloseTasks" :trigger="trigger" />
             <ChangeAgentTrigger v-else-if="trigger.type === TriggerType.ChangeAgent" :trigger="trigger" :employees="employees" />
             <DeleteFilesTrigger v-else-if="trigger.type === TriggerType.DeleteFiles" :trigger="trigger" />
-            <ChangeFieldsTrigger v-else-if="trigger.type === TriggerType.ChangeFields" :trigger="trigger" :fillers="fillers" />
+            <ChangeFieldsTrigger v-else-if="trigger.type === TriggerType.ChangeFields" :trigger="trigger" :fillers="fillers" :employees="employees" />
             <CreateDealTrigger v-else-if="trigger.type === TriggerType.CreateDeal" :trigger="trigger" :stage="stage" :stages="stages ?? []" />
+            <MoveStageTrigger v-else-if="trigger.type === TriggerType.MoveStage" :trigger="trigger" :stage="stage" />
+            <NotifyTrigger v-else-if="trigger.type === TriggerType.Notify" :trigger="trigger" :employees="employees" />
+            </fieldset>
+            <p class="mx-3 mb-3 rounded-md bg-muted-50 px-3 py-2 text-sm text-muted-600 dark:bg-muted-900 dark:text-muted-300">
+                <span class="font-medium text-muted-700 dark:text-muted-200">Что произойдёт:</span> {{ summary }}
+            </p>
             <p v-if="error" class="px-3 pb-2 text-sm text-rose-600">{{ error }}</p>
             <div class="flex items-center justify-between px-3 pb-3">
                 <div class="flex gap-2">
-                    <BaseButton variant="solid" color="primary" size="sm" type="submit">Готово</BaseButton>
-                    <BaseButton variant="pastel" color="default" size="sm" @click="emits('cancel')">Отменить</BaseButton>
+                    <BaseButton v-if="!readonly" variant="solid" color="primary" size="sm" type="submit">Готово</BaseButton>
+                    <BaseButton variant="pastel" color="default" size="sm" @click="emits('cancel')">{{ readonly ? 'Закрыть' : 'Отменить' }}</BaseButton>
                 </div>
-                <BaseButtonIcon size="sm" color="danger" type="button" v-if="trigger.id > 0" @click="emits('remove', trigger)">
+                <BaseButtonIcon size="sm" color="danger" type="button" v-if="trigger.id > 0 && !readonly" @click="emits('remove', trigger)">
                     <Icon name="ph:trash" class="size-4" />
                 </BaseButtonIcon>
             </div>
         </form>
-        <TriggerRuns v-if="trigger.id > 0 && stage.id > 0" :stage-id="stage.id" :trigger-id="trigger.id" />
+        <TriggerRuns v-if="trigger.id > 0 && stage.id > 0" :stage-id="stage.id" :trigger-id="trigger.id" :open="!!problems?.length" />
     </div>
+    </div>
+    </Teleport>
 </template>

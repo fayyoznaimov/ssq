@@ -11,6 +11,7 @@ import type { EventApi } from '@fullcalendar/core';
 import ruLocale from '@fullcalendar/core/locales/ru';
 import dayGridPlugin from '@fullcalendar/daygrid';
 import interactionPlugin from '@fullcalendar/interaction';
+import listPlugin from '@fullcalendar/list';
 import timeGridPlugin from '@fullcalendar/timegrid';
 import FullCalendar from '@fullcalendar/vue3';
 import moment from 'moment';
@@ -22,16 +23,18 @@ import type { Deal, TaskFilters, TaskType } from '~/types/deal';
 import type { Task } from '~/types/deal';
 import type { PaginatedResponse } from '~/types/generics';
 import type { Company, Group, User } from '~/types/user';
+import { confirmTaskPlan, isTaskPlanCancelled } from '~/components/task/taskPlan';
+import { taskSubject } from '~/components/task/taskText';
 import { promiseResult } from '~/utils/result';
 
 definePageMeta({
     layout: 'account',
-    verbose: 'Месяц',
+    verbose: 'Календарь',
     subject: 'Task'
 });
 
 useHead({
-    title: 'Месяц',
+    title: 'Календарь задач',
 });
 
 const props = withDefaults(defineProps<{
@@ -51,24 +54,36 @@ const eventList = computed(() => {
     return events.value;
 });
 
+// a phone: seven columns of 40 px were unreadable and the grid stopped at 09:00 — a list of the week
+const phone = typeof window !== 'undefined' && window.matchMedia('(max-width: 639px)').matches;
+
+/** «Встреча: позвонить» and the client (the deal without the word «Сделка»), for the event and its tooltip. */
+function eventLines(props: Record<string, any>): [string, string] {
+    const what = [props.type?.name ?? 'Задача', props.label].filter(Boolean).join(': ');
+    return [what, taskSubject(props)];
+}
+
 const calendarOptions = ref({
     locale: ruLocale,
     plugins: [
         dayGridPlugin,
         timeGridPlugin,
+        listPlugin,
         interactionPlugin,
     ],
-    headerToolbar: {
-        center: 'title',
-        left: 'dayGridMonth timeGridWeek timeGridDay',
-        right: 'prev,next today',
-    },
+    headerToolbar: phone
+        ? { left: 'prev,next', center: 'title', right: 'listWeek,timeGridDay' }
+        : { center: 'title', left: 'dayGridMonth timeGridWeek timeGridDay listWeek', right: 'prev,next today' },
+    ...(phone ? { footerToolbar: { center: 'today' }, height: 'auto' } : {}),
     buttonText: {
         today: 'Сегодня',
         month: 'Месяц',
         week: 'Неделя',
-        day: 'День'
+        day: 'День',
+        list: 'Список',
     },
+    scrollTime: '08:00:00',
+    noEventsText: 'Задач нет',
     nowIndicator: true,
     events: eventList,
     slotLabelFormat: {
@@ -77,7 +92,7 @@ const calendarOptions = ref({
         omitZeroMinute: false,
     },
     firstDay: 1,
-    initialView: 'timeGridWeek',
+    initialView: phone ? 'listWeek' : 'timeGridWeek',
     initialEvents: events.value,
     editable: true,
     selectable: true,
@@ -102,39 +117,23 @@ const calendarOptions = ref({
         const closedAt = moment(event.extendedProps.closed_at);
         if (closedAt.isBefore(moment())) return ['fc-event-on-time'];
     },
+    // one line each, cut with «…» inside the event (it ran over the next slots); the whole text on hover
     eventContent: ({event}) => {
+        const [what, subject] = eventLines(event.extendedProps ?? {});
         const container = document.createElement('div');
-        container.classList.add('fc-event-content');
-        const top = document.createElement('p');
-        const bottom = document.createElement('p');
-        let result = '';
-        if (event.extendedProps?.deal) {
-            result += 'Сделка ' + event.extendedProps.deal.label;
+        container.classList.add('fc-event-content', 'overflow-hidden', 'h-full', 'w-full');
+        for (const line of [what, subject]) {
+            if (!line) continue;
+            const p = document.createElement('p');
+            p.className = 'truncate leading-tight';
+            p.innerText = line;
+            container.append(p);
         }
-        if (event.extendedProps?.ctr_agent) {
-            result += event.extendedProps?.ctr_agent.username;
-        }
-        if (event.extendedProps?.company) {
-            result += event.extendedProps?.company.name;
-        }
-
-        if (result) {
-            top.innerText = result;
-            container.append(top);
-        }
-
-        result = '';
-
-        if (event.extendedProps.type?.name) result += event.extendedProps.type.name;
-        if (event.extendedProps?.label) result += ': ' + event.extendedProps?.label;
-
-        if (result) {
-            bottom.innerText = result;
-            container.append(bottom);
-        }
-        
         return { domNodes: [container] };
-    }
+    },
+    eventDidMount: ({event, el}) => {
+        el.title = eventLines(event.extendedProps ?? {}).filter(Boolean).join(' — ');
+    },
 });
 
 
@@ -143,8 +142,7 @@ async function handleDateSet({startStr, endStr}: {startStr: string, endStr: stri
     emits('fetchTasks', {
         from_date: moment(startStr).subtract(1, 'day').format('YYYY-MM-DD'),
         till_date: moment(endStr).format('YYYY-MM-DD'),
-        skip: 0,
-        limit: 1000,
+        all: true,
     });
 }
 
@@ -197,10 +195,11 @@ async function saveMove(info: any) {
     const task = fromSelectInfo(info.event);
     if (!task.id) return;
     const payload = createUpdatePayload(task);
-    const result = await promiseResult(taskService.patch(task.id, payload).exec());
+    // a time in the past or next to another task of the deal: the API asks first (taskPlan.ts)
+    const result = await promiseResult(confirmTaskPlan((flags) => taskService.patch(task.id, {...payload, ...flags}).exec()));
     if (!result.ok) {
         info.revert?.();
-        toast.show({message: result.error.message, type: 'error', timeout: 3000});
+        if (!isTaskPlanCancelled(result.error)) toast.show({message: result.error.message, type: 'error', timeout: 5000});
     }
 }
 
@@ -290,5 +289,15 @@ function handleEvents(events) {
 .fc-daygrid-body-balanced {
     width: 100% !important;
     height: 100% !important;
+}
+/* a phone: the toolbar in one row, a smaller title */
+@media (max-width: 639px) {
+    .fc :deep(.fc-toolbar-title) {
+        font-size: 1rem;
+    }
+    .fc :deep(.fc-header-toolbar) {
+        gap: 0.5rem;
+        margin-bottom: 0.75rem;
+    }
 }
 </style>

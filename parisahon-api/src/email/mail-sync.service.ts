@@ -21,7 +21,8 @@ import {
 import { PendingAttachment, receivedAttachment, removeWritten, writeAttachments } from './mail-files';
 import { MailDealsService } from './mail-deals.service';
 import { HistoryItem, MailHistoryService } from './mail-history.service';
-import { clip, messageIdOf, messageIdsIn, noNul, safeFileName } from './mail-text';
+import { addressesIn, clip, htmlToText, messageIdOf, messageIdsIn, noNul, safeFileName, splitQuote } from './mail-text';
+import { AuditJournal } from '../audit/audit-journal';
 
 /** What the mail page and the admin see about the background copying of the mailboxes. */
 export interface MailSyncStatus {
@@ -42,6 +43,8 @@ export interface MailSyncStatus {
 const MAX_ATTEMPTS = 3;
 /** Larger HTML parts lose their embedded images (data: URLs); even larger ones are not kept. */
 const MAX_HTML = 1_500_000;
+/** Older letters whose HTML part is read again per mailbox and run. */
+const HTML_BACKFILL_BATCH = 25;
 
 /**
  * Copies the mailboxes of the company mail server (EMAIL_SENT/SPAM/TRASH/
@@ -84,7 +87,8 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     const minutes = Number(process.env.EMAIL_SYNC_INTERVAL_MINUTES ?? 3);
     if (minutes > 0) {
       this.syncTimer = setInterval(() => {
-        this.syncAllMailboxes().catch((error) =>
+        // the journal (src/audit): what the background sync writes is the mail's (source «почта»)
+        AuditJournal.job('mail', 'mail-sync', () => this.syncAllMailboxes()).catch((error) =>
           this.loggerService.error('Background email sync failed', error.stack),
         );
       }, minutes * 60_000);
@@ -150,6 +154,15 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       }
     } catch (error) {
       errors.push({ mailbox: '*', message: `Почтовый сервер недоступен: ${(error as Error)?.message ?? error}` });
+    }
+
+    // letters stored before their sender became a contact (an e-mail added to the card later) join
+    // the contact and its deal now; they used to stay «without contact» for good
+    try {
+      const linked = await this.mailDeals.linkLettersOfNewContacts();
+      if (linked.letters) this.loggerService.log(`Mail sync: ${linked.letters} letters linked to contacts, ${linked.history} into deals`);
+    } catch (error) {
+      this.loggerService.warn(`Mail sync: letters of new contacts were not linked: ${(error as Error)?.message}`);
     }
 
     this.state.last_run_at = started;
@@ -222,6 +235,66 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       await this.addToHistory(result.saved);
       if (result.error) throw result.error;
     }
+
+    try {
+      await this.backfillHtml(mailbox);
+    } catch (error) {
+      this.loggerService.warn(`Mail sync: HTML of older letters of ${mailbox} was not loaded: ${(error as Error)?.message}`);
+    }
+  }
+
+  /**
+   * Letters stored before the HTML part was kept (html IS NULL) get it now, a few per run, and the
+   * text when theirs was empty or had the cells of a table glued together; their entries in the deal
+   * history get the text too. A letter that is no longer on the server, or has no HTML, gets '' (done).
+   */
+  private async backfillHtml(mailbox: string): Promise<void> {
+    await this.connection.withMailbox(mailbox, async (imap) => {
+      const validity = String(selectedMailbox(imap).uidValidity);
+      const rows = await this.emailRepository
+        .createQueryBuilder('t0')
+        .select(['t0.id', 't0.email_id', 't0.body', 't0.outgoing'])
+        .withDeleted()
+        .where('t0.from_mailbox = :mailbox', { mailbox })
+        .andWhere('t0.html IS NULL')
+        .andWhere('t0.email_id IS NOT NULL')
+        .andWhere('t0.uidvalidity = :validity', { validity })
+        .orderBy('t0.id', 'DESC')
+        .limit(HTML_BACKFILL_BATCH)
+        .getMany();
+      if (!rows.length) return;
+
+      const byUid = new Map(rows.map((row) => [Number(row.email_id), row]));
+      const done = new Set<number>();
+      for await (const message of imap.fetch([...byUid.keys()], { source: true, uid: true }, { uid: true })) {
+        const row = byUid.get(Number(message.uid));
+        if (!row || done.has(row.id)) continue;
+        done.add(row.id);
+        try {
+          const parsed = await simpleParser(message.source);
+          let html = typeof parsed.html === 'string' ? noNul(parsed.html) : '';
+          if (html.length > MAX_HTML) html = html.replace(/(\ssrc\s*=\s*)(["'])data:[^"']*\2/gi, '$1$2$2');
+          if (html.length > MAX_HTML) html = '';
+          const body = bodyOf(parsed.text, html || null);
+          const old = String(row.body ?? '');
+          const squash = (value: string) => value.replace(/\s+/g, '');
+          const newBody = body.trim() && body !== old && (!old.trim() || squash(old) === squash(body)) ? body : null;
+          await this.emailRepository.update(row.id, newBody !== null ? { html, body: newBody } : { html });
+          if (newBody !== null && !row.outgoing) {
+            await this.dataSource.query(
+              `UPDATE event SET after_state = jsonb_set(after_state, '{data,body}', to_jsonb($1::text))
+                WHERE type = 9 AND (after_state -> 'data') ->> 'id' = $2`,
+              [splitQuote(newBody).main, String(row.id)],
+            );
+          }
+        } catch (error) {
+          this.loggerService.warn(`Mail sync: letter ${row.id} could not be read again: ${(error as Error)?.message}`);
+          await this.emailRepository.update(row.id, { html: '' });
+        }
+      }
+      const missing = rows.filter((row) => !done.has(row.id)).map((row) => row.id);
+      if (missing.length) await this.emailRepository.update(missing, { html: '' });
+    });
   }
 
   /**
@@ -294,7 +367,6 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     const email = new Email();
     const sender = parsed.from?.value?.[0];
 
-    email.body = noNul(parsed.text ?? '');
     email.from = clip(sender?.address, 10000);
     email.from_name = clip(sender?.name?.trim() || null, 255);
     email.subject = clip(parsed.subject, 10000);
@@ -307,7 +379,7 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     email.in_reply_to = messageIdsIn(parsed.inReplyTo)[0] ?? null;
     email.reference_ids = messageIdsIn(parsed.references).join(' ').slice(0, 20000) || null;
     email.from_mailbox = mailbox;
-    email.outgoing = this.isOurs(email.from) || mailbox === this.connection.mailboxes.sent;
+    email.outgoing = this.isOutgoing(email.from, mailbox, [...email.to, ...email.cc].map((r) => r.value));
 
     // HTML as it came (cleaned by the client when shown); embedded images go when it is too big
     let html = typeof parsed.html === 'string' ? noNul(parsed.html) : null;
@@ -317,7 +389,11 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       imagesInHtml = false;
       if (html.length > MAX_HTML) html = null;
     }
-    email.html = html;
+    // '' = no HTML part (NULL: a letter stored before the HTML was kept, backfillHtml reads it again)
+    email.html = html ?? '';
+    // the text: the text part; a letter of HTML only (or with an empty text part, as some mailers send)
+    // gets the text of its HTML, with table cells and paragraphs apart («50x90 | 300 | 12 500 сум»)
+    email.body = bodyOf(parsed.text, typeof parsed.html === 'string' ? parsed.html : null);
 
     if (message.flags && message.flags.has('\\Seen')) {
       email.read = true;
@@ -448,7 +524,8 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
       stub.to = [];
       stub.cc = [];
       stub.files = [];
-      stub.outgoing = this.isOurs(stub.from) || mailbox === this.connection.mailboxes.sent;
+      stub.html = '';
+      stub.outgoing = this.isOutgoing(stub.from, mailbox, []);
       stub.is_spam = mailbox === this.connection.mailboxes.spam;
       if (mailbox === this.connection.mailboxes.trash) stub.deleted_at = new Date();
       stub.from_user = stub.from ? await this.userOf(stub.from, !stub.outgoing) : null;
@@ -467,7 +544,18 @@ export class MailSyncService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** From a company address (the shared mailbox's domain, parisahome.com): a letter we sent. */
+  /**
+   * A letter we sent: it lies in Sent, or it is from our address and goes to someone outside the
+   * company (the shared mailbox in Cc of a letter written in Outlook). A colleague's letter to our
+   * addresses only (a forwarded request) is incoming: it used to land in «Отправленные».
+   */
+  private isOutgoing(from: string | null | undefined, mailbox: string, recipients: string[]): boolean {
+    if (mailbox === this.connection.mailboxes.sent) return true;
+    if (!this.isOurs(from)) return false;
+    return addressesIn(recipients).some((address) => !this.isOurs(address));
+  }
+
+  /** From a company address (the shared mailbox's domain, parisahome.com). */
   private isOurs(address: string | null | undefined): boolean {
     const from = String(address ?? '').toLowerCase();
     if (!from) return false;
@@ -691,20 +779,54 @@ function chunks<T>(items: T[], size: number): T[][] {
   return result;
 }
 
-/** To/Cc rows of a parsed header: one row per address group, as written. */
+/**
+ * To/Cc rows of a parsed header: one row per address (`"Name" <a@x>` or `a@x`), so that the filter
+ * by an address finds letters with several recipients (they used to be one row per header).
+ */
 function addresses<T extends EmailTo | EmailCc>(
   header: AddressObject | AddressObject[] | undefined,
   Row: new () => T,
 ): T[] {
   const groups = Array.isArray(header) ? header : header ? [header] : [];
+  const rows: T[] = [];
+  const add = (value: string) => {
+    const clean = noNul(value).trim();
+    if (!clean) return;
+    const row = new Row();
+    row.value = clean.slice(0, 2000);
+    rows.push(row);
+  };
 
-  return groups
-    .map((group) => {
-      const row = new Row();
-      row.value = noNul(group.text ?? '');
-      return row;
-    })
-    .filter((row) => row.value);
+  for (const group of groups) {
+    const list = group.value ?? [];
+    if (!list.length) {
+      add(group.text ?? '');
+      continue;
+    }
+    for (const entry of list) {
+      // a group ("Undisclosed recipients: a@x, b@y;") holds addresses of its own
+      for (const one of entry.group?.length ? entry.group : [entry]) {
+        if (!one.address && !one.name) continue;
+        const name = (one.name ?? '').replace(/"/g, '').trim();
+        add(one.address ? (name ? `"${name}" <${one.address}>` : one.address) : name);
+      }
+    }
+  }
+  return rows;
+}
+
+/**
+ * The text of a letter: its text part; else (empty or missing) the text of its HTML part. mailparser
+ * makes the text of an HTML-only letter itself and glues table cells together («50x9030012 500 сум»):
+ * when the text part is the HTML's words without the separators, the HTML's text is taken.
+ */
+export function bodyOf(text: string | null | undefined, html: string | null | undefined): string {
+  const plain = noNul(String(text ?? ''));
+  if (!html) return plain;
+  const fromHtml = htmlToText(html);
+  if (!plain.trim()) return fromHtml;
+  const squash = (value: string) => value.replace(/\s+/g, '');
+  return squash(plain) === squash(fromHtml) ? fromHtml : plain;
 }
 
 function normalizeMessageId(value: string | null | undefined): string {

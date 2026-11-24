@@ -21,9 +21,10 @@ const newQuantity = ref('1');
 const toNumber = (value: unknown) => Number(String(value ?? '').replace(/\s/g, '').replace(',', '.'));
 const lineTotal = (item: { quantity: unknown, price: unknown }) => {
     const sum = toNumber(item.quantity) * toNumber(item.price);
-    return Number.isFinite(sum) ? Math.round(sum) : 0;
+    // with cents: 12.5 m × 1250.40 = 15630
+    return Number.isFinite(sum) ? Math.round(sum * 100) / 100 : 0;
 };
-const total = computed(() => props.deal.deal_products.reduce((acc, item) => acc + lineTotal(item), 0));
+const total = computed(() => Math.round(props.deal.deal_products.reduce((acc, item) => acc + lineTotal(item), 0) * 100) / 100);
 const budget = computed(() => toNumber(props.deal.budget) || 0);
 
 // The budget follows the products while it is empty, 0 or equal to their previous total;
@@ -80,7 +81,7 @@ onMounted(() => {
 </script>
 <template>
     <section>
-        <span class="text-medium text-muted-900">Товары</span>
+        <h3 class="block text-sm font-medium text-muted-900 dark:text-muted-100 mb-2">Товары <span class="text-muted-400">({{ props.deal.deal_products?.length ?? 0 }})</span></h3>
         <div class="flex flex-col space-y-4 mt-2">
             <ul class="flex flex-col gap-1">
                 <li v-for="(item, index) in props.deal.deal_products" :key="index">

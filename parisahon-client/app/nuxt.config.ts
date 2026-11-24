@@ -89,15 +89,17 @@ export default defineNuxtConfig({
                 extend: {
                     colors: {
                         ...colors,
-                        primary: {
-                            200: "#08b09c",
-                            300: "#068474",
-                            400: "#04574d",
-                            500: "#022b26",
-                            600: "#022722",
-                            700: "#02221e",
-                            800: "#011e1b"
-                        },
+                        // The brand teal. The tones are CSS variables (app.vue): the dark theme takes lighter
+                        // ones for 200, 400, 500 and 600, so primary buttons, links and the current page stay
+                        // readable on the dark background (it used to be #022b26 on #0f172a, 1.2:1)
+                        primary: Object.fromEntries(
+                            [50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 950].map((tone) => [
+                                tone,
+                                `rgb(var(--color-primary-${tone}) / <alpha-value>)`,
+                            ])
+                        ),
+                        // the text on a solid primary background: white in the light theme, dark in the dark one
+                        "primary-invert": "rgb(var(--color-primary-invert) / <alpha-value>)",
                         secondary: {
                             200: "#f4d1b0",
                             300: "#f2cba5",

@@ -383,8 +383,10 @@ async def send_message(message: message_handler.Message) -> Tuple[bool, str, lis
     if ctx is None:
         state = (shared["states"] or {}).get(user_id) or {}
         if state.get("status") == "revoked":
-            return False, "Ваш Telegram отключён в самом Telegram (сеанс завершён): подключите его заново (Телеграм → Подключить)", []
-        return False, "У менеджера нет подключённого Telegram", []
+            return False, "Ваш Telegram отключён в самом Telegram (сеанс завершён): подключите его заново в разделе «Телеграм» и отправьте ещё раз", []
+        if state.get("status") in ("starting", "error"):
+            return False, "Ваш Telegram сейчас не на связи с CRM: сообщение не отправлено, попробуйте через минуту (раздел «Телеграм»)", []
+        return False, "Ваш Telegram не подключён к CRM: подключите его в разделе «Телеграм» и отправьте ещё раз", []
     sent: List[dict] = []
     try:
         try:

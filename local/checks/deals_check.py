@@ -14,6 +14,8 @@ Regression checks for the deals / pipeline (stages, collections) module.
   physically), also when the run is interrupted. A run starts with the same cleanup, so a crashed run
   does not poison the next one.
 * Prints PASS/FAIL per check, exits 1 if anything failed.
+* Stages are found by their kind (deal_stage.kind: new, first_contact, prepayment, won, lost, work),
+  not by the DEAL_STAGE_* names of .env (migration 1795620000000-deal-stage-kind).
 """
 import base64
 import datetime
@@ -158,6 +160,17 @@ def http(method, path, body=None, raw=None, headers=None, auth=True):
         return status, text
 
 
+def http_as(token, method, path, body=None):
+    """http() with the token of another user (an agent of the ACL checks)."""
+    global TOKEN
+    saved = TOKEN
+    TOKEN = token
+    try:
+        return http(method, path, body)
+    finally:
+        TOKEN = saved
+
+
 def message_of(response):
     body = response[1]
     if isinstance(body, dict):
@@ -202,7 +215,10 @@ def client_query_string(query):
     """
     with open(CLIENT_SERVICE, encoding="utf-8") as fh:
         text = fh.read()
-    source = text[text.index("function subQueryToString"):text.index("// --- Service Response Wrapper")]
+    # only the two serialiser functions: the rest of the file uses Nuxt auto-imports (ref, ...) that plain node lacks
+    start = text.index("function subQueryToString")
+    end = re.compile(r"\n\}\r?\n").search(text, text.index("export function queryToString", start)).end()
+    source = text[start:end]
     source = source.replace("export function", "function")
     js = (
         "let input='';process.stdin.on('data',(c)=>input+=c);process.stdin.on('end',()=>{"
@@ -239,7 +255,9 @@ DELETE FROM deal WHERE id IN (SELECT id FROM _d);
 DELETE FROM deal_stage WHERE id IN (SELECT id FROM _s);
 DELETE FROM collection WHERE id IN (SELECT id FROM _col);
 DELETE FROM filler WHERE field LIKE 'AUDIT-%';
+DELETE FROM deal_user WHERE "userId" IN (SELECT id FROM _u);
 DELETE FROM "user" WHERE id IN (SELECT id FROM _u);
+DELETE FROM "group" WHERE name LIKE 'AUDIT-chk-%';
 DELETE FROM deal_product WHERE product_id IN (SELECT id FROM product WHERE name LIKE 'AUDIT-%');
 DELETE FROM product WHERE name LIKE 'AUDIT-%';
 DELETE FROM company WHERE id IN (SELECT id FROM _c);
@@ -324,11 +342,15 @@ def main():
     status, stages = http("GET", "/stages")
     if status != 200:
         raise SystemExit("GET /stages -> %s" % status)
-    by_name = {s["name"]: s["id"] for s in stages}
-    stage_prepay = by_name[env("DEAL_STAGE_PREPAYMENT")]
-    stage_created = by_name[env("DEAL_STAGE_CREATED")]
-    stage_closed = by_name[env("DEAL_STAGE_CLOSED")]
-    stage_unknown = by_name[env("DEAL_STAGE_UNKNOWN")]
+    # the meaning of a stage is its kind: GET /stages gives it (the names are labels)
+    by_kind = {s.get("kind"): s["id"] for s in stages if s.get("kind") and s.get("kind") != "work"}
+    missing = [kind for kind in ("new", "first_contact", "prepayment", "won", "lost") if kind not in by_kind]
+    if missing:
+        raise SystemExit("GET /stages: no stage of kind %s (migration 1795620000000-deal-stage-kind?)" % ", ".join(missing))
+    stage_prepay = by_kind["prepayment"]
+    stage_created = by_kind["first_contact"]
+    stage_closed = by_kind["won"]
+    stage_unknown = by_kind["new"]
 
     def create_deal(suffix, **extra):
         """POST /deals with the payload of the "new deal" form (pages/deals/main-tab.vue)."""
@@ -397,11 +419,21 @@ def main():
     check("migration %s is applied" % MIGRATION, count("SELECT count(*) FROM migrations WHERE name = '%s'" % MIGRATION) == 1)
     check("deal.deleted_at column exists", count("SELECT count(*) FROM information_schema.columns WHERE table_name = 'deal' AND column_name = 'deleted_at'") == 1)
     check("deal.display_id has a unique index", count("SELECT count(*) FROM pg_indexes WHERE tablename = 'deal' AND indexdef ILIKE '%UNIQUE%display_id%'") == 1)
-    for name in ("DealClosedAt1795220000000", "DefaultStageActive1795220000100", "CompanyIsOldRestore1795220000200"):
+    for name in ("DealClosedAt1795220000000", "DefaultStageActive1795220000100", "CompanyIsOldRestore1795220000200",
+                 "DealStageKind1795620000000", "DealAmountsNumeric1795620000100"):
         check("migration %s is applied" % name, count("SELECT count(*) FROM migrations WHERE name = '%s'" % name) == 1)
-    closing_names = "'%s', '%s'" % (env("DEAL_STAGE_CLOSED"), env("DEAL_STAGE_CLOSED_NOT_REALIZED"))
     check("closed_at follows the stage: no deal of a working stage is marked closed",
-          count("SELECT count(*) FROM deal d JOIN deal_stage s ON s.id = d.stage_id WHERE d.closed_at IS NOT NULL AND s.name NOT IN (%s)" % closing_names) == 0)
+          count("SELECT count(*) FROM deal d JOIN deal_stage s ON s.id = d.stage_id WHERE d.closed_at IS NOT NULL AND s.kind NOT IN ('won', 'lost')") == 0)
+    check("... and no live deal of a closing stage is open",
+          count("SELECT count(*) FROM deal d JOIN deal_stage s ON s.id = d.stage_id WHERE d.closed_at IS NULL AND d.deleted_at IS NULL AND s.kind IN ('won', 'lost')") == 0)
+    # K10: every pipeline has exactly one stage of each system kind
+    bad = sql("SELECT c.id, k.kind, count(s.id) FROM collection c CROSS JOIN (VALUES ('new'), ('first_contact'), ('prepayment'), ('won'), ('lost')) k(kind) "
+              "LEFT JOIN deal_stage s ON s.collection_id = c.id AND s.kind = k.kind GROUP BY 1, 2 HAVING count(s.id) <> 1")
+    check("every pipeline has one stage of each system kind (new, first_contact, prepayment, won, lost)", bad == [], bad)
+    types = dict(sql("SELECT table_name || '.' || column_name, data_type FROM information_schema.columns "
+                     "WHERE (table_name, column_name) IN (('deal', 'budget'), ('deal_product', 'quantity'), ('deal_product', 'price'))"))
+    check("deal.budget, deal_product.quantity / price are numeric (metres, cents)",
+          types == {"deal.budget": "numeric", "deal_product.quantity": "numeric", "deal_product.price": "numeric"}, types)
 
     # ================================================================= create
     section("Create deal")
@@ -445,6 +477,10 @@ def main():
     check("stage is changed", row["stage"] == stage_prepay, row)
     check("last_stage_change is set", row["moved"], row)
     check("exactly one new stage record", stage_records(D) == 2, stage_records(D))
+    last = sql("SELECT COALESCE(from_stage_id::text, ''), COALESCE(moved_by::text, '') FROM deal_stage_record WHERE deal_id = %d ORDER BY id DESC LIMIT 1" % D)
+    check("the stage record says from which stage and who moved the deal", last == [[str(stage_created), str(admin_id)]], last)
+    first = sql("SELECT COALESCE(from_stage_id::text, ''), COALESCE(moved_by::text, '') FROM deal_stage_record WHERE deal_id = %d ORDER BY id LIMIT 1" % D)
+    check("... the first record of a deal: no previous stage, its creator", first == [["", str(admin_id)]], first)
     check("exactly one NEW_DEAL_STAGE event", wait_for(lambda: stage_events(D), 1) == 1, stage_events(D))
     prev = sql("SELECT moved_after_minutes FROM deal_stage_record WHERE deal_id = %d ORDER BY id LIMIT 1" % D)[0][0]
     check("previous record got its duration (0-1 min, not the time zone offset)", prev in ("0", "1"), prev)
@@ -457,6 +493,8 @@ def main():
 
     r = http("PATCH", "/deals/%d/stage" % D, {"stage_id": stage_created})
     check("PATCH /deals/:id/stage still works", r[0] == 200 and deal_row(D)["stage"] == stage_created and stage_records(D) == 3, r)
+    last = sql("SELECT from_stage_id, moved_by FROM deal_stage_record WHERE deal_id = %d ORDER BY id DESC LIMIT 1" % D)
+    check("... the kanban move is recorded from the previous stage, by the user", last == [[str(stage_prepay), str(admin_id)]], last)
     r = http("PATCH", "/deals/%d/stage" % D, {"stage_id": stage_created})
     check("PATCH /deals/:id/stage with the same stage adds no record", r[0] == 200 and stage_records(D) == 3, stage_records(D))
 
@@ -466,7 +504,7 @@ def main():
     check("edit leaves no orphan deal_product rows", orphan_products() == 0, orphan_products())
     r = form_patch(D, P + "-main", products=[{"product_id": product1, "quantity": 3, "price": 50}, {"product_id": product2, "quantity": 1, "price": 10}])
     rows = products_of(D)
-    check("products: update quantity + add second product", r[0] == 200 and len(rows) == 2 and rows[0][0] == before_products[0][0] and rows[0][2] == "3", rows)
+    check("products: update quantity + add second product", r[0] == 200 and len(rows) == 2 and rows[0][0] == before_products[0][0] and float(rows[0][2]) == 3, rows)  # numeric(14,3): "3.000"
     # the history says which product the quantity is of (it said «quantity: 2 → 3» of no product, DEAL-9)
     change = []
     for _ in range(10):  # the history is written by an event listener, right after the answer
@@ -476,6 +514,23 @@ def main():
             break
         time.sleep(0.5)
     check("... the quantity change in the history names the product", change == [[P + "-prod-1", "2", "3"]], change)
+    # DB-7: fabric is sold by the metre and the kilo, prices have cents (bigint answered 500)
+    r = form_patch(D, P + "-main", budget=1250.5, products=[{"product_id": product1, "quantity": 12.5, "price": 1250.75},
+                                                            {"product_id": product2, "quantity": 1, "price": 10}])
+    stored = sql("SELECT quantity::text, price::text FROM deal_product WHERE deal_id = %d AND product_id = %d" % (D, product1))
+    check("12.5 metres at 1250.75 and a budget of 1250.50 -> 200, stored as they are",
+          r[0] == 200 and stored == [["12.500", "1250.75"]] and scalar("SELECT budget::text FROM deal WHERE id = %d" % D) == "1250.50", (r, stored))
+    r = http("GET", "/deals/%d" % D)
+    line = [p for p in (r[1] or {}).get("deal_products", []) if (p.get("product") or {}).get("id") == product1] if r[0] == 200 else []
+    check('... GET /deals/:id gives them as text without trailing zeros ("12.5", "1250.75", "1250.5")',
+          r[0] == 200 and r[1].get("budget") == "1250.5" and line and line[0]["quantity"] == "12.5" and line[0]["price"] == "1250.75",
+          r[1] if r[0] == 200 else r)
+    r = form_patch(D, P + "-main", products=[{"product_id": product1, "quantity": 1.2345, "price": 10}])
+    check("4 decimals of a quantity -> 400 (numeric(14,3)), not 500", r[0] == 400, r)
+    r = form_patch(D, P + "-main", products=[{"product_id": product1, "quantity": 1, "price": -5}])
+    check("a negative price -> 400", r[0] == 400, r)
+    r = form_patch(D, P + "-main", budget=10.555)
+    check("a budget with 3 decimals -> 400", r[0] == 400, r)
     r = form_patch(D, P + "-main", products=[{"product_id": product2, "quantity": 1, "price": 10}])
     rows = products_of(D)
     check("products: a product missing from the list is removed", r[0] == 200 and len(rows) == 1 and int(rows[0][1]) == product2, rows)
@@ -515,6 +570,53 @@ def main():
     check("PATCH {company_id: null} -> the deal has no company", off and r[0] == 200 and deal_row(off)["company"] is None, (r, off and deal_row(off)))
     if off:
         http("DELETE", "/deals/%d" % off)
+
+    # ================================================================= ACL-4: linking what one may not see
+    section("Linking a company / contact the user may not see (ACL-4)")
+    group_id = int(scalar("INSERT INTO \"group\" (name) VALUES ('%s-g') RETURNING id" % P))
+    # «create» has only two levels: 0 (banned) or 3 (allowed); 1/2 (own / group) are for view, update, delete, export
+    own_perms = {"deal": {"view": 1, "create": 3, "update": 1, "delete": 0, "export": 0},
+                 "contact": {"view": 1, "create": 3, "update": 1, "delete": 0, "export": 0},
+                 "company": {"view": 1, "create": 3, "update": 1, "delete": 0, "export": 0},
+                 "task": {"update": 1, "delete": 1}, "mail": False, "file": True}
+    agent_email, agent_password = "audit-chk-%s-own@example.test" % RUN, "Audit-%s-own" % RUN
+    r = http("POST", "/users", {"email": agent_email, "password": agent_password, "username": P + "-own",
+                                "role": "agent", "group_id": group_id, "permissions": own_perms})
+    check("an agent who sees only his own -> 201", r[0] == 201, r)
+    agent_id = r[1]["id"] if r[0] == 201 else None
+    login = http("POST", "/auth/login", {"email": agent_email, "password": agent_password}, auth=False) if agent_id else (0, None)
+    agent_token = login[1].get("access_token") if login[0] in (200, 201) and isinstance(login[1], dict) else None
+    check("... and logs in", agent_token, login)
+    if agent_token:
+        hidden_co = int(scalar("INSERT INTO company (name, is_old) VALUES ('%s-hidden-co', false) RETURNING id" % P))
+        hidden_ct = int(scalar("INSERT INTO \"user\" (username, role) VALUES ('%s-hidden-contact', 'ctr_agent') RETURNING id" % P))
+        check("the agent does not see the company", http_as(agent_token, "GET", "/companies/%d" % hidden_co)[0] == 404)
+        r = http_as(agent_token, "GET", "/contacts?name=" + urllib.parse.quote(P + "-hidden"))
+        names = [c.get("name") for c in (r[1] or {}).get("data", [])] if r[0] == 200 else r
+        check("... and the pickers (GET /contacts) do not offer them", r[0] == 200 and names == [], names)
+        r = http_as(agent_token, "POST", "/deals", {"label": P + "-acl", "budget": 0, "agent_id": agent_id, "ctr_agent_ids": [],
+                                                   "fillers": [], "products": [], "stage_id": stage_created})
+        check("the agent creates his own deal -> 201", r[0] == 201, r)
+        mine = r[1]["id"] if r[0] == 201 else None
+        if mine:
+            r = http_as(agent_token, "PATCH", "/deals/%d" % mine, {"company_id": hidden_co})
+            check("PATCH his deal {company_id: <not visible>} -> 404", r[0] == 404, r)
+            check("... the company is not linked and still not visible to him",
+                  deal_row(mine)["company"] is None and http_as(agent_token, "GET", "/companies/%d" % hidden_co)[0] == 404)
+            r = http_as(agent_token, "PATCH", "/deals/%d" % mine, {"ctr_agent_ids": [hidden_ct]})
+            check("PATCH his deal {ctr_agent_ids: [<not visible>]} -> 404, not linked",
+                  r[0] == 404 and count("SELECT count(*) FROM deal_user WHERE \"dealId\" = %d" % mine) == 0, r)
+            r = http_as(agent_token, "POST", "/deals", {"label": P + "-acl-2", "budget": 0, "agent_id": agent_id, "company_id": hidden_co,
+                                                       "ctr_agent_ids": [hidden_ct], "fillers": [], "products": [], "stage_id": stage_created})
+            check("POST /deals with a company and a contact he does not see -> 404", r[0] == 404, r)
+            # the admin links them: the agent keeps saving his deal with what it already has
+            r = http("PATCH", "/deals/%d" % mine, {"company_id": hidden_co, "ctr_agent_ids": [hidden_ct]})
+            check("the admin links them -> 200", r[0] == 200, r)
+            r = http_as(agent_token, "PATCH", "/deals/%d" % mine, {"company_id": hidden_co, "ctr_agent_ids": [hidden_ct], "budget": 5})
+            check("... then the agent saves his deal with the links it already has -> 200", r[0] == 200, r)
+            change = wait_for(lambda: count("SELECT count(*) FROM event WHERE deal_id = %d AND after_state::text LIKE '%%%s-hidden-co%%'" % (mine, P)) > 0, True)
+            check("... the change of the company is in the history of the deal", change)
+            http("DELETE", "/deals/%d" % mine)
 
     # ================================================================= edit form: errors
     section("Edit form: wrong ids")
@@ -557,6 +659,8 @@ def main():
             "assign_to": {"target": "agent", "id": admin_id},
             "link_to": {"target": target, "id": target_id},
             "start_time": iso(start), "end_time": iso(end), "allDay": False,
+            # overdue and same-time fixtures on purpose (the API refuses them otherwise: TASK_IN_PAST / TASK_DUPLICATE)
+            "allow_past": True, "allow_duplicate": True,
         })
 
     notifications_before = count("SELECT count(*) FROM notification WHERE company_id = %d" % company_id)
@@ -904,9 +1008,22 @@ def main():
     check("custom stage can be renamed", scalar("SELECT name FROM deal_stage WHERE id = %d" % stage_y) == "AUDIT-stage-2 renamed")
     r = http("PATCH", "/stages/%d" % stage_y, {"name": "AUDIT-stage-1", "order": 0, "color": "#99ccff", "collection_id": coll_a})
     check("rename to a name taken in the same collection -> 400", r[0] == 400, r)
-    system_id = int(scalar("SELECT id FROM deal_stage WHERE collection_id = %d AND name = '%s'" % (coll_a, env("DEAL_STAGE_CLOSED"))))
-    r = http("PATCH", "/stages/%d" % system_id, {"name": "AUDIT-renamed-system", "order": 3, "color": "#99ccff", "collection_id": coll_a})
-    check("system stage keeps its name on PATCH", r[0] == 200 and scalar("SELECT name FROM deal_stage WHERE id = %d" % system_id) == env("DEAL_STAGE_CLOSED"), r)
+    check("a new collection gets one stage of each system kind",
+          sorted(row[0] for row in sql("SELECT kind FROM deal_stage WHERE collection_id = %d AND kind <> 'work'" % coll_a))
+          == ["first_contact", "lost", "new", "prepayment", "won"])
+    check("a stage made by an admin is of kind work", scalar("SELECT kind FROM deal_stage WHERE id = %d" % stage_y) == "work")
+    # K10: the name of a system stage is only its label: it can be renamed, the kind decides
+    system_id = int(scalar("SELECT id FROM deal_stage WHERE collection_id = %d AND kind = 'won'" % coll_a))
+    r = http("PATCH", "/stages/%d" % system_id, {"name": "AUDIT-renamed-won", "order": 3, "color": "#99ccff", "collection_id": coll_a})
+    check("a system stage can be renamed and keeps its kind",
+          r[0] == 200 and sql("SELECT name, kind FROM deal_stage WHERE id = %d" % system_id) == [["AUDIT-renamed-won", "won"]], r)
+    r = http("PATCH", "/stages/%d" % system_id, {"name": "AUDIT-renamed-won", "order": 3, "color": "#99ccff", "collection_id": coll_b})
+    check("... it cannot be moved to another collection", scalar("SELECT collection_id FROM deal_stage WHERE id = %d" % system_id) == str(coll_a), r)
+    r = create_deal("renamed-won", stage_id=system_id)
+    renamed = r[1]["id"] if r[0] == 201 else None
+    check("... a deal put into the renamed «won» stage is closed", renamed and deal_row(renamed)["closed"], r)
+    if renamed:
+        http("DELETE", "/deals/%d" % renamed)
 
     r = create_deal("stage", stage_id=stage_x)
     D_STAGE = r[1]["id"]
@@ -926,7 +1043,7 @@ def main():
           count("SELECT count(*) FROM deal_stage WHERE id = %d" % stage_x) == 0
           and deal_row(D_STAGE)["stage"] == stage_y
           and count("SELECT count(*) FROM deal_stage_record WHERE deal_id = %d AND stage_id = %d" % (D_STAGE, stage_y)) == stage_records(D_STAGE))
-    system_stage = int(scalar("SELECT id FROM deal_stage WHERE collection_id = %d AND name = '%s'" % (coll_a, env("DEAL_STAGE_UNKNOWN"))))
+    system_stage = int(scalar("SELECT id FROM deal_stage WHERE collection_id = %d AND kind = 'new'" % coll_a))
     r = http("DELETE", "/stages/%d" % system_stage)
     check("delete a system stage -> 400", r[0] == 400, r)
     r = http("DELETE", "/stages/99999999")
@@ -946,7 +1063,7 @@ def main():
     r = http("GET", "/stages/default")
     check("GET /stages/default -> a working stage of the active collection",
           r[0] == 200 and isinstance(r[1], dict) and scalar("SELECT collection_id FROM deal_stage WHERE id = %d" % r[1]["id"]) == str(ORIGINAL_ACTIVE_COLLECTION)
-          and r[1]["name"] not in (env("DEAL_STAGE_CLOSED"), env("DEAL_STAGE_CLOSED_NOT_REALIZED")), r)
+          and r[1].get("kind") not in ("won", "lost"), r)
     r = http("PATCH", "/stages/default", {"stage_id": stage_closed})
     check("PATCH /stages/default with a closing stage -> 400", r[0] == 400, r)
     r = http("PATCH", "/stages/default", {"stage_id": stage_y})
@@ -965,9 +1082,9 @@ def main():
         r = http("PATCH", "/stages/collections/%d/activate" % coll_c, {})
         active = sql("SELECT id FROM collection WHERE is_active = true")
         check("activate a collection -> 200, exactly one active", r[0] == 200 and active == [[str(coll_c)]], (r, active))
-        same_name = scalar("SELECT id FROM deal_stage WHERE collection_id = %d AND name = '%s' ORDER BY id LIMIT 1" % (coll_c, env("DEAL_STAGE_PREPAYMENT")))
+        same_name = scalar("SELECT id FROM deal_stage WHERE collection_id = %d AND kind = 'prepayment'" % coll_c)
         r = http("GET", "/stages/default")
-        check("... the stage for new deals moved to the stage of the same name of the new collection",
+        check("... the stage for new deals moved to the stage of the same kind of the new collection",
               r[0] == 200 and str((r[1] or {}).get("id")) == same_name, (r, same_name))
         r = http("GET", "/stages")
         check("GET /stages returns stages of the active collection",

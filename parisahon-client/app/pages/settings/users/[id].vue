@@ -1,6 +1,6 @@
 <template>
     <div>
-        <form @submit.prevent="submit" class="mt-4 px-10">
+        <form @submit.prevent="submit" class="mt-4 lg:px-10">
             <div class="flex flex-col gap-4">
                 <h4>Общие данные</h4>
                 <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 mb-6 items-end">
@@ -8,19 +8,21 @@
                         :error="errors.username"
                         type="text"
                         v-model="user.username"
-                        label="Логин*"
+                        label="Имя*"
                         name="username"
                         placeholder="пр.: Shoxrux"
                         icon="ph:user"
                     />
+                    <!-- autocomplete off: the browser must not fill in the admin's own login and password here -->
                     <BaseInput
                         v-model="user.email"
-                        label="Почта*"
+                        label="Почта (логин)*"
                         name="email"
                         placeholder="пр.: shoxrux@gmail.com"
                         :error="errors.email"
                         type="text"
                         icon="ph:envelope-simple"
+                        autocomplete="off"
                     />
 
                     <BaseInput
@@ -30,7 +32,6 @@
                         name="phone"
                         placeholder="пр.: +998901200000"
                         icon="ph:phone"
-                        required
                         :error="errors.phone"
                     />
                     <!-- staff roles only: a customer contact is made in Списки → Контакты -->
@@ -45,7 +46,13 @@
                             Агент
                         </option>
                     </BaseSelect>
-                    <BaseSelect :error="errors.groups" v-model="user.group_id" label="Группа*" name="group_id">
+                    <BaseSelect
+                        :error="errors.group_id"
+                        v-model="user.group_id"
+                        label="Группа*"
+                        name="group_id"
+                        placeholder="Выберите группу"
+                    >
                         <option
                             v-for="group in groups"
                             :value="group.id"
@@ -53,7 +60,6 @@
                         >
                             {{ group.name }}
                         </option>
-                        <option v-if="!groups.length">Нет групп</option>
                     </BaseSelect>
                     <PasswordInput
                         v-model="user.password"
@@ -61,6 +67,7 @@
                         :label="user.id ? 'Новый пароль' : 'Пароль*'"
                         :placeholder="user.id ? 'Пусто: пароль не меняется' : 'Не меньше 10 символов'"
                         name="password"
+                        autocomplete="new-password"
                     />
                 </div>
                 <p v-if="user.id && user.password" class="text-sm text-muted-500 -mt-4">
@@ -72,33 +79,36 @@
                         Новый пароль завершит все сеансы сотрудника, а его Telegram-бот CRM отключится.
                     </template>
                 </p>
-                <div>
-                    <div class="flex justify-between items-center mb-3">
-                        <h4>Права доступа</h4>
-                    </div>
-                    <div class="mb-3">
-                        <BaseSwitchBall
-                            v-model="isAdminAccess"
-                            label="Админские права"
-                        />
-                    </div>
-                    <p v-if="seesEverything" class="text-sm text-muted-500">
-                        {{ user.role === 'admin' ? 'Администратор' : 'Менеджер' }} видит и меняет все сделки, компании,
-                        контакты и задачи, у него есть почта и файлы. Права ниже действуют только для роли «Агент».
-                    </p>
-                    <Permissions v-else-if="rerender" v-model:permissions="user.permissions" />
-                </div>
-                <div v-if="!seesEverything" class="flex flex-col gap-3">
-                    <BaseCheckbox
-                        v-model="user.mail"
-                        label="Доступ к почте"
-                        name="mailActive"
-                    />
-                    <BaseCheckbox
-                        v-model="user.file"
-                        label="Доступ к файлам"
-                        name="fileActive"
-                    />
+                <div class="flex flex-col gap-3">
+                    <h4>Права доступа</h4>
+                    <!-- the role decides: admin and manager see and change everything (src/auth/access.ts) -->
+                    <BaseMessage v-if="user.role === 'admin'" type="info" :closable="false">
+                        Администратор — полный доступ: все сделки, компании, контакты и задачи, почта, файлы,
+                        аналитика и настройки CRM.
+                    </BaseMessage>
+                    <BaseMessage v-else-if="user.role === 'manager'" type="info" :closable="false">
+                        Менеджер видит и меняет все сделки, компании, контакты и задачи, ему открыты почта, файлы
+                        и аналитика; настройки CRM — только у администратора. Таблица прав действует только для
+                        роли «Агент».
+                    </BaseMessage>
+                    <template v-else-if="loaded">
+                        <Permissions v-model:permissions="user.permissions" />
+                        <div class="flex flex-col gap-3">
+                            <BaseCheckbox
+                                v-model="user.mail"
+                                label="Доступ к почте"
+                                name="mailActive"
+                            />
+                            <BaseCheckbox
+                                v-model="user.file"
+                                label="Раздел «Файлы» (список файлов; вкладка «Файлы» сделки — по правам на сделку)"
+                                name="fileActive"
+                            />
+                        </div>
+                        <BaseMessage v-if="warning" type="warning" :closable="false">
+                            {{ warningText }}
+                        </BaseMessage>
+                    </template>
                 </div>
             </div>
             <div class="flex justify-end mt-6">
@@ -115,6 +125,7 @@
                         v-if="user.id && !isSelf"
                         type="button"
                         color="danger"
+                        variant="outline"
                         :loading="isDeletePending"
                         @click="askRemove"
                     >
@@ -130,11 +141,23 @@
                 </div>
             </div>
         </form>
+        <!-- who changed this account (role, rights, group, password — the fact only), its logins and the bot;
+             «Действия сотрудника»: what the employee did in the CRM (the journal of changes, components/audit) -->
+        <section v-if="user.id" class="mt-10 lg:px-10">
+            <h4 class="mb-3">История изменений</h4>
+            <CardHistory scope="user" :id="user.id" staff />
+        </section>
         <Confirmation
             id="SignOutUserConfirmation"
             title="Завершить все сеансы"
             description="Сотрудник выйдет из CRM на всех устройствах, его Telegram-бот CRM отключится. Пароль не меняется: войти снова можно с ним же."
             :on-confirm="signOutEverywhere"
+        />
+        <Confirmation
+            id="SaveWithoutRightsConfirmation"
+            title="Сохранить без прав на просмотр?"
+            description="Сотрудник ничего не увидит."
+            :on-confirm="saveAnyway"
         />
         <Modal id="DeleteUserModal" size="md">
             <template #header>
@@ -185,7 +208,9 @@ import Confirmation from '~/components/common/Confirmation.vue';
 import Modal from '~/components/common/Modal.vue';
 import PasswordInput from '~/components/common/PasswordInput.vue';
 import Permissions from '~/components/common/Permissions.vue';
+import CardHistory from '~/components/audit/CardHistory.vue';
 import type { User } from '~/types/user';
+import { STANDARD_PERMISSIONS, blindSpot } from '~/utils/casl';
 import { promiseResult } from '~/utils/result';
 
 definePageMeta({
@@ -205,6 +230,7 @@ const usersService = useService('users', {auth: true});
 const groupsService = useService('groups', {auth: true});
 const authService = useService('auth', {auth: true});
 const signOutConfirmation = useModal('SignOutUserConfirmation');
+const saveConfirmation = useModal('SaveWithoutRightsConfirmation');
 const deleteModal = useModal('DeleteUserModal');
 const me = useState<User>('user');
 
@@ -214,19 +240,11 @@ const errors = ref<Record<string, string>>({});
 const isDeletePending = ref(false);
 const isSavePending = ref(false);
 const isSignOutPending = ref(false);
-const groups = ref([]);
-const rerender = ref(false);
+const groups = ref<{ id: number; name: string }[]>([]);
+const loaded = ref(false);
 
 // One's own account: signed out and deleted from the profile / not at all
 const isSelf = computed(() => !!user.value.id && user.value.id === me.value?.id);
-
-// A new account starts without rights; the admin opens what is needed
-const defaultAccess = {
-    deal: {create: 0, view: 0, update: 0, delete: 0, export: 0},
-    contact: {create: 0, view: 0, update: 0, delete: 0, export: 0},
-    company: {create: 0, view: 0, update: 0, delete: 0, export: 0},
-    task: {update: 0, delete: 0},
-};
 
 // What the API applies to a level that is not stored (src/auth/access.ts): the agent's own deals,
 // every company, contact and task. The card shows these, saving stores them.
@@ -251,44 +269,52 @@ function withMissingLevels(stored: any) {
 }
 
 onMounted(async () => {
-    groups.value = await groupsService.find().exec();
+    const found = await promiseResult(groupsService.find().exec());
+    groups.value = found.ok && Array.isArray(found.value) ? found.value : [];
     if (route.params.id === 'new') {
-        user.value = {};
-        user.value.permissions = JSON.parse(JSON.stringify(defaultAccess));
+        // a new employee starts with the standard rights: their own deals, companies, contacts and tasks
+        user.value = {
+            role: 'agent',
+            group_id: '',
+            permissions: JSON.parse(JSON.stringify(STANDARD_PERMISSIONS)),
+            mail: true,
+            file: true,
+        };
     } else {
-        user.value = await usersService.get(route.params.id as string).exec();
+        const loadedUser = await promiseResult(usersService.get(route.params.id as string).exec());
+        if (!loadedUser.ok) {
+            toast.show({message: errorText(loadedUser.error), timeout: 4000, type: 'error'});
+            return navigateTo('/settings/users', {replace: true});
+        }
+        // a customer contact is not an employee: its card is in Списки → Контакты
+        if (loadedUser.value?.role === 'ctr_agent') {
+            return navigateTo(`/lists/contacts/${loadedUser.value.id}`, {replace: true});
+        }
+        user.value = loadedUser.value;
         // null for an account made without rights (the first admin from the server settings)
         const stored = user.value.permissions ?? null;
         user.value.permissions = withMissingLevels(stored);
         // a switch that is not stored counts as on, as the API reads it
         user.value.mail = stored?.mail !== false;
         user.value.file = stored?.file !== false;
-        user.value.group_id = user.value.group?.id;
+        // "": no group yet (the placeholder of the select)
+        user.value.group_id = user.value.group?.id ?? '';
         user.value.company_id = user.value.company?.id;
     }
-    rerender.value = true;
+    loaded.value = true;
 });
 
-// «Админские права» is the role «Администратор». Turned off, the role goes back to the one before
-// (a manager when the account was an admin already); the stored rights are not touched.
-let roleBeforeAdmin: string | undefined;
-const isAdminAccess = computed({
-    get: () => user.value.role === 'admin',
-    set(value: boolean) {
-        if (value) {
-            if (user.value.role !== 'admin') roleBeforeAdmin = user.value.role;
-            user.value.role = 'admin';
-        } else if (user.value.role === 'admin') {
-            user.value.role = roleBeforeAdmin && roleBeforeAdmin !== 'admin' ? roleBeforeAdmin : 'manager';
-        }
-    },
-});
+/** An agent whose levels hide everything, or even their own deals (utils/casl.ts blindSpot): warned before saving. */
+const warning = computed(() => (loaded.value
+    ? blindSpot({role: user.value.role, permissions: {...user.value.permissions, mail: user.value.mail, file: user.value.file}})
+    : null));
+const warningText = computed(() => (warning.value === 'nothing'
+    ? 'Нет прав на просмотр: сотрудник ничего не увидит — ни сделок, ни компаний, ни контактов. Нажмите «Стандартные: свои записи» или откройте нужное.'
+    : 'Просмотр сделок — «Нет»: сотрудник не увидит даже свои сделки, в том числе те, что ему передали коллеги.'));
 
-// Admin and manager see and change everything: the matrix of the card does not apply to them (src/auth/access.ts)
-const seesEverything = computed(() => user.value.role === 'admin' || user.value.role === 'manager');
-
+// useService() puts the human Russian text into `message` (the server's own Russian text, or one by the status)
 function errorText(e: any): string {
-    const message = e?.data?.message ?? e?.message ?? 'Ошибка';
+    const message = e?.message || e?.data?.message || 'Не получилось, попробуйте ещё раз';
     return Array.isArray(message) ? message.join('; ') : String(message);
 }
 
@@ -339,28 +365,55 @@ async function signOutEverywhere() {
     toast.show({message: 'Все сеансы сотрудника завершены, Telegram-бот CRM отключён', timeout: 4000, type: 'success'});
 }
 
-async function submit() {
+/** POST / PATCH /users; throws the API's error. */
+async function save() {
     const {id, ...data} = user.value;
-    errors.value = {};
-    isSavePending.value = true;
     data.permissions = {...(data.permissions ?? withMissingLevels(null)), mail: Boolean(data.mail), file: Boolean(data.file)};
+    delete data.mail;
+    delete data.file;
     // empty: the password stays as it is
     if (!data.password) delete data.password;
+    isSavePending.value = true;
     try {
         if (id) {
             await usersService.patch(id, data).exec();
         } else {
             await usersService.create(data).exec();
         }
-        navigateTo('/settings/users');
-    } catch (e: any) {
-        toast.show({message: errorText(e), timeout: 4000, type: 'error'});
     } finally {
         isSavePending.value = false;
     }
+    navigateTo('/settings/users');
+}
+
+async function submit() {
+    errors.value = {};
+    if (!user.value.group_id) {
+        errors.value.group_id = 'Выберите группу';
+        return;
+    }
+    // an agent who would see nothing: the admin confirms it first (ACL-15)
+    if (warning.value) {
+        saveConfirmation.open({
+            description: warning.value === 'nothing'
+                ? 'Сотрудник ничего не увидит: ни сделок, ни компаний, ни контактов.'
+                : 'Сотрудник не увидит даже свои сделки, в том числе те, что ему передали коллеги.',
+        });
+        return;
+    }
+    try {
+        await save();
+    } catch (e: any) {
+        toast.show({message: errorText(e), timeout: 4000, type: 'error'});
+    }
+}
+
+// «Подтвердить» of the warning: an error is shown by the confirmation window
+async function saveAnyway() {
+    try {
+        await save();
+    } catch (e: any) {
+        throw new Error(errorText(e));
+    }
 }
 </script>
-
-<style scoped>
-
-</style>

@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { DataSource } from 'typeorm';
 import { JwtService } from '@nestjs/jwt';
@@ -6,9 +6,10 @@ import * as bcrypt from 'bcryptjs';
 import { SignInDto } from './dto/sign-in.dto';
 import { RoleEnum, User } from '../user/user.entity';
 import { AuthUser } from './auth.guard';
-import { Access, AccessSummary } from './access';
+import { Access, AccessSummary, STANDARD_LEVELS } from './access';
 import { LoginThrottle } from './login-throttle';
 import { SIGNED_OUT_EVENT, SignedOut, signOutEverywhere } from './sign-out';
+import { AuditJournal } from '../audit/audit-journal';
 
 /** GET /auth/access */
 export type AccessResponse = AccessSummary & {
@@ -44,6 +45,39 @@ export class AuthService {
     const result = await signOutEverywhere(this.dataSource, userId);
     this.events.emit(SIGNED_OUT_EVENT, result);
     return result;
+  }
+
+  /**
+   * POST /auth/standard-rights/:id (admin): the agent gets the standard rights (STANDARD_LEVELS in access.ts) —
+   * for an employee whose card forbids everything: they saw nothing, not even the deals given to them. The
+   * switches «Доступ к почте» / «Доступ к файлам» stay as they are. Admin and manager see everything anyway
+   * (400); not a staff account: 404. Applies at once: AuthGuard reads the rights on every request.
+   */
+  async giveStandardRights(
+    userId: number,
+    performerId: number,
+  ): Promise<{ id: number; permissions: Record<string, any> }> {
+    const row = (
+      await this.dataSource.query(`SELECT role, permissions FROM "user" WHERE id = $1 AND deleted_at IS NULL`, [userId])
+    )[0];
+    if (!row || row.role === RoleEnum.CTR_AGENT) throw new NotFoundException(`User ${userId} not found`);
+    if (row.role !== RoleEnum.AGENT) {
+      throw new BadRequestException('Администратор и менеджер видят всё: стандартные права нужны только агенту');
+    }
+    const stored = row.permissions ?? {};
+    const permissions = {
+      ...JSON.parse(JSON.stringify(STANDARD_LEVELS)),
+      mail: stored.mail !== false,
+      file: stored.file !== false,
+    };
+    // the journal (src/audit): «Изменение прав», every right before and after
+    await AuditJournal.around(this.dataSource, 'user', 't.id = $1', [userId], () =>
+      this.dataSource.query(
+        `UPDATE "user" SET permissions = $2::jsonb, updated_by = $3, updated_at = now() WHERE id = $1`,
+        [userId, JSON.stringify(permissions), performerId],
+      ),
+    );
+    return { id: userId, permissions };
   }
 
   /** GET /auth/access: the user's rules (Access.describe()) and the members of their group. */

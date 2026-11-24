@@ -124,6 +124,15 @@ export class TelegramBotApi {
     });
   }
 
+  /** Only the buttons of a message (the text stays): the menus of a task card. */
+  editMessageReplyMarkup(chatId: number | string, messageId: number, keyboard?: InlineKeyboard) {
+    return this.call('editMessageReplyMarkup', {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: { inline_keyboard: keyboard ?? [] },
+    });
+  }
+
   answerCallbackQuery(id: string, text?: string) {
     return this.call('answerCallbackQuery', { callback_query_id: id, ...(text ? { text } : {}) });
   }

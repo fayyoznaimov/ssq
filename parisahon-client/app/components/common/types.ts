@@ -22,6 +22,13 @@ export interface Column<T = any> {
     decimalPoints?: number; // if provided it will round the number to the specified decimal points
     mask?: string; // if provided it will format the number using mask, ex.: +1 (###) ###-####
     resizable?: boolean;
+    align?: 'left' | 'center' | 'right'; // money is right-aligned by default
+    stage?: (item: T) => { name: string; color?: string | null } | null | undefined; // the cell is the stage as a coloured chip
+    maxWidth?: number; // px; longer text is cut with «…» and shown whole on hover (default 320 for plain text)
+    wrap?: boolean; // the text may take several lines instead of being cut
+    // the row as a card on a phone (BaseTable, below 640 px): 'title' — the heading of the card (default: the first column),
+    // 'show' — a line «label: value» (default), 'hide' — not on the card
+    mobile?: 'title' | 'show' | 'hide';
     headerStyle?: Record<string, any>;
     style?: {
         overwrite?: boolean; // if true will overwrite any default styles

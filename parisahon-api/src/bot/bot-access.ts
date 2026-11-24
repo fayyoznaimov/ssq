@@ -40,9 +40,32 @@ export class BotAccess {
     return this.access.can('company', 'create');
   }
 
-  /** May this user close a task assigned to `agentId` / group `groupId` (created by `creatorId`)? */
-  canUpdateTask(agentId: number | null, groupId: number | null, creatorId: number | null = null): boolean {
-    return this.access.allowsTask('update', agentId, groupId, creatorId);
+  /**
+   * May this user close, move or edit a task assigned to `agentId` / group `groupId` (created by `creatorId`)?
+   * `peopleGroups`: the groups of the assignee and of the author, as PATCH /tasks/:id checks it (RecordAccessGuard).
+   */
+  canUpdateTask(agentId: number | null, groupId: number | null, creatorId: number | null = null, peopleGroups: (number | null)[] = []): boolean {
+    return this.access.allowsTask('update', agentId, groupId, creatorId, peopleGroups);
+  }
+
+  /** May this user delete such a task (the "delete" level of tasks, as DELETE /tasks/:id)? */
+  canDeleteTask(agentId: number | null, groupId: number | null, creatorId: number | null = null, peopleGroups: (number | null)[] = []): boolean {
+    return this.access.allowsTask('delete', agentId, groupId, creatorId, peopleGroups);
+  }
+
+  /** The task level of the user card ("Задачи: правка / удаление"); admin and manager: all. */
+  taskScope(action: 'update' | 'delete'): Scope {
+    return this.access.scope('task', action);
+  }
+
+  /** A task goes into its deal's history: putting one on a deal needs the right to change the deal (as POST /tasks). */
+  canTaskOnDeal(dealAgentId: number | null, dealAgentGroup: number | null): boolean {
+    return this.access.isManager || this.access.allowsDeal('update', dealAgentId, dealAgentGroup);
+  }
+
+  /** Contacts (alias of "user") the user may see, as a QueryBuilder condition (Access.contactSql). */
+  contactSql(alias: string): { sql: string; params: Record<string, any> } {
+    return this.access.contactSql(alias, 'view');
   }
 
   /**

@@ -4,6 +4,7 @@ import moment from 'moment';
 import TaskColumn from '~/components/task/TaskColumn.vue';
 import TaskModal from '~/components/task/TaskModal.vue';
 import TaskResultModal from '~/components/task/TaskResultModal.vue';
+import { tasksCount } from '~/components/task/taskText';
 import type { Task } from '~/types/deal';
 import type { PaginatedResponse } from '~/types/generics';
 const props = withDefaults(defineProps<{
@@ -13,8 +14,8 @@ const props = withDefaults(defineProps<{
 
 const emits = defineEmits(['fetchTasks']);
 
-// the board shows every open task of the filters, not one page of the list (25)
-const BOARD_QUERY = { skip: 0, limit: 1000 };
+// the board shows every open task of the filters, not one page of the list (25): all the pages
+const BOARD_QUERY = { all: true };
 
 type GroupedTasks = {
   overdue: Task[];
@@ -88,7 +89,7 @@ onMounted(reload);
         <TaskResultModal id="TaskResultModal" @saved="emits('fetchTasks')" />
         <TaskModal @save="emits('fetchTasks')" id="TaskModal" />
         <p v-if="tasks.count > tasks.data.length" class="text-sm text-amber-500 mb-2">
-            Показаны {{ tasks.data.length }} задач из {{ tasks.count }}: сузьте фильтры.
+            Показаны {{ tasksCount(tasks.data.length) }} из {{ tasks.count }}: сузьте фильтры.
         </p>
         <ul class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <li>

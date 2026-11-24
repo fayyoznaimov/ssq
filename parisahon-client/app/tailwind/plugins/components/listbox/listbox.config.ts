@@ -131,7 +131,7 @@ export const defaultConfig = {
             font: {
                 color: {
                     light: 'primary-600',
-                    dark: 'primary-400',
+                    dark: 'primary-200',
                 },
             },
             background: {

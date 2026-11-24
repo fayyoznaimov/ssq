@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
@@ -35,7 +36,8 @@ import { File } from '../file/file.entity';
 import { SIGNED_OUT_EVENT, signOutEverywhere } from '../auth/sign-out';
 import { Access } from '../auth/access';
 import { AuthUser } from '../auth/auth.guard';
-import { normalizePhone, phoneKey, phoneKeySql } from '../helper/phone';
+import { normalizeEmail, normalizePhone, phoneKey, phoneKeySql } from '../helper/phone';
+import { AuditJournal } from '../audit/audit-journal';
 
 /** Staff accounts; ctr_agent rows are customer contacts. */
 export const STAFF_ROLES = [RoleEnum.ADMIN, RoleEnum.MANAGER, RoleEnum.AGENT];
@@ -295,11 +297,7 @@ export class UserService {
       throw new ForbiddenException('Only admin can create staff accounts');
     }
 
-    if (await this.checkIfUserEmailExists(data.email)) {
-      throw new BadRequestException(
-        `User with email ${data.email} already exists!`,
-      );
-    }
+    await this.assertEmailIsFree(data.email);
 
     // Handle CTR_AGENT separately because the logic vastly differs
     if (data.role === RoleEnum.CTR_AGENT) {
@@ -310,16 +308,45 @@ export class UserService {
 
     const newUser = new User();
     newUser.username = data.username;
-    newUser.email = data.email;
+    newUser.email = data.email ? String(data.email).trim() : data.email;
     newUser.password = await bcrypt.hash(data.password, salt);
     newUser.role = data.role;
     newUser.group = await this.helperService.getById(Group, data.group_id);
     newUser.permissions = data.permissions;
-    newUser.phone = data.phone;
+    // one form of a phone everywhere (helper/phone.ts): "90 123 45 67" is stored as +998901234567
+    newUser.phone = normalizePhone(data.phone);
     newUser.created_by =
       await this.helperService.extractUserFromRequest(request);
 
-    return this.userRepository.save(newUser);
+    return this.saveUnique(newUser);
+  }
+
+  /**
+   * A row that hits a unique index (two requests at once got past the checks): 409 in Russian, not 500.
+   */
+  private async saveUnique(user: User): Promise<User> {
+    try {
+      return await this.userRepository.save(user);
+    } catch (error) {
+      if ((error as { code?: string })?.code === '23505') {
+        throw new ConflictException('Контакт или пользователь с такой почтой уже есть');
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * 409 when the e-mail is taken by a user that is not deleted (case and spaces do not matter), with
+   * who has it: a contact or an account.
+   */
+  async assertEmailIsFree(email: string | null | undefined, exceptId?: number): Promise<void> {
+    const same = await this.checkIfUserEmailExists(email, exceptId);
+    if (!same) return;
+    throw new ConflictException(
+      same.role === RoleEnum.CTR_AGENT
+        ? `Контакт с почтой ${same.email} уже есть: ${same.username} (№${same.id})`
+        : `Почта ${same.email} уже занята сотрудником ${same.username}`,
+    );
   }
 
   /**
@@ -332,7 +359,7 @@ export class UserService {
     if (!email || !String(email).trim()) return null;
     const qb = this.userRepository
       .createQueryBuilder('u')
-      .where('lower(u.email) = lower(:email)', { email: String(email).trim() });
+      .where('lower(btrim(u.email)) = lower(:email)', { email: String(email).trim() });
     if (exceptId) qb.andWhere('u.id <> :exceptId', { exceptId });
     return qb.getOne();
   }
@@ -349,7 +376,8 @@ export class UserService {
     return this.userRepository
       .createQueryBuilder('t0')
       .addSelect('t0.password')
-      .where('t0.email = :email', { email })
+      // case does not matter (the e-mail is unique by lower(email)): "Info@…" signs in as "info@…"
+      .where('lower(btrim(t0.email)) = lower(:email)', { email: email.trim() })
       .getOne();
   }
 
@@ -417,12 +445,9 @@ export class UserService {
     // If email is being changed check if it already exists
     if (
       data.email !== undefined &&
-      (data.email ?? null) !== (user.email ?? null) &&
-      (await this.checkIfUserEmailExists(data.email, user.id))
+      String(data.email ?? '').trim().toLowerCase() !== String(user.email ?? '').trim().toLowerCase()
     ) {
-      throw new BadRequestException(
-        `User with email ${data.email} already exists!`,
-      );
+      await this.assertEmailIsFree(data.email, user.id);
     }
 
     // Handle CTR_AGENT separately because the logic vastly differs
@@ -505,17 +530,22 @@ export class UserService {
       let deals: any[] = [];
       let tasks: any[] = [];
       if (successor) {
+        // the journal (src/audit): «Ответственный: … → …» of every deal and task handed over, in this transaction
         deals = returnedRows(
-          await manager.query(
-            `UPDATE deal SET agent_id = $1 WHERE agent_id = $2 AND closed_at IS NULL AND deleted_at IS NULL RETURNING id`,
-            [successor.id, user.id],
+          await AuditJournal.around(manager, 'deal', 't.agent_id = $1 AND t.closed_at IS NULL AND t.deleted_at IS NULL', [user.id], () =>
+            manager.query(
+              `UPDATE deal SET agent_id = $1 WHERE agent_id = $2 AND closed_at IS NULL AND deleted_at IS NULL RETURNING id`,
+              [successor.id, user.id],
+            ),
           ),
         );
         tasks = returnedRows(
-          await manager.query(`UPDATE task SET agent_id = $1 WHERE agent_id = $2 AND closed_at IS NULL RETURNING id`, [
-            successor.id,
-            user.id,
-          ]),
+          await AuditJournal.around(manager, 'task', 't.agent_id = $1 AND t.closed_at IS NULL', [user.id], () =>
+            manager.query(`UPDATE task SET agent_id = $1 WHERE agent_id = $2 AND closed_at IS NULL RETURNING id`, [
+              successor.id,
+              user.id,
+            ]),
+          ),
         );
       }
       await manager.update(User, { id: user.id }, { deleted_at: new Date(), deleted_by: { id: performer.id } as User });
@@ -631,7 +661,7 @@ export class UserService {
     const newCtrAgent = new User();
 
     newCtrAgent.username = data.username;
-    newCtrAgent.email = data.email || null;
+    newCtrAgent.email = normalizeEmail(data.email);
     newCtrAgent.role = RoleEnum.CTR_AGENT;
     newCtrAgent.company = company;
     newCtrAgent.phone = phone;
@@ -654,7 +684,7 @@ export class UserService {
         )
       : [];
 
-    return this.userRepository.save(newCtrAgent);
+    return this.saveUnique(newCtrAgent);
   }
 
   /**
@@ -674,6 +704,158 @@ export class UserService {
     if (same) {
       throw new BadRequestException(`Контакт с таким телефоном уже есть: ${same.username} (№${same.id})`);
     }
+  }
+
+  /**
+   * POST /users/:id/merge {from_id}: «Объединить контакты». Contact B (`sourceId`) is the same client as
+   * contact A (`targetId`), entered twice (a Telegram chat without a phone and then WhatsApp, a typo):
+   * - A gets B's deals (deal_user), the events, tasks, e-mails and files of B, B's «не клиент» marks of
+   *   the messengers, and the custom fields A has no value of;
+   * - what A lacks is taken from B: phone, e-mail, Telegram, WhatsApp, photo, company (A's own stay);
+   * - B is deleted (soft) and gives up its Telegram / WhatsApp ids when A took them, so the messengers
+   *   find A only;
+   * - the history of A (each of its deals, or A itself) says what was merged and what A got.
+   * Rights: change A (RecordAccess on the route) and delete B (`access`).
+   */
+  async mergeContacts(
+    targetId: number,
+    sourceId: number,
+    request: Request,
+    access: Access,
+  ): Promise<{ id: number; merged_id: number; deals: number; fields: string[] }> {
+    if (!Number.isInteger(sourceId) || sourceId < 1) {
+      throw new BadRequestException('Укажите контакт, который присоединить (from_id)');
+    }
+    if (targetId === sourceId) {
+      throw new BadRequestException('Нельзя объединить контакт с самим собой');
+    }
+    const [target, source] = await Promise.all([
+      this.userRepository.findOne({ where: { id: targetId }, relations: ['company'] }),
+      this.userRepository.findOne({ where: { id: sourceId }, relations: ['company'] }),
+    ]);
+    if (!target || !source) throw new NotFoundException('Контакт не найден');
+    if (target.role !== RoleEnum.CTR_AGENT || source.role !== RoleEnum.CTR_AGENT) {
+      throw new BadRequestException('Объединить можно только контакты клиентов');
+    }
+    if (access.scope('contact', 'delete') !== 'all') {
+      const cond = access.contactSql('u', 'delete');
+      const allowed = access.can('contact', 'delete')
+        ? await this.dataSource
+            .createQueryBuilder()
+            .select('u.id', 'id')
+            .from('user', 'u')
+            .where('u.id = :sourceId', { sourceId })
+            .andWhere(cond.sql, cond.params)
+            .getRawOne()
+        : null;
+      if (!allowed) throw new ForbiddenException('Нет права удалить присоединяемый контакт');
+    }
+
+    const performer = await this.helperService.extractUserFromRequest(request);
+    // what A takes from B: only what A has not
+    const taken: Partial<Record<'phone' | 'email' | 'tg_id' | 'wa_id' | 'avatar', any>> = {};
+    if (!target.phone && source.phone) taken.phone = source.phone;
+    if (!target.email && source.email) taken.email = normalizeEmail(source.email);
+    if (!target.tg_id && source.tg_id) taken.tg_id = source.tg_id;
+    if (!target.wa_id && source.wa_id) taken.wa_id = source.wa_id;
+    if (!target.avatar && source.avatar) taken.avatar = source.avatar;
+    const company = target.company ?? source.company ?? null;
+    const companyTaken = !target.company && !!source.company;
+
+    const fields: Field[] = [new Field('Объединён с контактом', `${source.username} (№${source.id})`, null)];
+    const labels: Record<string, string> = { phone: 'phone', email: 'email', tg_id: 'tg_user_id', wa_id: 'WhatsApp' };
+    for (const key of ['phone', 'email', 'tg_id', 'wa_id'] as const) {
+      if (taken[key] !== undefined) fields.push(new Field(labels[key], String(taken[key]), null));
+    }
+    if (companyTaken) fields.push(new Field('company', source.company.name, null));
+    // B's own phone / e-mail that A does not take: kept in the history, so they are not lost from sight
+    if (source.phone && taken.phone === undefined && phoneKey(source.phone) !== phoneKey(target.phone)) {
+      fields.push(new Field('Телефон присоединённого контакта', source.phone, null));
+    }
+    if (source.email && taken.email === undefined && normalizeEmail(source.email) !== normalizeEmail(target.email)) {
+      fields.push(new Field('Почта присоединённого контакта', source.email, null));
+    }
+
+    const deals = await this.dataSource.transaction(async (manager) => {
+      // B first: its e-mail and messenger ids are free for A only once B is deleted (unique indexes of live rows)
+      // (the journal, src/audit: B «Удаление в корзину» in this transaction)
+      await AuditJournal.around(manager, 'user', 't.id = $1', [source.id], () =>
+        manager.query(
+          `UPDATE "user" SET deleted_at = now(), deleted_by = $2,
+                  tg_id = CASE WHEN $3::boolean THEN NULL ELSE tg_id END,
+                  wa_id = CASE WHEN $4::boolean THEN NULL ELSE wa_id END
+            WHERE id = $1`,
+          [source.id, performer?.id ?? null, taken.tg_id !== undefined, taken.wa_id !== undefined],
+        ),
+      );
+      const changes: Partial<User> = { ...taken, updated_by: { id: performer.id } as User };
+      if (companyTaken) changes.company = { id: source.company.id } as Company;
+      await manager.update(User, { id: target.id }, changes);
+
+      // the journal (src/audit): «Контакты: B → A» of every deal of B
+      await AuditJournal.around(manager, 'deal', 't.id IN (SELECT du."dealId" FROM deal_user du WHERE du."userId" = $1)', [source.id], async () => {
+        await manager.query(
+          `INSERT INTO deal_user ("dealId", "userId")
+           SELECT du."dealId", $1 FROM deal_user du
+            WHERE du."userId" = $2
+              AND NOT EXISTS (SELECT 1 FROM deal_user x WHERE x."dealId" = du."dealId" AND x."userId" = $1)`,
+          [target.id, source.id],
+        );
+        await manager.query(`DELETE FROM deal_user WHERE "userId" = $1`, [source.id]);
+      });
+      await manager.query(`UPDATE event SET target_user_id = $1 WHERE target_user_id = $2`, [target.id, source.id]);
+      await manager.query(`UPDATE event SET user_id = $1 WHERE user_id = $2`, [target.id, source.id]);
+      // the client of an event (event.contact_id, migration 1795610000000-event-client): the feed of A
+      const [clientColumn] = await manager.query(
+        `SELECT 1 FROM information_schema.columns WHERE table_name = 'event' AND column_name = 'contact_id'`,
+      );
+      if (clientColumn) {
+        await manager.query(`UPDATE event SET contact_id = $1 WHERE contact_id = $2`, [target.id, source.id]);
+      }
+      await manager.query(`UPDATE task SET ctr_agent_id = $1 WHERE ctr_agent_id = $2`, [target.id, source.id]);
+      await manager.query(`UPDATE email SET user_id = $1 WHERE user_id = $2`, [target.id, source.id]);
+      await manager.query(`UPDATE file SET uploaded_by = $1 WHERE uploaded_by = $2`, [target.id, source.id]);
+      await manager.query(
+        `UPDATE messenger_ignore m SET contact_id = $1
+          WHERE m.contact_id = $2
+            AND NOT EXISTS (SELECT 1 FROM messenger_ignore x WHERE x.contact_id = $1 AND x.agent_id = m.agent_id)`,
+        [target.id, source.id],
+      );
+      // custom fields: those A has no value of (A's «Должность» stays A's)
+      await manager.query(
+        `UPDATE user_filler uf SET user_id = $1
+          WHERE uf.user_id = $2
+            AND NOT EXISTS (SELECT 1 FROM user_filler x WHERE x.user_id = $1 AND x.filler_id = uf.filler_id)`,
+        [target.id, source.id],
+      );
+      // B as the primary contact of a company: A when it is A's company now, otherwise none
+      await manager.query(
+        `UPDATE company SET primary_contact_id = CASE WHEN id = $3::int THEN $1::int ELSE NULL END WHERE primary_contact_id = $2::int`,
+        [target.id, source.id, company?.id ?? 0],
+      );
+      // the deals of A without a company belong to its company (as a move of a contact does)
+      if (company) {
+        await manager.query(
+          `UPDATE deal SET company_id = $1
+            WHERE company_id IS NULL AND deleted_at IS NULL
+              AND id IN (SELECT "dealId" FROM deal_user WHERE "userId" = $2)`,
+          [company.id, target.id],
+        );
+      }
+      const rows: { id: number }[] = await manager.query(
+        `SELECT d.id FROM deal_user du JOIN deal d ON d.id = du."dealId"
+          WHERE du."userId" = $1 AND d.deleted_at IS NULL`,
+        [target.id],
+      );
+      return rows.map((row) => Number(row.id));
+    });
+
+    const events: FieldValueEventDto[] = deals.length
+      ? deals.map((dealId) => ({ originated_by: performer, deal: { id: dealId } as any, fields, fields_of: FieldsOf.USER }) as FieldValueEventDto)
+      : [{ originated_by: performer, target_user: { id: target.id } as User, deal: undefined, fields, fields_of: FieldsOf.USER } as FieldValueEventDto];
+    for (const eventData of events) this.eventEmitter.emit(EventTypes.NEW_FIELD_VALUE.toString(), eventData);
+
+    return { id: target.id, merged_id: source.id, deals: deals.length, fields: fields.map((f) => f.name) };
   }
 
   /**
@@ -709,11 +891,10 @@ export class UserService {
     }
 
     if (data.email !== undefined) {
-      const email = data.email ? String(data.email).trim() : null;
+      // one form of an e-mail (helper/phone.ts normalizeEmail): "Ivan@Mail.ru" is "ivan@mail.ru"
+      const email = normalizeEmail(data.email);
       if (email !== (ctrAgent.email ?? null)) {
-        if (email && (await this.checkIfUserEmailExists(email, ctrAgent.id))) {
-          throw new BadRequestException(`User with email ${email} already exists!`);
-        }
+        if (email && email !== normalizeEmail(ctrAgent.email)) await this.assertEmailIsFree(email, ctrAgent.id);
         updatedFields.push(new Field('email', email, ctrAgent.email));
         ctrAgent.email = email;
         columns.email = email;
@@ -839,26 +1020,43 @@ export class UserService {
 
     ctrAgent.updated_by = originated_by;
 
-    await this.userRepository.update(ctrAgent.id, {
-      ...columns,
-      updated_by: { id: originated_by.id } as User,
-    });
+    try {
+      await this.userRepository.update(ctrAgent.id, {
+        ...columns,
+        updated_by: { id: originated_by.id } as User,
+      });
+    } catch (error) {
+      if ((error as { code?: string })?.code === '23505') {
+        throw new ConflictException('Контакт с такой почтой уже есть');
+      }
+      throw error;
+    }
 
     if (movedTo !== undefined) {
       // the old company does not keep as its primary contact a person who is not its contact any more
       if (movedFrom) {
-        await this.dataSource.query(
-          `UPDATE company SET primary_contact_id = NULL WHERE id = $1 AND primary_contact_id = $2`,
-          [movedFrom.id, ctrAgent.id],
+        await AuditJournal.around(this.dataSource, 'company', 't.id = $1', [movedFrom.id], () =>
+          this.dataSource.query(
+            `UPDATE company SET primary_contact_id = NULL WHERE id = $1 AND primary_contact_id = $2`,
+            [movedFrom.id, ctrAgent.id],
+          ),
         );
       }
       // the contact's deals without a company (Telegram, WhatsApp, calls) are the new company's now
+      // (the journal, src/audit: «Компания: — → …» of each of those deals)
       if (movedTo) {
-        await this.dataSource.query(
-          `UPDATE deal SET company_id = $1
-            WHERE company_id IS NULL AND deleted_at IS NULL
-              AND id IN (SELECT "dealId" FROM deal_user WHERE "userId" = $2)`,
-          [movedTo.id, ctrAgent.id],
+        await AuditJournal.around(
+          this.dataSource,
+          'deal',
+          't.company_id IS NULL AND t.deleted_at IS NULL AND t.id IN (SELECT "dealId" FROM deal_user WHERE "userId" = $1)',
+          [ctrAgent.id],
+          () =>
+            this.dataSource.query(
+              `UPDATE deal SET company_id = $1
+                WHERE company_id IS NULL AND deleted_at IS NULL
+                  AND id IN (SELECT "dealId" FROM deal_user WHERE "userId" = $2)`,
+              [movedTo.id, ctrAgent.id],
+            ),
         );
       }
     }

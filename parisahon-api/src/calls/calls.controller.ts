@@ -1,11 +1,11 @@
-import { Body, Controller, Delete, Get, Param, ParseIntPipe, Post, Query, Req } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, ParseIntPipe, Patch, Post, Query, Req } from '@nestjs/common';
 import { Request } from 'express';
 import { Roles } from '../auth/decorator/roles.decorator';
 import { AuthGuard } from '../auth/auth.guard';
 import { HelperService } from '../helper/helper.service';
 import { CallsService } from './calls.service';
 import { CallDealService } from './call-deal.service';
-import { IssueTokenDto, QueueQueryDto, RecordingsQueryDto } from './dto/calls.dto';
+import { IssueTokenDto, QueueQueryDto, RecordingsQueryDto, TokenSettingsDto } from './dto/calls.dto';
 
 /** Call recordings for the admin: recorder tokens, the queue, every recording. */
 @Roles(AuthGuard.ADMIN_LEVEL)
@@ -25,7 +25,13 @@ export class CallsController {
   @Post('tokens')
   async issue(@Req() request: Request, @Body() data: IssueTokenDto) {
     const admin = await this.helperService.extractUserFromRequest(request);
-    return this.calls.issueToken(data.user_id, admin);
+    return this.calls.issueToken(data.user_id, admin, data.tls_required);
+  }
+
+  /** FTPS required (or not) for the FTP logins with the manager's current token. */
+  @Patch('tokens/:user_id')
+  tokenSettings(@Param('user_id', ParseIntPipe) userId: number, @Body() data: TokenSettingsDto) {
+    return this.calls.setTokenTls(userId, data.tls_required);
   }
 
   @Delete('tokens/:user_id')

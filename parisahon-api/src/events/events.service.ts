@@ -39,6 +39,11 @@ import { RemapEventDto } from './dto/remap.event.dto';
 import { Email } from '../email/email.entity';
 import { Company } from '../company/company.entity';
 import { COMPANY_DEALS_SQL } from '../deal/client-history.service';
+import { stripFeedSnapshots } from './feed-privacy';
+import { applyHistoryFilters } from '../history/history-filters';
+
+/** Whose card a note without a deal is written to (POST /companies/:id/comments, /users/:id/comments). */
+export type ClientNoteOwner = { company_id: number } | { contact_id: number };
 
 /**
  * The people of a feed row: who did it and to whom, by name. Not the whole account (an agent
@@ -84,7 +89,7 @@ export class EventsService {
       .createQueryBuilder('t0')
       .where('t0.deal_id = :deal_id', { deal_id });
 
-    return EventsService.hideMail(await this.applyEventFilters(query, qb), canReadMail);
+    return EventsService.hideMail(await this.applyEventFilters(query, qb, { canReadMail }), canReadMail);
   }
 
   /**
@@ -124,8 +129,9 @@ export class EventsService {
 
   /**
    * The feed of a company: everything that happened in all of its deals the user may see (an agent
-   * with "own deals" read the chats, letters and comments of colleagues' deals here, ACL-4), and the
-   * tasks of the company itself (no deal). A company without deals has an empty feed, not a 404.
+   * with "own deals" read the chats, letters and comments of colleagues' deals here, ACL-4), and what
+   * is about the company outside deals (event.company_id, DB-9): its tasks and notes, and those of its
+   * contacts. A company without deals has an empty feed, not a 404.
    */
   async fetchCompanyEvents(
     company_id: number,
@@ -139,18 +145,19 @@ export class EventsService {
       .createQueryBuilder('t0')
       .where(
         `(t0.deal_id IN (SELECT d.id FROM deal d WHERE d.deleted_at IS NULL AND ${COMPANY_DEALS_SQL} AND ${deals.sql})
-          OR (t0.deal_id IS NULL AND t0.task_id IN (SELECT ct.id FROM task ct WHERE ct.company_id = :company_id)))`,
+          OR (t0.deal_id IS NULL AND t0.company_id = :company_id))`,
         { company_id, ...deals.params },
       );
 
-    const page = await this.applyEventFilters(query, qb, { withDeal: true });
+    const page = await this.applyEventFilters(query, qb, { withDeal: true, canReadMail: access ? access.canReadMail : true });
     return EventsService.hideMail(page, access ? access.canReadMail : true);
   }
 
   /**
    * The card of a contact: what they wrote and got, everything in their deals the user may see, and
-   * the tasks of the contact (no deal). The card of an employee: their own history (admin and
-   * manager: anyone's), as GET /users/:id/events always was.
+   * what is about the contact outside deals (event.contact_id, DB-9: tasks, notes, changes of the
+   * card). The card of an employee: their own history (admin and manager: anyone's), as
+   * GET /users/:id/events always was.
    */
   async fetchUserEvents(
     user_id: number,
@@ -163,9 +170,8 @@ export class EventsService {
     const qb = this.eventRepository
       .createQueryBuilder('t0')
       .where(
-        `(t0.user_id = :user_id OR t0.target_user_id = :user_id
-          OR t0.deal_id IN (SELECT du."dealId" FROM deal_user du WHERE du."userId" = :user_id)
-          OR (t0.deal_id IS NULL AND t0.task_id IN (SELECT ut.id FROM task ut WHERE ut.ctr_agent_id = :user_id)))`,
+        `(t0.user_id = :user_id OR t0.target_user_id = :user_id OR t0.contact_id = :user_id
+          OR t0.deal_id IN (SELECT du."dealId" FROM deal_user du WHERE du."userId" = :user_id))`,
         { user_id },
       )
       // a deal in the trash or out of the user's scope: not its events either
@@ -174,7 +180,7 @@ export class EventsService {
         deals.params,
       );
 
-    const page = await this.applyEventFilters(query, qb, { withDeal: true });
+    const page = await this.applyEventFilters(query, qb, { withDeal: true, canReadMail: access ? access.canReadMail : true });
     return EventsService.hideMail(page, access ? access.canReadMail : true);
   }
 
@@ -205,7 +211,7 @@ export class EventsService {
   async applyEventFilters(
     query: SearchEventDto,
     qb: SelectQueryBuilder<Event>,
-    options: { withDeal?: boolean } = {},
+    options: { withDeal?: boolean; canReadMail?: boolean } = {},
   ): Promise<PaginationResponseDto<Event[]>> {
     const eventTypesToExclude = [];
 
@@ -260,22 +266,10 @@ export class EventsService {
       });
     }
 
-    // withDeleted: the joined author / addressee / group may be deleted since (the event has no deleted_at)
-    qb = qb
-      .withDeleted()
-      .leftJoin('t0.originated_by', 'ev_by')
-      .addSelect(FEED_PERSON.map((column) => `ev_by.${column}`))
-      .leftJoin('t0.target_user', 'ev_to')
-      .addSelect(FEED_PERSON.map((column) => `ev_to.${column}`))
-      .leftJoin('t0.target_group', 'ev_group')
-      .addSelect(['ev_group.id', 'ev_group.name']);
+    // «Переписка / Звонки / Задачи / Изменения» and the search (DEAL-10); a letter's words only with mail access
+    qb = applyHistoryFilters(qb, query, options.canReadMail !== false);
 
-    // a company's or a contact's feed spans several deals: which one an event is of
-    if (options.withDeal) {
-      qb = qb
-        .leftJoin('t0.deal', 'ev_deal')
-        .addSelect(['ev_deal.id', 'ev_deal.label', 'ev_deal.display_id']);
-    }
+    qb = EventsService.withFeedRelations(qb, !!options.withDeal);
 
     // newest first by the time of the event (a call synced later, a letter fetched later stand
     // where they happened), the id among events of the same moment; pages do not overlap
@@ -284,7 +278,48 @@ export class EventsService {
       qb = qb.orderBy('t0.created_at', 'DESC').addOrderBy('t0.id', 'DESC');
     }
 
-    return this.helperService.withPagination(qb, query, 't0', null, false, newestFirst);
+    const page = await this.helperService.withPagination(qb, query, 't0', null, false, newestFirst);
+    stripFeedSnapshots(page.data);
+    return page;
+  }
+
+  /**
+   * The people of a feed row by name only (SALE-16), and its deal for a feed that spans several.
+   * withDeleted: the joined author / addressee / group may be deleted since (the event has no deleted_at).
+   */
+  static withFeedRelations(qb: SelectQueryBuilder<Event>, withDeal: boolean): SelectQueryBuilder<Event> {
+    qb = qb
+      .withDeleted()
+      .leftJoin('t0.originated_by', 'ev_by')
+      .addSelect(FEED_PERSON.map((column) => `ev_by.${column}`))
+      .leftJoin('t0.target_user', 'ev_to')
+      .addSelect(FEED_PERSON.map((column) => `ev_to.${column}`))
+      .leftJoin('t0.target_group', 'ev_group')
+      .addSelect(['ev_group.id', 'ev_group.name']);
+    // a company's or a contact's feed spans several deals and contacts: which one an event is of
+    if (withDeal) {
+      qb = qb
+        .leftJoin('t0.deal', 'ev_deal')
+        .addSelect(['ev_deal.id', 'ev_deal.label', 'ev_deal.display_id'])
+        .leftJoin('t0.contact', 'ev_contact')
+        .addSelect(['ev_contact.id', 'ev_contact.username', 'ev_contact.deleted_at']);
+    }
+    return qb;
+  }
+
+  /**
+   * One row as the feeds give it: what POST /deals/:id/comments and /message answer. They answered
+   * with the whole account of the author (rights, Telegram id, SALE-16).
+   */
+  async feedRow(id: number, withDeal = false): Promise<Event> {
+    const qb = EventsService.withFeedRelations(
+      this.eventRepository.createQueryBuilder('t0').where('t0.id = :id', { id }),
+      withDeal,
+    );
+    const row = await qb.getOne();
+    if (!row) throw new NotFoundException(`Event ${id} not found`);
+    stripFeedSnapshots([row]);
+    return row;
   }
 
   /**
@@ -466,7 +501,7 @@ export class EventsService {
       originated_by: await this.helperService.extractUserFromRequest(request),
     };
 
-    return this.eventRepository.save(
+    const saved = await this.eventRepository.save(
       EventBuilder.fromType(EventTypes.NEW_COMMENT)
         .originatedBy(eventData.originated_by)
         .addTargetFieldsIfGiven(eventData)
@@ -478,6 +513,7 @@ export class EventsService {
           }),
         ),
     );
+    return this.feedRow(saved.id);
   }
 
   /**
@@ -514,6 +550,12 @@ export class EventsService {
       );
     }
 
+    EventsService.rewriteComment(commentEvent, data.comment, files);
+    await this.eventRepository.save(commentEvent);
+  }
+
+  /** The new text of a note; the earlier ones stay in before_state.data.versions (AUDIT-12). */
+  private static rewriteComment(commentEvent: Event, comment: string, files: File[]): void {
     const previous = commentEvent.after_state?.data ?? {};
     const versions = [
       ...((commentEvent.before_state?.data?.versions as any[]) ?? []),
@@ -521,12 +563,70 @@ export class EventsService {
     ];
     commentEvent.before_state = EventWrapper.fromEntity({ ...previous, versions });
     commentEvent.after_state = EventWrapper.fromEntity({
-      comment: data.comment,
+      ...previous,
+      comment,
       files: [...(previous.files ?? []), ...files],
       edited_at: new Date(),
     });
+  }
 
-    await this.eventRepository.save(commentEvent);
+  /**
+   * A note in the card of a company or a contact, outside any deal (SCR2-4: there was only a task
+   * "for now" to write «клиент просил прайс»). It goes to the feed of the card (event.company_id /
+   * contact_id); a contact's note also to the feed of the contact's company.
+   */
+  async postClientNote(owner: ClientNoteOwner, comment: string, userId: number): Promise<Event> {
+    const event = EventBuilder.fromType(EventTypes.NEW_COMMENT)
+      .originatedBy({ id: userId } as User)
+      .addAfterState(EventWrapper.fromEntity({ comment, files: [] }));
+    if ('company_id' in owner) {
+      await this.helperService.getById(Company, owner.company_id);
+      event.company_id = owner.company_id;
+    } else {
+      await this.assertContact(owner.contact_id);
+      event.contact_id = owner.contact_id;
+    }
+    const saved = await this.eventRepository.save(event);
+    return this.feedRow(saved.id, true);
+  }
+
+  /** PATCH /companies/:id/comments/:event_id, /users/:id/comments/:event_id: the author changes the text. */
+  async updateClientNote(owner: ClientNoteOwner, eventId: number, comment: string, userId: number): Promise<Event> {
+    const note = await this.clientNote(owner, eventId, userId);
+    EventsService.rewriteComment(note, comment, []);
+    await this.eventRepository.save(note);
+    return this.feedRow(note.id, true);
+  }
+
+  /** DELETE /companies/:id/comments/:event_id, /users/:id/comments/:event_id: only the author. */
+  async deleteClientNote(owner: ClientNoteOwner, eventId: number, userId: number): Promise<void> {
+    const note = await this.clientNote(owner, eventId, userId);
+    await this.eventRepository.delete(note.id);
+  }
+
+  private async clientNote(owner: ClientNoteOwner, eventId: number, userId: number): Promise<Event> {
+    const note = await this.eventRepository.findOne({
+      where: { id: eventId },
+      relations: { originated_by: true, deal: true },
+      withDeleted: true,
+    });
+    const ownerMatches =
+      note &&
+      note.type === EventTypes.NEW_COMMENT &&
+      !note.deal &&
+      ('company_id' in owner ? note.company_id === owner.company_id : note.contact_id === owner.contact_id);
+    if (!ownerMatches) throw new NotFoundException('Заметка не найдена');
+    if (note.originated_by?.id !== userId) {
+      throw new ForbiddenException('Изменить или удалить заметку может только её автор');
+    }
+    return note;
+  }
+
+  /** A note is written to a client: a contact, not an employee. */
+  private async assertContact(id: number): Promise<void> {
+    const row = (await this.eventRepository.query(`SELECT role FROM "user" WHERE id = $1 AND deleted_at IS NULL`, [id]))[0];
+    if (!row) throw new NotFoundException(`Contact ${id} not found`);
+    if (row.role !== RoleEnum.CTR_AGENT) throw new BadRequestException('Заметку можно оставить только у клиента');
   }
 
   async deleteComment(
@@ -582,7 +682,7 @@ export class EventsService {
 
     eventData = await this.assignTarget(data, eventData);
 
-    return this.eventRepository.save(
+    const saved = await this.eventRepository.save(
       EventBuilder.fromType(EventTypes.NEW_CHAT_MESSAGE)
         .originatedBy(eventData.originated_by)
         .addTargetFieldsIfGiven(eventData)
@@ -594,6 +694,7 @@ export class EventsService {
           }),
         ),
     );
+    return this.feedRow(saved.id);
   }
 
   private async assignTarget(

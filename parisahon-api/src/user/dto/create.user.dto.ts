@@ -44,8 +44,8 @@ export class CreateUserDto extends LoginUserDto {
   role: RoleEnum;
 
   @Trim()
-  @IsString()
-  @Length(2, 255)
+  @IsString({ message: 'Имя: текст' })
+  @Length(2, 255, { message: 'Имя: от 2 до 255 символов' })
   username: string;
 
   // a contact needs no e-mail ("" = none); staff accounts still need one to log in (LoginUserDto)

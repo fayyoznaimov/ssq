@@ -115,7 +115,17 @@ class Forwarder:
             if name.isdigit() and int(name) > 0 and os.path.isdir(path) and not os.path.islink(path):
                 yield int(name), path
 
-    def files(self, home: str) -> Iterator[Tuple[str, str, os.stat_result]]:
+    def sources(self) -> Iterator[Tuple[int, str, str]]:
+        """(user id, folder, prefix of the names in it) of every folder to forward: the homes in FTP_ROOT
+        and the FTP_EXTRA_HOMES (a folder an old FTP server fills; its names get "@extra-<n>/" in front,
+        so they never meet the names of the home in the state). A missing extra folder is skipped."""
+        for user_id, home in self.homes():
+            yield user_id, home, ""
+        for index, (user_id, folder) in enumerate(self.config.extra_homes, start=1):
+            if os.path.isdir(folder) and not os.path.islink(folder):
+                yield user_id, folder, f"@extra-{index}/"
+
+    def files(self, home: str, prefix: str = "") -> Iterator[Tuple[str, str, os.stat_result]]:
         """(name relative to the home, full path, lstat) of every regular file, hidden folders left out."""
         for folder, folders, names in os.walk(home):
             folders[:] = sorted(name for name in folders if not name.startswith("."))
@@ -126,21 +136,25 @@ class Forwarder:
                 except OSError:
                     continue
                 if stat.S_ISREG(info.st_mode):
-                    yield os.path.relpath(full, home), full, info
+                    yield prefix + os.path.relpath(full, home), full, info
 
     def scan_once(self) -> Optional[float]:
         """Looks at every home once and sends what is ready. Returns in how many seconds something
         that is not ready yet (still settling, waiting for its next try) should be looked at again."""
         waits: List[float] = []
         candidates = []
-        for user_id, home in self.homes():
-            present = []
-            handled = self.state.handled_files(user_id)
-            for rel, full, info in self.files(home):
-                present.append(rel)
-                if wanted(os.path.basename(rel)) and info.st_size > 0 and handled.get(rel) != (info.st_size, info.st_mtime_ns):
+        present = {}
+        handled = {}
+        for user_id, home, prefix in self.sources():
+            if user_id not in handled:
+                handled[user_id] = self.state.handled_files(user_id)
+                present[user_id] = []
+            for rel, full, info in self.files(home, prefix):
+                present[user_id].append(rel)
+                if wanted(os.path.basename(rel)) and info.st_size > 0 and handled[user_id].get(rel) != (info.st_size, info.st_mtime_ns):
                     candidates.append((info.st_mtime_ns, user_id, rel, full, info))
-            self.state.forget_seen_except(user_id, present)
+        for user_id, names in present.items():
+            self.state.forget_seen_except(user_id, names)
         candidates.sort(key=lambda item: item[:3])  # the oldest recording first
 
         alive = set()
@@ -288,17 +302,18 @@ class Forwarder:
                 self.state.receiving_done(path)
         if not os.path.isdir(self.config.root):
             return 0  # the whole folder is away (not mounted?): touch nothing
-        homes = dict(self.homes())
+        sources = list(self.sources())
+        users = {user_id for user_id, _home, _prefix in sources}
         for user_id in self.state.known_users():
-            if user_id not in homes:
+            if user_id not in users:
                 self.state.forget_user(user_id)
                 log.info("home of user=%s is gone: its records are dropped", user_id)
         if self.config.retain_days <= 0:
             return 0
         limit = time.time() - self.config.retain_days * 86400
         removed = 0
-        for user_id, home in homes.items():
-            for rel, full, info in self.files(home):
+        for user_id, home, prefix in sources:
+            for rel, full, info in self.files(home, prefix):
                 if info.st_ctime > limit:
                     continue
                 if wanted(os.path.basename(rel)) and info.st_size > 0 and not self.state.is_receiving(full):

@@ -4,7 +4,11 @@ the scheduler, event triggers (Telegram, e-mail) and the rights on /stages/:id/t
 never reacts to what triggers did (its own letter) and repeats are bounded (once per deal, a pause,
 one open task); a failed run and the files a trigger deleted are noted in the deal's history; and
 «Контроль менеджеров»: an outgoing call answers the client, «ждут ответа сейчас» does not depend on
-the period.
+the period. Wave 1b (business processes): exactly once (run keys), what a trigger names is checked
+on save and a broken trigger is shown, a manager builds triggers, the order of the triggers and the
+open tasks of a new responsible, «Перевести в этап», «Уведомить», «нет ответа N минут», conditions by
+channel and «больше / меньше», «по очереди», a copy keeps its fields and products, a letter with the
+deal's data and file, exact delays and a task never overdue at once.
 
 Runs against the local stack: the docker stack (http://localhost:8080) or, with the CRM_*
 variables from local/dev/env.sh, the dev copy on the server. The API must run the scheduler
@@ -219,9 +223,18 @@ def main():
         r = trigger(S1, {"type": 1, "deal_filters": [], "apply_when": when_now(), "create_deal_data": {"stage_id": S1}})
         check("'create deal' into its own stage -> 400", r[0] == 400, r)
         r = trigger(S1, {"type": 0, "deal_filters": [], "apply_when": when_now(), "create_task_data": {"label": "x", "type_id": 999999999, "responsible": {"user": "currently_assigned"}, "end_time_in_minutes": 60, "all_day": False}})
-        check("unknown task type -> 404", r[0] == 404, r)
+        check("unknown task type -> 400 that names it (it used to be 404 «TaskType with id … does not exist»)",
+              r[0] == 400 and "тип задачи" in message_of(r), r)
         r = trigger(S1, {"type": 4, "deal_filters": [], "apply_when": when_now(), "change_agent_data": {"agent_id": contact}})
         check("'change responsible' to a contact -> 400", r[0] == 400, r)
+        r = trigger(S1, {"type": 5, "deal_filters": [], "apply_when": when_now(), "change_fields_data": {"fields": [{"field": "agent_id", "value": str(contact), "is_filler": False}]}})
+        check("'change fields': a contact of a client as the responsible -> 400 (it made the client responsible)",
+              r[0] == 400 and "контакт" in message_of(r), r)
+        r = trigger(S1, {"type": 5, "deal_filters": [], "apply_when": when_now(), "change_fields_data": {"fields": [{"field": "budget", "value": "сто тысяч", "is_filler": False}]}})
+        check("'change fields': a budget that is not a number -> 400 on save, not a failed run later", r[0] == 400 and "число" in message_of(r), r)
+        r = trigger(S1, {"type": 0, "deal_filters": [{"field": "budget", "value": "много", "is_filler": False, "op": "gt"}], "apply_when": when_now(),
+                         "create_task_data": {"label": "x", "type_id": task_type, "responsible": {"user": "currently_assigned"}, "end_time_in_minutes": 60, "all_day": False}})
+        check("a condition «больше» with a value that is not a number -> 400", r[0] == 400, r)
 
         print("== immediate triggers on entering a stage")
         r = trigger(S1, {"type": 0, "deal_filters": [], "apply_when": when_now(),
@@ -245,7 +258,7 @@ def main():
         r = trigger(S1, {"type": 5, "deal_filters": [], "apply_when": when_now(), "change_fields_data": {"fields": [{"field": "created_at", "value": "2020-01-01", "is_filler": False}]}})
         check("'change fields' on a read-only column -> 400", r[0] == 400, r)
         r = trigger(S1, {"type": 2, "deal_filters": [], "apply_when": when_now(), "send_email_data": {"template_id": 999999999, "from": "currently_assigned"}})
-        check("'send email' with an unknown template -> 404", r[0] == 404, r)
+        check("'send email' with an unknown template -> 400 that names it", r[0] == 400 and "шаблон письма" in message_of(r), r)
 
         D1 = new_deal("сделка 1")
         r = move(D1, S1)
@@ -265,7 +278,8 @@ def main():
         check("POST /triggers/run-due as an agent -> 403", r[0] == 403, r)
         r = http("POST", "/triggers/run-due", {}, token=admin)
         check("POST /triggers/run-due as admin -> one tick with counters", r[0] == 201 and isinstance(r[1], dict) and "executed" in r[1], r)
-        row = psql(f"select d.budget, d.agent_id, (select value from deal_filler df where df.deal_id = d.id and df.filler_id = {filler_id}) from deal d where d.id = {D1}")
+        # deal.budget is numeric(18,2) since DealAmountsNumeric1795620000100 (DB-7): 777 is stored as 777.00
+        row = psql(f"select trim_scale(d.budget), d.agent_id, (select value from deal_filler df where df.deal_id = d.id and df.filler_id = {filler_id}) from deal d where d.id = {D1}")
         check("'change fields' changed BOTH fields (budget and the custom field created on the fly); then 'change responsible' fired because budget = 777",
               row == f"777|{B['id']}|auto", row)
         n = psql(f"select count(*) from event where deal_id = {D1} and type = 3")
@@ -273,7 +287,7 @@ def main():
 
         D2 = new_deal("сделка 2", budget=5)
         move(D2, S1)
-        row = psql(f"select budget, agent_id from deal where id = {D2}")
+        row = psql(f"select trim_scale(budget), agent_id from deal where id = {D2}")
         check("the condition on budget is checked after 'change fields' ran: budget 777 -> responsible changed too", row == f"777|{B['id']}", row)
         D3 = new_deal("сделка 3 сразу в этапе", stage=S1)
         tasks = tasks_of(D3)
@@ -336,7 +350,7 @@ def main():
         t_copy = r[1]["id"]
         D6 = new_deal("оригинал", budget=42)
         move(D6, S2)
-        row = psql(f"select label, budget, stage_id, agent_id, (select count(*) from deal_user du where du.\"dealId\" = d.id and du.\"userId\" = {contact}), created_by from deal d where label = '{TAG} оригинал (копия)'")
+        row = psql(f"select label, trim_scale(budget), stage_id, agent_id, (select count(*) from deal_user du where du.\"dealId\" = d.id and du.\"userId\" = {contact}), created_by from deal d where label = '{TAG} оригинал (копия)'")
         check("a copy of the deal appears in the target stage with budget, responsible and contact", row == f"{TAG} оригинал (копия)|42|{S3}|{A['id']}|1|{admin_id}", row)
         n = psql(f"select count(*) from deal where label like '{TAG} оригинал (копия)%'")
         check("the copy itself does not spawn another copy", n == "1", n)
@@ -365,6 +379,8 @@ def main():
         local_now = "(now() at time zone 'Asia/Karachi')"
         row = psql(f"select status, (run_at between {local_now} + interval '9 minutes' and {local_now} + interval '11 minutes') from trigger_run where trigger_id = {t_delay} and deal_id = {D7}")
         check("entering the stage plans one pending run about 10 minutes ahead", row == "pending|t", row)
+        row = psql(f"select abs(extract(epoch from (r.run_at - (d.last_stage_change + interval '10 minutes')))) < 0.01 from trigger_run r join deal d on d.id = r.deal_id where r.trigger_id = {t_delay} and r.deal_id = {D7} and r.status = 'pending'")
+        check("«через 10 минут» is exactly 10 minutes after the entry (it was rounded down to the minute: up to 59 s early)", row == "t", row)
         check("nothing is executed yet", tasks_of(D7) == [], tasks_of(D7))
         r = http("GET", f"/stages/{S2}/triggers/{t_delay}/runs", token=admin)
         check("GET /stages/:id/triggers/:id/runs shows the planned run", r[0] == 200 and len(r[1]) == 1 and r[1][0]["status"] == "pending" and r[1][0]["deal_id"] == D7, r)
@@ -403,8 +419,9 @@ def main():
         after = psql(f"select id from trigger_run where trigger_id = {t_delay} and deal_id = {D7} and status = 'pending'")
         check("saving a trigger whose schedule did not change keeps its planned runs", r[0] == 200 and before and after == before, (r, before, after))
         r = http("PATCH", f"/stages/{S2}/triggers/{t_delay}", {**same_when, "apply_when": when_now(30)}, admin)
-        row = wait_for(lambda: psql(f"select (r.id <> {before or 0}) and r.run_at = date_trunc('minute', d.last_stage_change) + interval '30 minutes' from trigger_run r join deal d on d.id = r.deal_id where r.trigger_id = {t_delay} and r.deal_id = {D7} and r.status = 'pending'"), "t")
-        check("a changed schedule replaces the planned run: 30 minutes from the entry into the stage", r[0] == 200 and row == "t", (r, row))
+        row = psql(f"select r.id = {before or 0} and abs(extract(epoch from (r.run_at - (d.last_stage_change + interval '30 minutes')))) < 0.01 from trigger_run r join deal d on d.id = r.deal_id where r.trigger_id = {t_delay} and r.deal_id = {D7} and r.status = 'pending'")
+        check("a changed schedule moves the planned run, never drops it: the same row, exactly 30 minutes from the entry into the stage",
+              r[0] == 200 and row == "t", (r, row))
         http("PATCH", f"/stages/{S2}/triggers/{t_delay}", same_when, admin)
 
         print("== a failing trigger is a failed run, not a crash")
@@ -448,16 +465,22 @@ def main():
         check("daily: the next occurrence at 08:00 is planned, in the future", row == "pending|t|08:00", row)
         row = psql(f"select status, run_at > now(), extract(isodow from run_at)::int, to_char(run_at, 'HH24:MI') from trigger_run where trigger_id = {t_weekly} and deal_id = {D9}")
         check("weekly: the next Monday 12:00 is planned", row == "pending|t|1|12:00", row)
-        # a recurring run whose time came: executed and the next one planned
-        psql(f"update trigger_run set run_at = now() - interval '1 minute' where trigger_id = {t_daily} and deal_id = {D9} and status = 'pending'")
+        # a recurring run whose time came: executed and the next one planned. An occurrence is its run key
+        # (at:<ms>, IDX_trigger_run_key, TRG-2): the time that «came» moves the key with run_at, otherwise
+        # the row would still be tomorrow's 08:00 and the next occurrence (tomorrow 08:00) a duplicate of it
+        occurrence = lambda ago: (f"run_at = (now() at time zone 'Asia/Karachi') - interval '{ago}', "
+                                  f"run_key = 'at:' || (extract(epoch from now() - interval '{ago}') * 1000)::bigint")
+        psql(f"update trigger_run set {occurrence('1 minute')} where trigger_id = {t_daily} and deal_id = {D9} and status = 'pending'")
         done = wait_for(lambda: psql(f"select count(*) from trigger_run where trigger_id = {t_daily} and deal_id = {D9} and status = 'done'"), "1")
-        row = psql(f"select count(*) filter (where status = 'done'), count(*) filter (where status = 'pending' and run_at > now()) from trigger_run where trigger_id = {t_daily} and deal_id = {D9}")
+        row = wait_for(lambda: psql(f"select count(*) filter (where status = 'done'), count(*) filter (where status = 'pending' and run_at > (now() at time zone 'Asia/Karachi')) from trigger_run where trigger_id = {t_daily} and deal_id = {D9}"), "1|1", timeout=15)
         check("a due daily run is executed and the next day's run is planned", done == "1" and row == "1|1", row)
         check("the daily task exists", any(t[0] == f"{TAG} ежедневно" for t in tasks_of(D9)), tasks_of(D9))
         # a recurring run that waited more than a day (the API was down) is not executed
-        psql(f"update trigger_run set run_at = now() - interval '2 days' where trigger_id = {t_daily} and deal_id = {D9} and status = 'pending'")
+        psql(f"update trigger_run set {occurrence('2 days')} where trigger_id = {t_daily} and deal_id = {D9} and status = 'pending'")
         missed = wait_for(lambda: psql(f"select count(*) from trigger_run where trigger_id = {t_daily} and deal_id = {D9} and status = 'skipped' and error like 'не выполнен вовремя%'"), "1")
         check("a run older than a day is skipped as missed, not executed late", missed == "1", missed)
+        nxt = wait_for(lambda: psql(f"select count(*) from trigger_run where trigger_id = {t_daily} and deal_id = {D9} and status = 'pending' and run_at > (now() at time zone 'Asia/Karachi')"), "1", timeout=15)
+        check("a missed occurrence does not stop the schedule: the next one is planned", nxt == "1", nxt)
         check("the daily task was not created twice", sum(1 for t in tasks_of(D9) if t[0] == f"{TAG} ежедневно") == 1, tasks_of(D9))
         # a closed deal gets no new recurring runs
         psql(f"update deal set closed_at = now() where id = {D9}")
@@ -470,7 +493,7 @@ def main():
         r = http("PATCH", f"/stages/{S3}/triggers/{t_exact}", {"type": 0, "deal_filters": [], "apply_when": {"when": "at_exact_time", "date": tomorrow, "time": "10:00"},
                   "create_task_data": {"label": f"{TAG} точное время 2", "type_id": task_type, "responsible": {"user": "currently_assigned"}, "end_time_in_minutes": 60, "all_day": False}}, admin)
         row = psql(f"select count(*) filter (where status = 'pending' and to_char(run_at, 'HH24:MI') = '09:30'), count(*) filter (where status = 'pending' and deal_id = {D9}) from trigger_run where trigger_id = {t_exact}")
-        check("changing the schedule of a trigger drops its planned runs: none left at the old time, none for the closed deal",
+        check("changing the schedule of a trigger moves its planned runs: none left at the old time, none for the closed deal",
               r[0] == 200 and row == "0|0", (r, row))
         row = wait_for(lambda: psql(f"select count(*) from trigger_run where trigger_id = {t_exact} and deal_id = {D4} and status = 'pending' and to_char(run_at, 'YYYY-MM-DD HH24:MI') = '{tomorrow} 10:00'"), "1")
         check("an open deal of the stage gets its run at the new time from the scheduler", row == "1", row)
@@ -641,6 +664,168 @@ def main():
         n = psql(f"select count(*) from event where deal_id = {D19} and type = 5 and user_id is null and after_state->'data'->>'comment' like 'Автоматика удалила файлы%' and after_state->'data'->'removed_files' @> '[{{\"name\": \"{TAG}-договор.pdf\"}}]'::jsonb")
         check("the deal's history says which files the automation deleted (removed_files: «Удалены файлы: …»)", n == "1", n)
 
+        print("== wave 1b: exactly once, broken triggers, the rights of a manager")
+        more = []
+        for n in range(8, 17):
+            status, st = http("POST", "/stages", {"name": f"{TAG}-{n}", "color": "#D5D8DB", "collection_id": collection}, admin)
+            if status != 201:
+                raise SystemExit(f"cannot create stage {n}: {status} {st}")
+            stages.append(st["id"])
+            more.append(st["id"])
+        S8, S9, S10, S11, S12, S13, S14, S15, S16 = more
+        task_now = {"type_id": task_type, "responsible": {"user": "currently_assigned"}, "end_time_in_minutes": 0, "all_day": False}
+        for key, role in (("m", "manager"), ("x", "agent")):
+            person = {"email": f"audit-trg-{RUN}-{key}@example.test", "password": secrets.token_urlsafe(12), "username": f"{TAG}-{key}",
+                      "role": role, "group_id": groups[0], "permissions": perms, "phone": f"+99890{random.randint(1000000, 9999999)}"}
+            status, created = http("POST", "/users", person, admin)
+            if status != 201:
+                raise SystemExit(f"cannot create user {key}: {status} {created}")
+            person["id"] = created["id"]
+            person["token"] = http("POST", "/auth/login", {"email": person["email"], "password": person["password"]})[1]["access_token"]
+            users[key] = person
+        M, X = users["m"], users["x"]
+
+        dup_key = f"enter:{random.randint(10**12, 2 * 10**12)}"
+        D20 = new_deal("ключ запуска")
+        try:
+            psql(f"insert into trigger_run (trigger_id, deal_id, run_at, status, run_key) values ({t_task}, {D20}, now(), 'done', '{dup_key}'), ({t_task}, {D20}, now(), 'running', '{dup_key}')")
+            dup = "inserted"
+        except RuntimeError as error:
+            dup = str(error)
+        check("one execution per entry, letter or occurrence: a second run with the same key is refused by the database (IDX_trigger_run_key)",
+              "IDX_trigger_run_key" in dup or "duplicate key" in dup, dup[:300])
+
+        r = trigger(S8, {"type": 0, "deal_filters": [], "apply_when": when_now(), "create_task_data": {"label": f"{TAG} руководитель", **task_now}}, M["token"])
+        check("a manager (руководитель) builds the triggers of a stage -> 201", r[0] == 201, r)
+        r = http("PATCH", f"/stages/{S8}/trigger-order", {"ids": [r[1]["id"]] if r[0] == 201 else []}, A["token"])
+        check("an agent cannot reorder the triggers -> 403", r[0] == 403, r)
+
+        http("DELETE", f"/users/{X['id']}", token=admin)
+        r = trigger(S8, {"type": 0, "deal_filters": [], "apply_when": when_now(), "create_task_data": {"label": "x", **task_now, "responsible": {"exact_user_id": X["id"]}}})
+        check("a trigger that names a dismissed employee is not saved: 400 that says so", r[0] == 400 and "уволен" in message_of(r), r)
+        template_e = int(psql(f"insert into email_template (template_body, name, subject) values ('<p>AUDIT</p>', '{TAG}-tpl-e', '{TAG} шаблон Д') returning id"))
+        r = trigger(S8, {"type": 2, "deal_filters": [], "apply_when": {"when": "email_received", "outgoing": False}, "send_email_data": {"template_id": template_e, "from": "currently_assigned"}})
+        t_broken = r[1]["id"] if r[0] == 201 else 0
+        psql(f"delete from email_template where id = {template_e}")
+        r = http("GET", f"/stages/{S8}/triggers", token=admin)
+        mine = next((t for t in (r[1] or []) if t.get("id") == t_broken), {}) if r[0] == 200 else {}
+        check("the template of a trigger is deleted: the trigger is marked broken in the settings (problems)",
+              any("шаблон письма" in p for p in mine.get("problems") or []), mine.get("problems"))
+        r = http("GET", "/triggers/broken", token=admin)
+        check("GET /triggers/broken lists it with the stage and what is wrong", r[0] == 200 and any(b.get("id") == t_broken and b.get("problems") for b in r[1]), r)
+        check("an agent does not get the list of broken triggers -> 403", http("GET", "/triggers/broken", token=A["token"])[0] == 403)
+        r = http("PATCH", f"/stages/{S8}/triggers/{t_broken}", {"type": 2, "deal_filters": [], "apply_when": {"when": "email_received", "outgoing": False}, "send_email_data": {"template_id": template_e, "from": "currently_assigned"}}, admin)
+        check("saving the broken trigger again says what to fix (400), the others of the page are saved one by one", r[0] == 400 and "шаблон письма" in message_of(r), r)
+        if t_broken:
+            http("DELETE", f"/stages/{S8}/triggers/{t_broken}", token=admin)
+
+        print("== wave 1b: the order of the triggers, the tasks of a new responsible, «по очереди»")
+        r1 = trigger(S9, {"type": 0, "deal_filters": [], "apply_when": when_now(), "create_task_data": {"label": f"{TAG} порядок", **task_now}})
+        r2 = trigger(S9, {"type": 4, "deal_filters": [], "apply_when": when_now(), "change_agent_data": {"agent_id": B["id"], "transfer_tasks": False}})
+        t_o1, t_o2 = (r1[1] or {}).get("id"), (r2[1] or {}).get("id")
+        r = http("PATCH", f"/stages/{S9}/trigger-order", {"ids": [t_o2, t_o1]}, admin)
+        listed = [t["id"] for t in http("GET", f"/stages/{S9}/triggers", token=admin)[1] or []]
+        check("PATCH trigger-order: the stage lists its triggers in the new order", r[0] == 200 and listed == [t_o2, t_o1], (r, listed))
+        r = http("PATCH", f"/stages/{S9}/trigger-order", {"ids": [t_o1]}, admin)
+        check("an order that leaves a trigger out -> 400", r[0] == 400, r)
+        D21 = new_deal("порядок", agent=A)
+        move(D21, S9)
+        tasks = tasks_of(D21)
+        check("they run in that order: «сменить ответственного» first, the task goes to the new responsible (B)",
+              any(t[0] == f"{TAG} порядок" and t[1] == str(B["id"]) for t in tasks), tasks)
+        trigger(S10, {"type": 0, "deal_filters": [], "apply_when": when_now(), "create_task_data": {"label": f"{TAG} передать", **task_now}})
+        trigger(S10, {"type": 4, "deal_filters": [], "apply_when": when_now(), "change_agent_data": {"agent_id": B["id"]}})
+        D22 = new_deal("передача задач", agent=A)
+        move(D22, S10)
+        tasks = tasks_of(D22)
+        check("the task made for the previous responsible goes to the new one with the deal (transfer_tasks)",
+              any(t[0] == f"{TAG} передать" and t[1] == str(B["id"]) for t in tasks), tasks)
+        r = trigger(S11, {"type": 4, "deal_filters": [], "apply_when": when_now(), "change_agent_data": {"rotate_user_ids": [A["id"], B["id"]]}})
+        check("«по очереди» between two employees -> 201", r[0] == 201, r)
+        r_one = trigger(S16, {"type": 4, "deal_filters": [], "apply_when": when_now(), "change_agent_data": {"rotate_user_ids": [A["id"]]}})
+        check("«по очереди» with one employee -> 400", r_one[0] == 400, r_one)
+        D23, D24 = new_deal("очередь 1", agent=C), new_deal("очередь 2", agent=C)
+        move(D23, S11)
+        move(D24, S11)
+        row = psql(f"select string_agg(agent_id::text, ',' order by agent_id) from deal where id in ({D23}, {D24})")
+        check("two new deals go to the two employees in turn", row == ",".join(sorted([str(A["id"]), str(B["id"])], key=int)), row)
+
+        print("== wave 1b: «перевести в этап», a copy with its fields and products, «уведомить»")
+        product = int(psql(f"insert into product (name) values ('{TAG}-полотенце') returning id"))
+        trigger(S12, {"type": 7, "deal_filters": [], "apply_when": when_now(), "move_stage_data": {"stage_id": S13}})
+        trigger(S13, {"type": 1, "deal_filters": [], "apply_when": when_now(), "create_deal_data": {"stage_id": S14, "label": f"{TAG} производство"}})
+        trigger(S13, {"type": 8, "deal_filters": [], "apply_when": when_now(), "notify_data": {"text": f"{TAG} заказ {{{{сделка}}}} на {{{{сумма}}}}", "to": "responsible"}})
+        D25 = new_deal("заказ", agent=A, budget=1500, fillers=[{"filler_id": filler_id, "value": "артикул-7"}])
+        psql(f"insert into deal_product (deal_id, product_id, quantity, price) values ({D25}, {product}, 12, 3500)")
+        r = move(D25, S12)
+        row = psql(f"select stage_id from deal where id = {D25}")
+        check("«перевести в этап»: the deal goes on to the next stage by itself", r[0] == 200 and row == str(S13), (r, row))
+        row = psql(f"select count(*) from deal_stage_record where deal_id = {D25} and stage_id = {S13} and from_stage_id = {S12}")
+        check("the move is in the stage history (from the stage it came from)", row == "1", row)
+        copy = psql(f"select id from deal where label = '{TAG} производство'")
+        check("the triggers of that stage ran: «Создать сделку» made the copy (a deal moved by a trigger still gets its copy)", copy.isdigit(), copy)
+        if copy.isdigit():
+            row = psql(f"select (select value from deal_filler where deal_id = {copy} and filler_id = {filler_id}), (select (quantity = 12 and price = 3500)::text from deal_product where deal_id = {copy} and product_id = {product})")
+            check("the copy keeps the custom fields and the products of the order", row == "артикул-7|true", row)
+            n = psql(f"select count(*) from event where deal_id = {copy} and type = 5 and user_id is null and (after_state->'data'->>'source_deal_id')::int = {D25}")
+            m = psql(f"select count(*) from event where deal_id = {D25} and type = 5 and user_id is null and (after_state->'data'->>'copy_deal_id')::int = {copy}")
+            check("both deals say where the other one is (a note in each history)", (n, m) == ("1", "1"), (n, m))
+        tasks = tasks_of(D25)
+        check("«уведомить» the responsible who has no bot: a task with the text and the deal's data instead",
+              any(t[0].startswith(f"Авто: {TAG} заказ {TAG} заказ на 1") and t[1] == str(A["id"]) for t in tasks), tasks)
+
+        print("== wave 1b: conditions by channel and «больше», «нет ответа N минут»")
+        trigger(S15, {"type": 0, "deal_filters": [{"field": "source", "value": "telegram", "is_filler": False}, {"field": "budget", "value": "500", "is_filler": False, "op": "gt"}],
+                      "apply_when": when_now(), "create_task_data": {"label": f"{TAG} из Telegram", **task_now}})
+        D26, D27, D28 = new_deal("telegram 900", budget=900), new_deal("telegram 100", budget=100), new_deal("вручную 900", budget=900)
+        for d in (D26, D27):
+            psql(f"insert into event (type, outgoing, deal_id, user_id, after_state, created_at) values (12, false, {d}, {contact}, '{{\"message\": \"AUDIT привет\"}}', (now() at time zone 'Asia/Karachi') - interval '5 minutes')")
+        for d in (D26, D27, D28):
+            move(d, S15)
+        got = [any(t[0] == f"{TAG} из Telegram" for t in tasks_of(d)) for d in (D26, D27, D28)]
+        check("«источник сделки = Telegram» and «бюджет больше 500»: only the Telegram deal of 900 fits", got == [True, False, False], got)
+        row = psql(f"select extract(epoch from (end_time - start_time)) >= 1799 from task where deal_id = {D26} and label = '{TAG} из Telegram'")
+        check("a task «сразу» is due in 30 minutes, not overdue as soon as it appears", row == "t", row)
+        r = trigger(S16, {"type": 0, "deal_filters": [], "apply_when": {"when": "no_reply", "after_minutes": 1},
+                          "create_task_data": {"label": f"{TAG} клиент ждёт", **task_now}})
+        check("create «если клиент ждёт ответа 1 мин» -> 201", r[0] == 201 and r[1].get("kind") == "event", r)
+        D29 = new_deal("ждёт ответа", agent=A, stage=S16)
+        psql(f"insert into event (type, outgoing, deal_id, user_id, after_state, created_at) values (12, false, {D29}, {contact}, '{{\"message\": \"AUDIT ау\"}}', (now() at time zone 'Asia/Karachi') - interval '2 days')")
+        n = wait_for(lambda: psql(f"select count(*) from task where deal_id = {D29} and label = '{TAG} клиент ждёт'"), "1", timeout=60)
+        check("the client wrote and nobody answered: the scheduler runs the trigger (one task)", n == "1", n)
+        http("POST", "/triggers/run-due", {}, admin)
+        time.sleep(float(env_value("TRIGGER_SCHEDULER_SEC", "5")) + 2)
+        n = psql(f"select count(*) from trigger_run where deal_id = {D29} and run_key like 'noreply:%'")
+        check("once per unanswered message (run key noreply:<event>), not on every tick", n == "1", n)
+
+        print("== wave 1b: a letter with the deal's data and its file")
+        template_f = int(psql(f"insert into email_template (template_body, name, subject) values ('<p>Сделка {{{{сделка}}}}, сумма {{{{сумма}}}}</p>', '{TAG}-tpl-f', '{TAG} КП: {{{{сделка}}}}') returning id"))
+        r = trigger(S16, {"type": 2, "deal_filters": [], "apply_when": when_now(), "send_email_data": {"template_id": template_f, "from": "currently_assigned", "attach_extensions": ["PDF"]}})
+        check("'send email' with the deal's .pdf attached -> 201, the extension kept as .pdf",
+              r[0] == 201 and (r[1].get("send_email_data") or {}).get("attach_extensions") == [".pdf"], r)
+        r = trigger(S16, {"type": 2, "deal_filters": [], "apply_when": when_now(), "send_email_data": {"template_id": template_f, "from": "currently_assigned", "attach_extensions": ["../x"]}})
+        check("an extension that is not one -> 400", r[0] == 400, r)
+        D30 = new_deal("письмо без файла", agent=A)
+        move(D30, S16)
+        row = wait_for(lambda: psql(f"select status from trigger_run r join trigger t on t.id = r.trigger_id where r.deal_id = {D30} and t.type = 2"), "failed", timeout=60)
+        err = psql(f"select coalesce(error, '') from trigger_run r join trigger t on t.id = r.trigger_id where r.deal_id = {D30} and t.type = 2")
+        check("no .pdf in the deal: the letter does not go without its file, the run says why", row == "failed" and "нет файла" in err, (row, err))
+        D31 = new_deal("письмо с файлом", agent=A)
+        disk = f"{TAG}-kp.pdf"
+        written = subprocess.run(APP_EXEC + ["sh", "-c", "cd %s && mkdir -p public/uploads && printf AUDIT-PDF > public/uploads/%s" % (shlex.quote(APP_DIR), shlex.quote(disk))],
+                                 capture_output=True, text=True, encoding="utf-8")
+        pdf_file = int(psql(f"insert into file (name, path, size, \"from\", extension) values ('{TAG}-КП.pdf', '{disk}', 9, 'uploaded_from_files_tab', '.pdf') returning id"))
+        psql(f"insert into deal_file (\"dealId\", \"fileId\") values ({D31}, {pdf_file})")
+        move(D31, S16)
+        row = wait_for(lambda: psql(f"select status from trigger_run r join trigger t on t.id = r.trigger_id where r.deal_id = {D31} and t.type = 2"), "done", timeout=60)
+        note = psql(f"select coalesce(note, '') from trigger_run r join trigger t on t.id = r.trigger_id where r.deal_id = {D31} and t.type = 2")
+        subject = f"{TAG} КП: {TAG} письмо с файлом"
+        sent = psql(f"select count(*), coalesce(sum((select count(*) from file f where f.email_id = e.id)), 0) from email e where e.subject = '{subject}'")
+        check("the letter goes with the deal's data in the subject ({{сделка}}) and the .pdf of the deal attached",
+              written.returncode == 0 and row == "done" and "вложения" in note and sent == "1|1", (written.stderr[-200:], row, note, sent))
+        body = psql(f"select position('сумма 100' in body) > 0 from email where subject = '{subject}'")
+        check("the body has the deal's data too ({{сумма}})", body == "t", body)
+
         print("== control: a call answers the client, «ждут сейчас» does not depend on the period")
         D12 = new_deal("контроль: перезвонил", agent=A)
         D13 = new_deal("контроль: ждёт", agent=A)
@@ -676,6 +861,14 @@ def main():
         # the letters on the stand's mail server first: a sync after the cleanup would bring them back
         purged = purge_mail(TAG)
         print(f"       mail server: {purged} letter(s) of this run removed")
+        try:
+            # the files of this run on the disk of the API: the deal's .pdf and the copies the letters keep
+            paths = [p for p in psql(f"select path from file where name like '{TAG}%' or email_id in (select id from email where subject like '{TAG}%')").split("\n") if p]
+            if paths:
+                subprocess.run(APP_EXEC + ["sh", "-c", "cd %s/public/uploads && rm -f %s" % (shlex.quote(APP_DIR), " ".join(shlex.quote(os.path.basename(p)) for p in paths))],
+                               capture_output=True, text=True, encoding="utf-8")
+        except Exception as error:  # the files are test ones: a leftover is not a failure
+            print(f"       files on disk: {str(error)[:200]}")
         ids = ",".join(str(u["id"]) for u in users.values()) or "0"
         stage_ids = ",".join(str(s) for s in stages) or "0"
         deals = f"select id from deal where label like '{TAG}%'"
@@ -694,6 +887,8 @@ def main():
             f"delete from email where subject like '{TAG}%'",
             f"delete from email_template where name like '{TAG}%'",
             f"delete from deal_filler where deal_id in ({deals}) or filler_id = {filler_id or 0}",
+            f"delete from deal_product where deal_id in ({deals}) or product_id in (select id from product where name like '{TAG}%')",
+            f"delete from product where name like '{TAG}%'",
             f"delete from deal_stage_record where deal_id in ({deals})",
             f"delete from deal_user where \"dealId\" in ({deals})",
             f"delete from deal where id in ({deals})",

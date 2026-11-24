@@ -46,6 +46,8 @@ import { TriggerService } from '../trigger/trigger.service';
 import { DealStageRecord } from 'src/deal_stage/deal_stage.records.entity';
 import { AuthUser } from '../auth/auth.guard';
 import { DealAccess } from './deal-access';
+import { canonicalDecimal } from './decimal';
+import { AuditJournal } from '../audit/audit-journal';
 
 /**
  * Relations returned by GET /deals.
@@ -254,7 +256,7 @@ export class DealService {
       stages: totals.map((row) => ({
         stage_id: row.stage_id === null || row.stage_id === undefined ? null : Number(row.stage_id),
         count: Number(row.count),
-        budget: String(row.budget ?? '0'),
+        budget: canonicalDecimal(row.budget ?? '0') ?? '0',
         closing: closingIds.includes(Number(row.stage_id)),
       })),
       data,
@@ -741,7 +743,7 @@ export class DealService {
     deal.last_stage_change = new Date();
     await this.dealRepository.save(deal);
 
-    await this.updateDealStageRecords(deal, stage);
+    await this.updateDealStageRecords(deal, stage, oldStage, originatedBy);
 
     // immediate triggers run now, delayed and recurring ones are planned in trigger_run
     await this.triggerService.onDealEnteredStage(originatedBy, deal, stage);
@@ -759,7 +761,7 @@ export class DealService {
 
   /**
    * Closes the previous history record (how long the deal stayed in the
-   * stage) and opens a new one.
+   * stage) and opens a new one: with the stage the deal came from and who moved it.
    *
    * Duration is calculated by the database: created_at is filled by the
    * database clock, and comparing it with the application clock gave an
@@ -768,6 +770,8 @@ export class DealService {
   private async updateDealStageRecords(
     deal: Deal,
     stage: DealStage,
+    fromStage: DealStage | null,
+    movedBy: User | null,
   ): Promise<void> {
     const lastDealStageRecord = await this.dealStageRecordRepository
       .createQueryBuilder('t0')
@@ -789,7 +793,7 @@ export class DealService {
         .execute();
     }
 
-    await this.createDealStageRecord(deal, stage);
+    await this.createDealStageRecord(deal, stage, fromStage, movedBy);
   }
 
   /** "%" and "_" typed into a search box are text, not wildcards. */
@@ -818,14 +822,18 @@ export class DealService {
   async create(
     creator_id: number,
     data: CreateDealDto,
-    // skipRequiredFields: deals that arrive from a channel (Telegram) carry no custom fields
-    options: { skipRequiredFields?: boolean } = {},
+    // skipRequiredFields: deals that arrive from a channel (Telegram) carry no custom fields;
+    // linkedBy: the user of POST /deals, who may link only the companies and contacts they see
+    options: { skipRequiredFields?: boolean; linkedBy?: AuthUser } = {},
   ): Promise<Deal> {
     const userIds = [data.agent_id, creator_id, ...data.ctr_agent_ids];
     const users = await this.userService.findByIds(userIds);
     // HashMap with ids linked to entities
     const usersMap = this.helperService.createHashMap<User>(users);
     DealService.assertDealPeople(usersMap, data.agent_id, data.ctr_agent_ids);
+    if (options.linkedBy) {
+      await this.assertMayLink(options.linkedBy, data.company_id, data.ctr_agent_ids);
+    }
 
     // Company is optional: deals created from mail / telegram have none
     const company = data.company_id
@@ -879,7 +887,7 @@ export class DealService {
       newDeal,
       data.display_id,
     );
-    await this.createDealStageRecord(savedDeal, savedDeal.stage);
+    await this.createDealStageRecord(savedDeal, savedDeal.stage, null, savedDeal.created_by ?? null);
 
     this.emitNecessaryEventsForDealCreation(savedDeal);
 
@@ -896,6 +904,8 @@ export class DealService {
   private async createDealStageRecord(
     deal: Deal,
     stage: DealStage,
+    fromStage: DealStage | null,
+    movedBy: User | null,
   ): Promise<void> {
     if (!stage) {
       return;
@@ -904,6 +914,9 @@ export class DealService {
     const record = new DealStageRecord();
     record.deal = deal;
     record.stage = stage;
+    record.from_stage = fromStage?.id ? ({ id: fromStage.id } as DealStage) : null;
+    // a user of the CRM (a move by a trigger or a channel has no author)
+    record.moved_by = movedBy?.id ? ({ id: movedBy.id } as User) : null;
 
     await this.dealStageRecordRepository.save(record);
   }
@@ -983,6 +996,12 @@ export class DealService {
     const userMap = this.helperService.createHashMap<User>(users);
     DealService.assertDealPeople(userMap, data.agent_id, data.ctr_agent_ids);
 
+    // the company and the contacts the deal has now: only new links are checked and logged
+    const linked = await this.linkedParties(id);
+    if (request?.['user']) {
+      await this.assertMayLink(request['user'], data.company_id, data.ctr_agent_ids, linked);
+    }
+
     // company_id: null takes the company off the deal (the form's company field was cleared)
     const company =
       data.company_id === null
@@ -1055,10 +1074,28 @@ export class DealService {
       deal.ctr_agents = [...new Set(data.ctr_agent_ids)].map((ctr_agent_id) =>
         userMap.get(ctr_agent_id),
       );
+
+      // «Контакты: A, B → A, C» in the history of the deal
+      const before = linked.contacts.map((c) => c.id).sort((a, b) => a - b).join(',');
+      const after = deal.ctr_agents.map((c) => c.id).sort((a, b) => a - b).join(',');
+      if (before !== after) {
+        eventData.fields.push(
+          new Field(
+            'Контакты',
+            deal.ctr_agents.map((c) => c.username).join(', ') || null,
+            linked.contacts.map((c) => c.username).join(', ') || null,
+          ),
+        );
+      }
     }
 
     if (company !== undefined) {
       deal.company = company;
+
+      // «Компания: A → B» in the history of the deal
+      if ((company?.id ?? null) !== (linked.company?.id ?? null)) {
+        eventData.fields.push(new Field('Компания', company?.name ?? null, linked.company?.name ?? null));
+      }
     }
 
     // Update necessary deal fillers
@@ -1254,15 +1291,18 @@ export class DealService {
       throw new ForbiddenException(`No right to delete deal ${id}`);
     }
 
-    await this.dealRepository
-      .createQueryBuilder()
-      .update(Deal)
-      .set({
-        deleted_at: () => 'CURRENT_TIMESTAMP',
-        deleted_by: { id: user.sub },
-      })
-      .where('id = :id AND deleted_at IS NULL', { id })
-      .execute();
+    // the journal (src/audit): «Удаление в корзину», who and when
+    await AuditJournal.around(this.dataSource, 'deal', 't.id = $1', [id], () =>
+      this.dealRepository
+        .createQueryBuilder()
+        .update(Deal)
+        .set({
+          deleted_at: () => 'CURRENT_TIMESTAMP',
+          deleted_by: { id: user.sub },
+        })
+        .where('id = :id AND deleted_at IS NULL', { id })
+        .execute(),
+    );
   }
 
   /**
@@ -1364,6 +1404,73 @@ export class DealService {
     }
 
     return dealFillers;
+  }
+
+  /** The company and the contacts linked to the deal now (id and name). */
+  private async linkedParties(dealId: number): Promise<{
+    company: { id: number; name: string } | null;
+    contacts: { id: number; username: string }[];
+  }> {
+    const [company]: { id: number; name: string }[] = await this.dataSource.query(
+      `SELECT c.id, c.name FROM deal d JOIN company c ON c.id = d.company_id WHERE d.id = $1`,
+      [dealId],
+    );
+    const contacts: { id: number; username: string }[] = await this.dataSource.query(
+      `SELECT u.id, u.username FROM deal_user du JOIN "user" u ON u.id = du."userId"
+        WHERE du."dealId" = $1 ORDER BY u.id`,
+      [dealId],
+    );
+    return {
+      company: company ? { id: Number(company.id), name: company.name } : null,
+      contacts: contacts.map((c) => ({ id: Number(c.id), username: c.username })),
+    };
+  }
+
+  /**
+   * ACL-4: a user links to a deal only a company and contacts they may see (Access.companySql /
+   * contactSql, the rule of GET /companies/:id and the contact card), otherwise 404 as for the
+   * card itself. A deal of one's own used to be a way to any company or contact: once linked,
+   * it became "own" with all its history. Links the deal already has are not checked again.
+   */
+  async assertMayLink(
+    user: AuthUser,
+    companyId: number | null | undefined,
+    contactIds: number[] | null | undefined,
+    linked?: { company: { id: number } | null; contacts: { id: number }[] },
+  ): Promise<void> {
+    const access = new Access(user);
+
+    if (companyId && companyId !== linked?.company?.id) {
+      const cond = access.companySql('c', 'view');
+      const visible = await this.dataSource
+        .createQueryBuilder()
+        .select('1', 'ok')
+        .from('company', 'c')
+        .where('c.id = :link_company_id', { link_company_id: companyId })
+        .andWhere(cond.sql, cond.params)
+        .getRawOne();
+      if (!visible) {
+        throw new NotFoundException(`Компания ${companyId} не найдена`);
+      }
+    }
+
+    const already = new Set((linked?.contacts ?? []).map((c) => c.id));
+    const added = [...new Set(contactIds ?? [])].filter((id) => !already.has(id));
+    if (added.length > 0) {
+      const cond = access.contactSql('u', 'view');
+      const rows: { id: number }[] = await this.dataSource
+        .createQueryBuilder()
+        .select('u.id', 'id')
+        .from('user', 'u')
+        .where('u.id IN (:...link_contact_ids)', { link_contact_ids: added })
+        .andWhere(cond.sql, cond.params)
+        .getRawMany();
+      const visible = new Set(rows.map((row) => Number(row.id)));
+      const hidden = added.filter((id) => !visible.has(id));
+      if (hidden.length > 0) {
+        throw new NotFoundException(`Контакт ${hidden.join(', ')} не найден`);
+      }
+    }
   }
 
   /**

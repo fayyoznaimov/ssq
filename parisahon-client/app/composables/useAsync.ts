@@ -21,6 +21,8 @@ export function useAsync<T>(initialData: Partial<T> | null = null) {
     const run = async (promise: Promise<T>, transform = (data: T) => data) => {
         const silent = silentDepth > 0;
         if (!silent) isLoading.value = true;
+        // the error of this request, not of an earlier one (it stayed after a failure for good)
+        error.value = null;
         try {
             const result = await promise;
             data.value = transform(result);
@@ -34,6 +36,7 @@ export function useAsync<T>(initialData: Partial<T> | null = null) {
     const runAsync = async (promise: Promise<T>) => {
         const silent = silentDepth > 0;
         if (!silent) isLoading.value = true;
+        error.value = null;
         try {
             const result = await promise;
             data.value = result;

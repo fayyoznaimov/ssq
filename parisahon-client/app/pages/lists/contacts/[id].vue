@@ -112,21 +112,8 @@
                                 </BaseInput>
                             </li>
                         </ul>
-                        <div class="flex flex-col gap-2 mt-4">
-                            <Can
-                                I="delete"
-                                a="Contact"
-                            >
-                                <BaseButton
-                                    v-if="contact.id"
-                                    color="danger"
-                                    :loading="isLoadingMap.delete"
-                                    :disabled="isLoadingMap.delete"
-                                    @click="onDelete"
-                                >
-                                    Удалить
-                                </BaseButton>
-                            </Can>
+                        <!--  ACTIONS: «Сохранить» first; «Объединить» and «Удалить» apart, small, and they ask  -->
+                        <div class="flex flex-col gap-2 mt-4 mb-4">
                             <Can
                                 v-if="!contactLoading"
                                 :I="contact.id ? 'update' : 'create'"
@@ -134,19 +121,65 @@
                             >
                                 <BaseButton
                                     color="primary"
+                                    variant="solid"
                                     type="submit"
                                     :disabled="isLoadingMap.save"
                                     :loading="isLoadingMap.save"
                                 >
-                                    Сохранить
+                                    {{ contact.id ? "Сохранить" : "Добавить контакт" }}
                                 </BaseButton>
                             </Can>
+                            <div
+                                v-if="contact.id"
+                                class="mt-6 flex flex-wrap justify-end gap-2 border-t border-muted-200 pt-4 dark:border-muted-700"
+                            >
+                                <Can
+                                    I="update"
+                                    a="Contact"
+                                >
+                                    <BaseButton
+                                        size="sm"
+                                        variant="pastel"
+                                        title="Тот же клиент записан дважды: присоединить второй контакт к этому"
+                                        @click="mergeModal.open()"
+                                    >
+                                        <Icon
+                                            name="ph:git-merge"
+                                            class="size-4 me-1"
+                                        /> Объединить контакты
+                                    </BaseButton>
+                                </Can>
+                                <Can
+                                    I="delete"
+                                    a="Contact"
+                                >
+                                    <BaseButton
+                                        size="sm"
+                                        variant="pastel"
+                                        color="danger"
+                                        :loading="isLoadingMap.delete"
+                                        :disabled="isLoadingMap.delete"
+                                        @click="onDelete"
+                                    >
+                                        <Icon
+                                            name="ph:trash"
+                                            class="size-4 me-1"
+                                        /> Удалить
+                                    </BaseButton>
+                                </Can>
+                            </div>
                         </div>
                     </form>
                     <!--  every deal of the contact, with links  -->
                     <ContactDeals
                         v-if="activeValue === 'deals'"
                         :contact-id="contact.id"
+                    />
+                    <!--  who changed what in the contact's card and deals (the journal of changes)  -->
+                    <CardHistory
+                        v-if="activeValue === 'history' && contact.id"
+                        scope="user"
+                        :id="contact.id"
                     />
                     <div
                         v-if="activeValue === 'settings'"
@@ -275,7 +308,8 @@
                 </template>
             </BaseTabs>
         </section>
-        <section class="col-span-12 lg:col-span-8 flex flex-col relative min-w-0 min-h-[60vh]">
+        <!-- the history takes the height next to the card from lg (it was a box cut at 100% - 4rem), full width on a phone -->
+        <section class="col-span-12 lg:col-span-8 flex flex-col relative min-w-0 lg:h-full lg:min-h-0">
             <p
                 v-if="eventsDenied"
                 class="text-sm text-muted-500 dark:text-muted-400"
@@ -284,13 +318,13 @@
             </p>
             <EventsList 
                 v-else
+                v-model:filters="historyFilters"
                 :events="events" 
-                :classes="{wrapper: 'max-h-[calc(100%-4rem)]'}" 
                 :events-loading="eventsLoading" 
                 :intersected="onIntersect" 
                 :start-observer="!!route.params.id"
             />
-            <div class="mb-8 my-4 space-y-2">
+            <div class="shrink-0 mb-8 mt-3 space-y-2 lg:mb-2">
                 <form
                     id="compose-form"
                     class="flex flex-wrap lg:flex-nowrap gap-2"
@@ -314,6 +348,12 @@
                         :initial-date="task.start" 
                     />
                 </form>
+                <QuickNote
+                    v-if="messageType.id === 'note' && route.params.id !== 'new'"
+                    target="users"
+                    :id="Number(route.params.id)"
+                    @saved="onNoteSaved"
+                />
                 <EmailReplyForm 
                     v-if="messageType.id === 'email'" 
                     :reply-options="[contact.email]"
@@ -360,6 +400,17 @@
                 </BaseTextarea>
             </div>
         </section>
+        <Confirmation
+            id="DeleteContactConfirmation"
+            title="Удалить контакт?"
+            description=""
+            :on-confirm="removeContact"
+        />
+        <MergeContactModal
+            id="MergeContactModal"
+            :contact="contact"
+            @merged="onMerged"
+        />
     </div>
 </template>
 
@@ -368,10 +419,17 @@ import { Can } from "@casl/vue";
 
 import type BaseTabs from "~/components/base/BaseTabs.vue";
 import EventSchedulerSingle from "~/components/common/EventSchedulerSingle.vue";
+import { confirmTaskPlan } from "~/components/task/taskPlan";
 import ContactDeals from "~/components/company/ContactDeals.vue";
+import CardHistory from "~/components/audit/CardHistory.vue";
 import { phoneOrLocal } from "~/components/company/phone";
 import { confirmFillerDelete } from "~/components/company/fillerDelete";
 import EventsList from "~/components/common/EventsList.vue";
+import QuickNote from "~/components/common/QuickNote.vue";
+import { type HistoryFilters, emptyHistoryFilters, historyQuery } from "~/components/history/history";
+import Confirmation from "~/components/common/Confirmation.vue";
+import MergeContactModal from "~/components/company/MergeContactModal.vue";
+import { useRecordTitle } from "~/components/company/recordTitle";
 import EmailReplyForm from "~/components/mail/EmailReplyForm.vue";
 import { useAsync } from "~/composables/useAsync";
 import { useValidation } from "~/composables/useValidation";
@@ -382,11 +440,8 @@ import { type Company, type Group,type User, UserRole } from "~/types/user";
 definePageMeta({
     authRoute: true,
     layout: "no-min-height",
-    verbose: "Новый контакт",
-});
-
-useHead({
-    title: "Новый контакт"
+    verbose: "Контакт",
+    verboseNew: "Новый контакт",
 });
 
 type TaskEventProps = {
@@ -426,6 +481,12 @@ const taskMessageType = {
     label: "Задача"
 };
 
+// a note of the card, outside any deal: the first and the default (SCR2-4)
+const noteMessageType = {
+    id: "note",
+    label: "Заметка"
+};
+
 const limit = 25;
 const route = useRoute();
 const toast = useToast("GlobalToast");
@@ -441,9 +502,10 @@ const activeTab = ref("general");
 const contactTabs = computed(() => [
     { label: "Общее", value: "general" },
     ...(route.params.id !== "new" ? [{ label: "Сделки", value: "deals" }] : []),
+    ...(route.params.id !== "new" ? [{ label: "История", value: "history" }] : []),
     { label: "Настройка", value: "settings" },
 ]);
-const messageType = ref<typeof emailMessageType>(taskMessageType);
+const messageType = ref<typeof emailMessageType>(route.params.id !== "new" ? noteMessageType : taskMessageType);
 const toEmail = ref("");
 const commentRef = ref();
 const content = ref("");
@@ -478,8 +540,12 @@ const eventsDenied = ref(false);
 
 const {onChange, validate, errors} = useValidation(schema);
 
-const end = new Date();
-const start = new Date().toISOString();
+// a new task is due tomorrow at 10:00, not the minute the page was opened (it went overdue at once)
+const tomorrow = new Date();
+tomorrow.setDate(tomorrow.getDate() + 1);
+tomorrow.setHours(10, 0, 0, 0);
+const start = tomorrow.toISOString();
+const end = new Date(tomorrow);
 end.setMinutes(end.getMinutes() + 30);
 const endStr = end.toISOString();
 const task = ref<Partial<Task>>({
@@ -592,19 +658,67 @@ async function onSubmit(e: Event) {
 
     const result = await promiseResult(runWithId(promise, "save"));
     if (!result.ok) return toast.show({ message: result.error.message, type: "error", timeout: 3000 });
-    navigateTo("/lists/contacts");
+    // stay in the card: a new contact opens as itself, a saved one is read again
+    toast.show({ message: id ? "Сохранено" : "Контакт добавлен", type: "success", timeout: 2500 });
+    if (!id) {
+        const created = result.value as User;
+        return navigateTo(created?.id ? `/lists/contacts/${created.id}` : "/lists/contacts", { replace: true });
+    }
+    await runContact(userService.get(String(id)).exec());
 }
 
+const deleteConfirmation = useModal("DeleteContactConfirmation");
+const mergeModal = useModal("MergeContactModal");
+
 async function onDelete() {
-    // one click used to delete the client: say what goes with it, and ask
+    // one click used to delete the client: say what goes with it, and ask (the dialog of the CRM)
     const deals = await promiseResult(userService.get(`${contact.value.id}/deals`).exec());
     const dealCount = deals.ok && Array.isArray(deals.value) ? deals.value.length : null;
     const dealsText = dealCount ? ` Сделок с ним: ${dealCount} — они останутся, без этого контакта.` : "";
-    if (!confirm(`Удалить контакт «${contact.value.username}»?${dealsText} Контакт пропадёт из списков и поиска.`)) return;
-    const result = await promiseResult(runWithId(userService.remove(contact.value.id).exec(), "delete"));
-    if (!result.ok) return toast.show({ message: result.error.message, type: "error", timeout: 3000 });
+    deleteConfirmation.open({
+        description: `Контакт «${contact.value.username}» пропадёт из списков и поиска.${dealsText} Если это дубль, лучше «Объединить контакты».`,
+    });
+}
+
+async function removeContact() {
+    await runWithId(userService.remove(contact.value.id).exec(), "delete");
+    toast.show({ message: "Контакт удалён", type: "success", timeout: 2500 });
     navigateTo("/lists/contacts");
 }
+
+/** The second contact of the client is merged into this one: the card and its history are read again. */
+async function onMerged() {
+    await runContact(userService.get(String(contact.value.id)).exec());
+    const result = await promiseResult(
+        userService.get(`${route.params.id as string}/events`, { sort: { id: -1 }, skip: 0, limit, ...historyQuery(historyFilters.value) }).exec()
+    );
+    if (result.ok) mergeNewestEvents(events.value.pages, (result.value as any).data, currentUser.value?.id);
+}
+
+useRecordTitle(
+    computed(() => (route.params.id === "new" ? null : contact.value?.username)),
+    route.params.id === "new" ? "Новый контакт" : "Контакт",
+);
+
+// «Всё / Переписка / Звонки / Задачи / Изменения» and the search above the feed: the feed again from its newest page
+const historyFilters = ref<HistoryFilters>(emptyHistoryFilters());
+let reloadPending = false;
+function reloadEvents() {
+    if (route.params.id === "new" || eventsDenied.value) return;
+    if (eventsLoading.value) {
+        reloadPending = true;
+        return;
+    }
+    reloadPending = false;
+    currentPage = 0;
+    eventsEnded.value = false;
+    resetEvents();
+    onIntersect();
+}
+watch(historyFilters, reloadEvents, { deep: true });
+watch(eventsLoading, (loading) => {
+    if (!loading && reloadPending) reloadEvents();
+});
 
 async function fetchEvents() {
     const query: Record<string, any> = {
@@ -613,6 +727,7 @@ async function fetchEvents() {
         }, 
         skip: currentPage * limit, 
         limit,
+        ...historyQuery(historyFilters.value),
     };
 
     return await promiseResult(runEventsAsync(userService.get(`${route.params.id as string}/events`, query).exec()));
@@ -622,7 +737,7 @@ async function fetchEvents() {
 useLive(async (changes) => {
     if (!liveTouches(changes, "events") || route.params.id === "new") return;
     const result = await promiseResult(
-        userService.get(`${route.params.id as string}/events`, { sort: { id: -1 }, skip: 0, limit }).exec()
+        userService.get(`${route.params.id as string}/events`, { sort: { id: -1 }, skip: 0, limit, ...historyQuery(historyFilters.value) }).exec()
     );
     if (result.ok) mergeNewestEvents(events.value.pages, (result.value as any).data, currentUser.value?.id);
 });
@@ -639,7 +754,7 @@ async function onIntersect() {
         }
         return;
     }
-    if (result.value.current_page === result.value.last_page) eventsEnded.value = true;
+    if (result.value.current_page >= result.value.last_page || !result.value.data?.length) eventsEnded.value = true;
     currentPage++;
 }
 
@@ -773,7 +888,7 @@ async function onTask(formData: FormData) {
     const event = NewTaskEvent(values);
     const latest = events.value.pages.length - 1;
     events.value.pages[latest].data.unshift(event);
-    const result = await promiseResult(taskService.create(values).exec());
+    const result = await promiseResult(confirmTaskPlan((flags) => taskService.create({...values, ...flags}).exec()));
 
     if (!result.ok) {
         toast.show({message: result.error.message, timeout: 3000, type: "error"});
@@ -821,8 +936,16 @@ function NewTaskEvent(task: TaskEventProps): DealEvent {
     return event;
 }
 
+/** A saved note: at once in the feed (the live update brings it to the others). */
+function onNoteSaved(event: DealEvent) {
+    if (!events.value.pages.length) events.value.pages.push({ data: [], count: 0, page_size: limit, current_page: 1, last_page: 1 });
+    const newest = events.value.pages[events.value.pages.length - 1];
+    newest.data.unshift(event);
+    newest.count = (newest.count ?? 0) + 1;
+}
+
 const messageTypes = computed(() => {
-    let out = [taskMessageType];
+    let out = route.params.id !== "new" ? [noteMessageType, taskMessageType] : [taskMessageType];
     if (contact.value?.tg_id) out.push(tgMessageType);
     if (contact.value?.email) out.push(emailMessageType);
 

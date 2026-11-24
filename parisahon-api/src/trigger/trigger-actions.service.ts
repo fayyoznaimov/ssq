@@ -1,5 +1,7 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { readFile } from 'fs/promises';
+import { basename, join } from 'path';
 import { Trigger, TriggerTypes } from './trigger.entity';
 import { DataSource, Repository } from 'typeorm';
 import { Deal } from '../deal/deal.entity';
@@ -7,7 +9,7 @@ import { TaskEventDto } from '../events/dto/task.event.dto';
 import { Event, EventTypes, FieldsOf } from '../events/event.entity';
 import { EventBuilder } from '../events/event.builder';
 import { EventWrapper } from '../events/event.wrapper';
-import { User } from '../user/user.entity';
+import { RoleEnum, User } from '../user/user.entity';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Task } from '../task/task.entity';
 import { TaskType } from '../task_type/task_type.entity';
@@ -21,6 +23,9 @@ import {
   CreateTaskContents,
   DealFilter,
   DeleteFilesContents,
+  MoveStageContents,
+  NotifyContents,
+  NotifyWhomEnum,
   SendEmailContents,
   TaskResponsible,
   TaskResponsibleEnum,
@@ -40,10 +45,34 @@ import { NotificationGateWay } from '../gateway/notification.gateway';
 import { defaultTaskType } from '../task_type/default-task-type';
 import { WorkSchedule } from '../analytics/control.service';
 import { endOfWorkingDay } from '../automation/autopilot.service';
+import { isClosingStage } from '../deal_stage/stage-kind';
+import { DealStageEventDto } from '../events/dto/deal.stage.event.dto';
+import { TRIGGER_NOTIFY, TriggerNotification } from './trigger-events';
 
 // a "create deal" trigger may start a chain: a copy never creates further copies
 const MAX_CREATE_DEAL_DEPTH = 1;
+// «перевести в этап» may start a chain too (S1 -> S2 -> S3): never longer than this (no ping-pong)
+const MAX_MOVE_DEPTH = 3;
 const DAY_MINUTES = 24 * 60;
+// the number columns of a deal a condition compares as numbers (budget is numeric: «777.00» as text)
+const NUMERIC_COLUMNS = ['budget'];
+const NUMBER = /^\s*-?\d+([.,]\d+)?\s*$/;
+// a task of a trigger is never due at once («в момент события» was overdue as soon as it appeared)
+const MIN_TASK_MINUTES = Math.max(5, Number(process.env.TRIGGER_TASK_MIN_MINUTES || 30));
+// the channel of the first client event of a deal (condition «источник сделки»)
+const SOURCE_BY_EVENT: Record<string, string> = {
+  [EventTypes.NEW_TELEGRAM_MESSAGE]: 'telegram',
+  [EventTypes.NEW_WHATSAPP_MESSAGE]: 'whatsapp',
+  [EventTypes.NEW_EMAIL]: 'email',
+  [EventTypes.NEW_CALL_RECORDING]: 'call',
+};
+export const SOURCE_NAMES: Record<string, string> = {
+  telegram: 'Telegram',
+  whatsapp: 'WhatsApp',
+  email: 'почта',
+  call: 'звонок',
+  manual: 'создана вручную',
+};
 // the letters of "send email": automatic, answering machines must not reply (RFC 3834; Exchange / Outlook)
 const AUTOMATIC_LETTER_HEADERS: Record<string, string> = {
   'Auto-Submitted': 'auto-generated',
@@ -58,6 +87,8 @@ const AUTOMATIC_LETTER_HEADERS: Record<string, string> = {
 export interface TriggerOutcome {
   status: 'done' | 'skipped';
   note?: string;
+  // «перевести в этап» moved the deal: the other triggers of the old stage are not for it any more
+  moved?: boolean;
 }
 
 const done = (note?: string): TriggerOutcome => ({ status: 'done', note });
@@ -73,17 +104,32 @@ export const ACTION_NAMES: Record<number, string> = {
   [TriggerTypes.CHANGE_AGENT]: 'Сменить ответственного',
   [TriggerTypes.CHANGE_FIELDS]: 'Изменить поле',
   [TriggerTypes.DELETE_FILES]: 'Удалить файлы',
+  [TriggerTypes.MOVE_STAGE]: 'Перевести в этап',
+  [TriggerTypes.NOTIFY]: 'Уведомить',
 };
 
 /**
- * A "create deal" trigger made `deal` in `stage`: the caller gives it the triggers of
- * that stage (TriggerService.onDealEnteredStage) one level deeper (`depth`).
+ * How the deal whose triggers run got into its stage: by a person or a channel ({0, 0}), by
+ * «Перевести в этап» (`moves` in a row) or as a copy made by «Создать сделку» (`copies`). A copy never
+ * makes another copy, a chain of moves is cut at MAX_MOVE_DEPTH; a deal moved by a trigger into a stage
+ * with «Создать сделку» still gets its copy (one counter used to stop both).
+ */
+export interface TriggerChain {
+  moves: number;
+  copies: number;
+}
+
+export const NO_CHAIN: TriggerChain = Object.freeze({ moves: 0, copies: 0 });
+
+/**
+ * A "create deal" trigger made `deal` in `stage`, or «перевести в этап» moved it there: the caller
+ * gives it the triggers of that stage (TriggerService.onDealEnteredStage) one step further (`chain`).
  */
 export type OnDealCreated = (
   originatedBy: User,
   deal: Deal,
   stage: DealStage,
-  depth: number,
+  chain: TriggerChain,
 ) => Promise<void>;
 
 /**
@@ -116,7 +162,7 @@ export class TriggerActionsService {
     originatedBy: User,
     deal: Deal,
     trigger: Trigger,
-    depth: number,
+    chain: TriggerChain,
     onDealCreated: OnDealCreated,
   ): Promise<TriggerOutcome> {
     this.loggerService.log(`Executing trigger ${trigger.id} (type ${trigger.type}) for deal ${deal.id}`);
@@ -137,11 +183,15 @@ export class TriggerActionsService {
       case TriggerTypes.CLOSE_TASKS:
         return this.handleCloseTasks(deal, trigger.data, filters, originatedBy);
       case TriggerTypes.CHANGE_AGENT:
-        return this.handleChangeAgent(deal, trigger.data, filters, originatedBy);
+        return this.handleChangeAgent(deal, { ...(trigger.data ?? {}), trigger_id: trigger.id }, filters, originatedBy);
       case TriggerTypes.SEND_EMAIL:
         return this.handleSendEmail(deal, trigger.data, filters);
       case TriggerTypes.CREATE_DEAL:
-        return this.handleCreateDeal(deal, trigger.data, filters, originatedBy, depth, onDealCreated);
+        return this.handleCreateDeal(deal, trigger.data, filters, originatedBy, chain ?? NO_CHAIN, onDealCreated, trigger.deal_stage?.name);
+      case TriggerTypes.MOVE_STAGE:
+        return this.handleMoveStage(deal, trigger.data, filters, originatedBy, chain ?? NO_CHAIN, onDealCreated);
+      case TriggerTypes.NOTIFY:
+        return this.handleNotify(deal, trigger.data, filters, originatedBy);
       default:
         throw new Error(`unknown trigger type ${trigger.type}`);
     }
@@ -182,13 +232,16 @@ export class TriggerActionsService {
       .map((f) => f.field);
   }
 
-  /** «уже есть открытая задача …» when the deal has an open task of this type and label (made by this trigger before). */
+  /**
+   * «уже есть открытая задача …» when the deal has an open task with this text, of any type and by
+   * anybody (this trigger before, another trigger, the manager): five messages of the client are one
+   * task «ответить», not five.
+   */
   private async openSameTask(dealId: number, data: CreateTaskContents): Promise<string | null> {
     const label = TriggerActionsService.taskLabel(data);
-    const type = data?.type_id ? Number(data.type_id) : (await defaultTaskType(this.taskRepository.manager)).id;
     const rows = await this.dataSource.query(
-      `SELECT id FROM task WHERE deal_id = $1 AND closed_at IS NULL AND type_id = $2 AND label = $3 LIMIT 1`,
-      [dealId, type, label],
+      `SELECT id FROM task WHERE deal_id = $1 AND closed_at IS NULL AND label = $2 LIMIT 1`,
+      [dealId, label],
     );
     return rows.length ? `в сделке уже есть открытая задача «${label}»` : null;
   }
@@ -208,23 +261,44 @@ export class TriggerActionsService {
     for (const filter of filters) {
       n++;
       const value = filter.value === null || filter.value === undefined ? '' : String(filter.value);
-      if (filter.is_filler && filter.filler_id) {
-        // by id: a renamed custom field keeps its triggers
-        qb = qb.andWhere(
-          `EXISTS (SELECT 1 FROM deal_filler df${n} WHERE df${n}.deal_id = t0.id AND df${n}.filler_id = :filler${n} AND df${n}.value = :value${n})`,
-          { [`filler${n}`]: Number(filter.filler_id), [`value${n}`]: value },
-        );
-      } else if (filter.is_filler) {
-        qb = qb.andWhere(
-          `EXISTS (SELECT 1 FROM deal_filler df${n} INNER JOIN filler fl${n} ON fl${n}.id = df${n}.filler_id
-                    WHERE df${n}.deal_id = t0.id AND fl${n}.field = :field${n} AND df${n}.value = :value${n})`,
-          { [`field${n}`]: filter.field, [`value${n}`]: value },
-        );
+      const params: Record<string, unknown> = { [`value${n}`]: value };
+      if (filter.is_filler) {
+        // by id: a renamed custom field keeps its triggers (by name for a trigger saved before the ids)
+        const which = filter.filler_id
+          ? `df${n}.filler_id = :filler${n}`
+          : `df${n}.filler_id IN (SELECT fl.id FROM filler fl WHERE fl.target = 'deal' AND fl.field = :field${n})`;
+        if (filter.filler_id) params[`filler${n}`] = Number(filter.filler_id);
+        else params[`field${n}`] = filter.field;
+        if (filter.op === 'ne') {
+          // «не равно» also holds for a deal where the field is not filled in at all
+          qb = qb.andWhere(
+            `NOT EXISTS (SELECT 1 FROM deal_filler df${n} WHERE df${n}.deal_id = t0.id AND ${which} AND df${n}.value = :value${n})`,
+            params,
+          );
+        } else {
+          const test = TriggerActionsService.compareSql(`df${n}.value`, filter.op, `value${n}`);
+          qb = qb.andWhere(`EXISTS (SELECT 1 FROM deal_filler df${n} WHERE df${n}.deal_id = t0.id AND ${which} AND ${test})`, params);
+        }
+      } else if (filter.field === 'source') {
+        // the channel the deal came from: its first client event (a message, a letter, a call), else made by hand
+        const first = `(SELECT e.type FROM event e WHERE e.deal_id = t0.id AND e.type IN (${Object.keys(SOURCE_BY_EVENT).join(', ')}) ORDER BY e.created_at, e.id LIMIT 1)`;
+        const source = `(CASE ${Object.entries(SOURCE_BY_EVENT).map(([type, name]) => `WHEN ${first} = ${type} THEN '${name}'`).join(' ')} ELSE 'manual' END)`;
+        qb = qb.andWhere(filter.op === 'ne' ? `${source} <> :value${n}` : `${source} = :value${n}`, params);
       } else {
         if (!/^[a-z_][a-z0-9_]*$/.test(filter.field)) {
-          throw new BadRequestException(`Invalid deal filter field: ${filter.field}`);
+          throw new BadRequestException(`Неизвестное поле в условии триггера: ${filter.field}`);
         }
-        qb = qb.andWhere(`CAST(t0.${filter.field} AS TEXT) = :value${n}`, { [`value${n}`]: value });
+        if (NUMERIC_COLUMNS.includes(filter.field) && (!filter.op || filter.op === 'eq' || filter.op === 'ne') && NUMBER.test(value)) {
+          // «бюджет = 777» as numbers: the column is numeric(18,2) and reads «777.00» as text
+          params[`value${n}`] = value.replace(',', '.').trim();
+          const number = `CAST(t0.${filter.field} AS NUMERIC)`;
+          qb = qb.andWhere(
+            filter.op === 'ne' ? `(${number} IS NULL OR ${number} <> CAST(:value${n} AS NUMERIC))` : `${number} = CAST(:value${n} AS NUMERIC)`,
+            params,
+          );
+          continue;
+        }
+        qb = qb.andWhere(TriggerActionsService.compareSql(`t0.${filter.field}`, filter.op, `value${n}`), params);
       }
     }
 
@@ -240,6 +314,27 @@ export class TriggerActionsService {
     }
 
     return qb.getOne();
+  }
+
+  /**
+   * SQL of one condition: `column` against the parameter `param` by `op` — равно (as text), не равно,
+   * больше / меньше (as numbers: a value that is not a number never matches), содержит (any case).
+   */
+  static compareSql(column: string, op: string | undefined, param: string): string {
+    const text = `CAST(${column} AS TEXT)`;
+    const number = `(CASE WHEN ${text} ~ '^\\s*-?[0-9]+([.][0-9]+)?\\s*$' THEN CAST(${text} AS NUMERIC) END)`;
+    switch (op) {
+      case 'ne':
+        return `COALESCE(${text}, '') <> :${param}`;
+      case 'gt':
+        return `${number} > CAST(:${param} AS NUMERIC)`;
+      case 'lt':
+        return `${number} < CAST(:${param} AS NUMERIC)`;
+      case 'contains':
+        return `POSITION(LOWER(:${param}) IN LOWER(COALESCE(${text}, ''))) > 0`;
+      default:
+        return `${text} = :${param}`;
+    }
   }
 
   private async handleCreateTask(
@@ -297,10 +392,12 @@ export class TriggerActionsService {
    *    hour of today's is left;
    *  - whole days («через день», «через 3 дня», «в течение недели»): the end of the working day
    *    that many days later (a day off moves it to the next working day), never at night;
-   *  - other minutes: exactly that much later; 0 = at the moment of the event.
+   *  - other minutes: exactly that much later; «сразу» (0) is TRIGGER_TASK_MIN_MINUTES (30) to react,
+   *    not a task that is overdue as soon as it appears.
    */
   static taskDeadline(data: CreateTaskContents, now = new Date(), schedule = new WorkSchedule()): Date {
-    const minutes = Math.max(0, Number(data?.end_time_in_minutes ?? 0) || 0);
+    const given = Math.max(0, Number(data?.end_time_in_minutes ?? 0) || 0);
+    const minutes = given > 0 ? given : MIN_TASK_MINUTES;
     if (TriggerActionsService.isEndOfDay(data)) return endOfWorkingDay(schedule, now, 30 * 60);
     if (minutes >= DAY_MINUTES && minutes % DAY_MINUTES === 0) {
       const days = minutes / DAY_MINUTES;
@@ -323,7 +420,8 @@ export class TriggerActionsService {
 
   private async getTaskResponsible(deal: Deal, data: TaskResponsible, originatedBy: User): Promise<User> {
     if (data?.exact_user_id) {
-      return this.helperService.getById(User, data.exact_user_id);
+      // a dismissed employee is an error in words, not "User with id 5 does not exist!"
+      return this.employee(data.exact_user_id, 'исполнитель задачи');
     }
     // the frontend used to send "created" for the creator
     if (data?.user === TaskResponsibleEnum.CREATOR || (data?.user as string) === 'created') {
@@ -403,20 +501,77 @@ export class TriggerActionsService {
 
   private async handleChangeAgent(
     deal: Deal,
-    data: ChangeAgentContents,
+    data: ChangeAgentContents & { trigger_id?: number },
     filters: DealFilter[],
     originatedBy: User,
   ): Promise<TriggerOutcome> {
     const targetDeal = await this.getTargetDeal(deal, filters, ['agent']);
     if (!targetDeal) return skipped(NOT_FITTING);
 
-    const agent = await this.helperService.getById(User, data.agent_id);
+    const rotation = (data.rotate_user_ids ?? []).map(Number).filter((id) => id > 0);
+    const agent = rotation.length
+      ? await this.nextInTurn(Number(data.trigger_id ?? 0), rotation)
+      : await this.employee(data.agent_id, 'новый ответственный');
     if (targetDeal.agent?.id === agent.id) return skipped(`ответственный уже ${agent.username}`);
-    const old = targetDeal.agent?.id;
+    const old = targetDeal.agent?.id ?? null;
     targetDeal.agent = agent;
     await this.dealRepository.save(targetDeal);
     this.emitFieldChanges(targetDeal, originatedBy ?? agent, [new Field('agent_id', String(agent.id), old ? String(old) : null)]);
-    return done(`ответственный: ${agent.username}`);
+    const moved = data.transfer_tasks === false ? 0 : await this.transferOpenTasks(targetDeal.id, old, agent.id);
+    return done(`ответственный: ${agent.username}${rotation.length ? ' (по очереди)' : ''}${moved ? `; передано открытых задач: ${moved}` : ''}`);
+  }
+
+  /**
+   * An employee a trigger names, at the moment it runs: a dismissed one or a contact of a client is
+   * an error in words («сотрудник … уволен»), not "User with id 5 does not exist!".
+   */
+  private async employee(id: number, what: string): Promise<User> {
+    const [row] = await this.dataSource.query(`SELECT id, username, role, deleted_at FROM "user" WHERE id = $1`, [Number(id)]);
+    if (!row) throw new Error(`${what} (сотрудник №${id}) удалён — исправьте триггер`);
+    if (row.deleted_at) throw new Error(`${what} «${row.username}» уволен (удалён из CRM) — выберите другого сотрудника в триггере`);
+    if (row.role === RoleEnum.CTR_AGENT) throw new Error(`«${row.username}» — контакт клиента, а не сотрудник: ответственным может быть только сотрудник`);
+    return this.helperService.getById(User, Number(id));
+  }
+
+  /**
+   * «По очереди»: the next employee of the list after the one who got the previous deal of this
+   * trigger (the last one is kept in trigger.data.rotation_last, under a lock of the trigger's row, so
+   * that two deals at once go to two people). Dismissed employees and contacts are passed over.
+   */
+  private async nextInTurn(triggerId: number, ids: number[]): Promise<User> {
+    const people: { id: number }[] = await this.dataSource.query(
+      `SELECT id FROM "user" WHERE id = ANY($1) AND deleted_at IS NULL AND role <> $2`,
+      [ids, RoleEnum.CTR_AGENT],
+    );
+    const usable = ids.filter((id) => people.some((p) => Number(p.id) === id));
+    if (usable.length === 0) throw new Error('в очереди триггера не осталось сотрудников (все уволены) — исправьте триггер');
+    if (!triggerId) return this.helperService.getById(User, usable[0]);
+    const chosen = await this.dataSource.transaction(async (manager) => {
+      const [row] = await manager.query(`SELECT data->>'rotation_last' AS last FROM "trigger" WHERE id = $1 FOR UPDATE`, [triggerId]);
+      const last = Number(row?.last ?? 0);
+      const at = ids.indexOf(last);
+      // the next one in the order of the list after the last, among the usable
+      const order = at < 0 ? ids : [...ids.slice(at + 1), ...ids.slice(0, at + 1)];
+      const next = order.find((id) => usable.includes(id)) ?? usable[0];
+      await manager.query(`UPDATE "trigger" SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{rotation_last}', to_jsonb($2::int)) WHERE id = $1`, [triggerId, next]);
+      return next;
+    });
+    return this.helperService.getById(User, chosen);
+  }
+
+  /**
+   * The open tasks of the deal that the previous responsible had go to the new one; how many. Through
+   * TypeORM, so that the task pages of both refresh themselves (gateway/live-updates.subscriber.ts).
+   */
+  private async transferOpenTasks(dealId: number, from: number | null, to: number): Promise<number> {
+    if (!from || from === to) return 0;
+    const result = await this.taskRepository
+      .createQueryBuilder()
+      .update(Task)
+      .set({ agent: { id: to } as User })
+      .where('deal_id = :deal AND agent_id = :from AND closed_at IS NULL', { deal: dealId, from })
+      .execute();
+    return Number(result?.affected ?? 0);
   }
 
   private async handelChangeField(
@@ -430,6 +585,7 @@ export class TriggerActionsService {
 
     const changes: Field[] = [];
     const missing: string[] = [];
+    let previousAgent: number | null = null;
     const fillerRepository = this.dataSource.getRepository(Filler);
     const dealFillerRepository = this.dataSource.getRepository(DealFiller);
 
@@ -468,15 +624,16 @@ export class TriggerActionsService {
 
       switch (fieldData.field) {
         case 'agent_id': {
-          const agent = await this.helperService.getById(User, Number(value));
+          const agent = await this.employee(Number(value), 'новый ответственный');
           if (targetDeal.agent?.id === agent.id) continue;
           changes.push(new Field('agent_id', String(agent.id), targetDeal.agent ? String(targetDeal.agent.id) : null));
+          previousAgent = targetDeal.agent?.id ?? null;
           targetDeal.agent = agent;
           break;
         }
         case 'budget': {
-          const budget = Number(value);
-          if (!Number.isFinite(budget)) throw new BadRequestException(`Budget "${value}" is not a number`);
+          const budget = Number(String(value).replace(/\s+/g, '').replace(',', '.'));
+          if (!value.trim() || !Number.isFinite(budget)) throw new Error(`бюджет «${value}» — не число: исправьте значение в триггере`);
           if (Number(targetDeal.budget) === budget) continue;
           changes.push(new Field('budget', String(budget), targetDeal.budget === null ? null : String(targetDeal.budget)));
           targetDeal.budget = budget;
@@ -501,10 +658,16 @@ export class TriggerActionsService {
     if (changes.length === 0) return skipped('поля уже имеют эти значения');
     await this.dealRepository.save(targetDeal);
     this.emitFieldChanges(targetDeal, originatedBy ?? targetDeal.agent, changes);
+    // a new responsible gets the open tasks of the deal too (as «Сменить ответственного» does)
+    const moved = previousAgent ? await this.transferOpenTasks(targetDeal.id, previousAgent, targetDeal.agent.id) : 0;
     const names = changes.map((c) =>
       c.name === 'agent_id' ? 'ответственный' : c.name === 'budget' ? 'бюджет' : c.name === 'label' ? 'название' : c.name,
     );
-    return done(`изменено: ${names.join(', ')}` + (missing.length ? `; поля больше нет: ${missing.join(', ')}` : ''));
+    return done(
+      `изменено: ${names.join(', ')}` +
+        (missing.length ? `; поля больше нет: ${missing.join(', ')}` : '') +
+        (moved ? `; передано открытых задач: ${moved}` : ''),
+    );
   }
 
   private emitFieldChanges(deal: Deal, originatedBy: User, fields: Field[]): void {
@@ -532,7 +695,8 @@ export class TriggerActionsService {
     const updatedTasks: Task[] = [];
     for (const task of targetDeal.tasks) {
       if (task.closed_at) continue;
-      if (data.type_id && data.type_id !== task.type?.id) continue;
+      // no type (0 / not set): tasks of any type
+      if (Number(data.type_id) > 0 && Number(data.type_id) !== task.type?.id) continue;
       if (!this.taskFitsDateFilter(data.with_task_end_times ?? [], task.end_time)) continue;
 
       task.closed_at = new Date();
@@ -581,10 +745,11 @@ export class TriggerActionsService {
   }
 
   private async handleSendEmail(deal: Deal, data: SendEmailContents, filters: DealFilter[]): Promise<TriggerOutcome> {
-    const targetDeal = await this.getTargetDeal(deal, filters, ['created_by', 'agent', 'ctr_agents']);
+    const targetDeal = await this.getTargetDeal(deal, filters, ['created_by', 'agent', 'ctr_agents', 'company', 'stage']);
     if (!targetDeal) return skipped(NOT_FITTING);
 
-    const template = await this.helperService.getById(EmailTemplate, data.template_id);
+    const template = await this.dataSource.getRepository(EmailTemplate).findOne({ where: { id: Number(data.template_id) } });
+    if (!template) throw new Error(`шаблон письма (№${data.template_id}) удалён — выберите шаблон в триггере`);
 
     // a chosen user, else every contact of the deal with an email
     const recipients = data.send_to_user_id
@@ -595,49 +760,162 @@ export class TriggerActionsService {
       throw new Error(data.send_to_user_id ? 'у получателя нет адреса почты' : 'у контактов сделки нет адреса почты');
     }
 
-    const sendEmailDto = new SendEmailDto();
-    sendEmailDto.body = template.template_body;
-    sendEmailDto.subject = template.subject ?? template.name ?? '';
-    sendEmailDto.to = to;
-    // in the history of this deal even when it is in a closed stage (the letter of a won deal)
-    sendEmailDto.deal_id = targetDeal.id;
-
     const originatedBy =
       data.from === TaskResponsibleEnum.CREATOR
         ? targetDeal.created_by ?? targetDeal.agent
         : targetDeal.agent ?? targetDeal.created_by;
 
+    const sendEmailDto = new SendEmailDto();
+    // {{клиент}}, {{сделка}}, {{сумма}}, {{менеджер}} ... of this deal (TriggerActionsService.fillPlaceholders)
+    sendEmailDto.body = TriggerActionsService.fillPlaceholders(template.template_body ?? '', targetDeal, true);
+    sendEmailDto.subject = TriggerActionsService.fillPlaceholders(template.subject ?? template.name ?? '', targetDeal, false);
+    sendEmailDto.to = to;
+    // in the history of this deal only, even when it is in a closed stage (the letter of a won deal)
+    sendEmailDto.deal_id = targetDeal.id;
+    // from the sender's own mailbox when it is connected and checked: the client answers the manager,
+    // not the shared box; otherwise (or when the trigger says so) from the shared mailbox
+    const mailbox = data.shared_mailbox ? null : await this.ownMailbox(originatedBy?.id);
+    if (mailbox) sendEmailDto.transporter_id = mailbox.id;
+    // the КП / the invoice uploaded to the deal goes with the letter (attach_extensions)
+    const files = await this.dealAttachments(targetDeal.id, data.attach_extensions ?? []);
+
     // the history of deals gets this letter (NEW_EMAIL) while the trigger runs:
     // TriggerService ignores it, a trigger never fires on what a trigger did.
     // An automatic letter says so (RFC 3834, Exchange): the client's answering machine does not
     // reply to it, so "при письме" cannot ping-pong with it
-    await this.emailService.sendEmail(sendEmailDto, originatedBy, [], {
+    await this.emailService.sendEmail(sendEmailDto, originatedBy, files, {
       signature: true,
       headers: AUTOMATIC_LETTER_HEADERS,
     });
-    return done(`письмо «${sendEmailDto.subject}»: ${to.join(', ')}`);
+    const attached = files.length ? `, вложения: ${files.map((f) => f.originalname).join(', ')}` : '';
+    return done(`письмо «${sendEmailDto.subject}»${mailbox ? ` с ящика ${mailbox.email}` : ''}: ${to.join(', ')}${attached}`);
+  }
+
+  /** ".pdf" for "pdf", "PDF", ".Pdf"; garbage is dropped (the API checks the trigger on save, normalizedExtensions). */
+  static normalizedExtensions(list: unknown[]): string[] {
+    const result: string[] = [];
+    for (const item of list ?? []) {
+      const ext = String(item ?? '').trim().toLowerCase().replace(/^\.*/, '.');
+      if (/^\.[a-z0-9]{1,16}$/.test(ext) && !result.includes(ext)) result.push(ext);
+    }
+    return result;
+  }
+
+  /**
+   * The deal's files of the given extensions for a letter of «Отправить письмо» (the КП, the invoice the
+   * manager uploaded to the deal): the newest first, at most 5 and EMAIL_MAX_ATTACHMENTS_MB (20) together.
+   * Asked for and none in the deal: an error — the letter does not go without its file, and the run, the
+   * deal's history and the admins say why.
+   */
+  private async dealAttachments(dealId: number, extensions: string[]): Promise<Express.Multer.File[]> {
+    const wanted = TriggerActionsService.normalizedExtensions(extensions);
+    if (wanted.length === 0) return [];
+    const rows: { name: string; path: string }[] = await this.dataSource.query(
+      `SELECT f.name, f.path FROM file f JOIN deal_file df ON df."fileId" = f.id
+        WHERE df."dealId" = $1 AND LOWER(COALESCE(f.extension, '')) = ANY($2)
+        ORDER BY f.created_at DESC, f.id DESC LIMIT 20`,
+      [dealId, wanted],
+    );
+    const limit = (Number(process.env.EMAIL_MAX_ATTACHMENTS_MB ?? 20) || 20) * 1024 * 1024;
+    const files: Express.Multer.File[] = [];
+    let total = 0;
+    for (const row of rows) {
+      if (files.length >= 5) break;
+      let buffer: Buffer;
+      try {
+        buffer = await readFile(join(FileService.UPLOADS_DIR, basename(String(row.path))));
+      } catch {
+        continue; // the row is there, the file is gone from the disk
+      }
+      if (total + buffer.length > limit) continue;
+      total += buffer.length;
+      files.push({
+        fieldname: 'files',
+        originalname: row.name,
+        encoding: '7bit',
+        mimetype: 'application/octet-stream',
+        size: buffer.length,
+        buffer,
+      } as Express.Multer.File);
+    }
+    if (files.length === 0) {
+      throw new Error(`в сделке нет файла ${wanted.join(', ')} для письма — загрузите его в сделку; письмо не отправлено`);
+    }
+    return files;
+  }
+
+  /** The sender's own mailbox that the mail server accepted (verified_at), if any. */
+  private async ownMailbox(userId?: number): Promise<{ id: number; email: string } | null> {
+    if (!userId) return null;
+    const [row] = await this.dataSource.query(
+      `SELECT id, email FROM email_transporter WHERE user_id = $1 AND verified_at IS NOT NULL ORDER BY id LIMIT 1`,
+      [userId],
+    );
+    return row ? { id: Number(row.id), email: row.email } : null;
+  }
+
+  /**
+   * The placeholders of a letter or a message of a trigger, filled in with the deal (`html`: the values
+   * are escaped for an HTML body). Russian or Latin names, any case and spaces: {{клиент}} / {{client}},
+   * {{компания}}, {{сделка}}, {{номер}}, {{сумма}}, {{менеджер}}, {{этап}}, {{ссылка}}. An unknown one stays.
+   */
+  static fillPlaceholders(text: string, deal: Deal, html: boolean): string {
+    const contact = (deal.ctr_agents ?? [])[0];
+    const budget = deal.budget === null || deal.budget === undefined || String(deal.budget) === '' ? '' : Number(deal.budget).toLocaleString('ru-RU');
+    const base = (process.env.CRM_PUBLIC_URL || '').replace(/\/+$/, '');
+    const values: Record<string, string> = {
+      'клиент': contact?.username ?? '',
+      'контакт': contact?.username ?? '',
+      client: contact?.username ?? '',
+      contact: contact?.username ?? '',
+      'компания': deal.company?.name ?? '',
+      company: deal.company?.name ?? '',
+      'сделка': deal.label ?? '',
+      deal: deal.label ?? '',
+      'номер': deal.display_id ? String(deal.display_id) : '',
+      'номер сделки': deal.display_id ? String(deal.display_id) : '',
+      number: deal.display_id ? String(deal.display_id) : '',
+      'сумма': budget,
+      'бюджет': budget,
+      budget,
+      'менеджер': deal.agent?.username ?? '',
+      'ответственный': deal.agent?.username ?? '',
+      manager: deal.agent?.username ?? '',
+      'этап': deal.stage?.name ?? '',
+      stage: deal.stage?.name ?? '',
+      'ссылка': base ? `${base}/deals/${deal.id}` : '',
+      link: base ? `${base}/deals/${deal.id}` : '',
+    };
+    const escape = (v: string) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return String(text ?? '').replace(/\{\{\s*([^{}]{1,40}?)\s*\}\}/g, (all, name: string) => {
+      const key = name.toLowerCase().replace(/\s+/g, ' ');
+      if (!(key in values)) return all;
+      return html ? escape(values[key]) : values[key];
+    });
   }
 
   /**
    * "Создать сделку": a copy of the deal (client, company, responsible) in another stage.
-   * The copy gets the triggers of its stage (`onDealCreated`), but never another copy (depth limit).
+   * The copy gets the triggers of its stage (`onDealCreated`), but never another copy (chain.copies).
    */
   private async handleCreateDeal(
     deal: Deal,
     data: CreateDealContents,
     filters: DealFilter[],
     originatedBy: User,
-    depth: number,
+    chain: TriggerChain,
     onDealCreated: OnDealCreated,
+    stageName?: string,
   ): Promise<TriggerOutcome> {
-    if (depth >= MAX_CREATE_DEAL_DEPTH) {
+    if (chain.copies >= MAX_CREATE_DEAL_DEPTH) {
       this.logger.warn(`create deal trigger skipped for deal ${deal.id}: a copy of a copy`);
       return skipped('сделка сама создана триггером: копия копии не создаётся');
     }
     const targetDeal = await this.getTargetDeal(deal, filters, ['agent', 'company', 'ctr_agents', 'created_by']);
     if (!targetDeal) return skipped(NOT_FITTING);
 
-    const stage = await this.helperService.getById(DealStage, data.stage_id);
+    const stage = await this.dataSource.getRepository(DealStage).findOne({ where: { id: Number(data.stage_id) } });
+    if (!stage) throw new Error(`этап (№${data.stage_id}) для новой сделки удалён — выберите этап в триггере`);
     const newDeal = new Deal();
     newDeal.label = (data.label || '').trim() || `${targetDeal.label} (копия)`;
     newDeal.budget = targetDeal.budget;
@@ -647,6 +925,8 @@ export class TriggerActionsService {
     newDeal.created_by = originatedBy ?? targetDeal.created_by ?? targetDeal.agent;
     newDeal.stage = stage;
     newDeal.last_stage_change = new Date();
+    // a copy made right in «успешно реализовано» / «закрыто и не реализовано» is closed (DEAL-2)
+    if (isClosingStage(stage)) newDeal.closed_at = new Date();
     // the next sequential number is given while saving
     const saved = await this.helperService.saveNewDeal(newDeal);
 
@@ -655,9 +935,174 @@ export class TriggerActionsService {
     record.stage = stage;
     await this.dataSource.getRepository(DealStageRecord).save(record);
 
+    // the order goes on in production with its article, parameters and items: the custom fields and
+    // the products of the deal come with it (unless the trigger says no)
+    const copied: string[] = [];
+    if (data.copy_fields !== false) {
+      const rows = await this.dataSource.query(
+        `INSERT INTO deal_filler (deal_id, filler_id, value)
+         SELECT $2, df.filler_id, df.value FROM deal_filler df JOIN filler f ON f.id = df.filler_id
+          WHERE df.deal_id = $1 AND f.target = 'deal' RETURNING id`,
+        [targetDeal.id, saved.id],
+      );
+      if (rows?.length) copied.push(`доп. поля: ${rows.length}`);
+    }
+    if (data.copy_products !== false) {
+      const rows = await this.dataSource.query(
+        `INSERT INTO deal_product (deal_id, product_id, quantity, price)
+         SELECT $2, product_id, quantity, price FROM deal_product WHERE deal_id = $1 ORDER BY id RETURNING id`,
+        [targetDeal.id, saved.id],
+      );
+      if (rows?.length) copied.push(`товары: ${rows.length}`);
+    }
+    // both deals say where the other one is
+    const number = (d: Deal) => `№${d.display_id ?? d.id}`;
+    await this.noteInDeal(saved.id, `Сделка создана автоматикой из сделки ${number(targetDeal)} «${targetDeal.label}»${stageName ? ` (триггер этапа «${stageName}»)` : ''}`, {
+      source_deal_id: targetDeal.id,
+    });
+    await this.noteInDeal(targetDeal.id, `Автоматика создала сделку ${number(saved)} «${saved.label}» в этапе «${stage.name}»`, {
+      copy_deal_id: saved.id,
+    });
+
     this.eventEmitter.emit(EventTypes.NEW_DEAL.toString(), { deal: saved });
-    await onDealCreated(newDeal.created_by, saved, stage, depth + 1);
-    return done(`создана сделка №${saved.display_id ?? saved.id} «${saved.label}» в этапе «${stage.name}»`);
+    await onDealCreated(newDeal.created_by, saved, stage, { moves: chain.moves, copies: chain.copies + 1 });
+    return done(`создана сделка ${number(saved)} «${saved.label}» в этапе «${stage.name}»${copied.length ? ` (${copied.join(', ')})` : ''}`);
+  }
+
+  /**
+   * «Перевести в этап»: the deal goes to another stage the way a manager moves it (closed in a closing
+   * stage, open again elsewhere, the stage history, the NEW_DEAL_STAGE event) and gets the triggers of
+   * that stage one step further. A chain of moves is cut at MAX_MOVE_DEPTH (no ping-pong of two stages).
+   */
+  private async handleMoveStage(
+    deal: Deal,
+    data: MoveStageContents,
+    filters: DealFilter[],
+    originatedBy: User,
+    chain: TriggerChain,
+    onDealEntered: OnDealCreated,
+  ): Promise<TriggerOutcome> {
+    if (chain.moves >= MAX_MOVE_DEPTH) {
+      this.logger.warn(`move stage trigger skipped for deal ${deal.id}: a chain of ${chain.moves} moves`);
+      return skipped('сделку уже перевели другие триггеры: цепочка переходов прервана (защита от зацикливания)');
+    }
+    const targetDeal = await this.getTargetDeal(deal, filters, ['stage', 'agent', 'created_by']);
+    if (!targetDeal) return skipped(NOT_FITTING);
+    const stage = await this.dataSource.getRepository(DealStage).findOne({ where: { id: Number(data.stage_id) } });
+    if (!stage) throw new Error(`этап (№${data.stage_id}), куда триггер переводит сделку, удалён — выберите этап в триггере`);
+    if (targetDeal.stage?.id === stage.id) return skipped(`сделка уже в этапе «${stage.name}»`);
+
+    const oldStage = targetDeal.stage ?? null;
+    const now = new Date();
+    const closedAt = isClosingStage(stage) ? now : null;
+    // through the entity (as DealService moves a deal): the kanban and the deal page refresh themselves
+    // (gateway/live-updates.subscriber.ts) and the journal sees the change; only stage, agent and author
+    // are loaded, so nothing else of the deal is written
+    targetDeal.stage = stage;
+    targetDeal.last_stage_change = now;
+    targetDeal.closed_at = closedAt;
+    await this.dealRepository.save(targetDeal);
+    // the stage history: how long the deal stayed in the previous stage, then the new record
+    await this.dataSource.query(
+      `UPDATE deal_stage_record SET moved_after_minutes = GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at)) / 60))
+        WHERE id = (SELECT id FROM deal_stage_record WHERE deal_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1)`,
+      [targetDeal.id],
+    );
+    const record = new DealStageRecord();
+    record.deal = targetDeal;
+    record.stage = stage;
+    record.from_stage = oldStage;
+    record.moved_by = null;
+    await this.dataSource.getRepository(DealStageRecord).save(record);
+
+    const eventData = new DealStageEventDto();
+    eventData.deal = targetDeal;
+    eventData.new_stage = stage;
+    eventData.old_stage = oldStage;
+    eventData.originated_by = originatedBy ?? targetDeal.agent;
+    // the history gets this move after the one that brought the deal here: the request that moved it
+    // announces its own move only when the triggers of that stage (this one) are done
+    setImmediate(() => this.eventEmitter.emit(EventTypes.NEW_DEAL_STAGE.toString(), eventData));
+
+    await onDealEntered(originatedBy ?? targetDeal.agent, targetDeal, stage, { moves: chain.moves + 1, copies: chain.copies });
+    return { status: 'done', note: `сделка переведена в этап «${stage.name}»${oldStage ? ` из «${oldStage.name}»` : ''}`, moved: true };
+  }
+
+  /**
+   * «Уведомить»: a message to the responsible, the managers (admins and managers) or a chosen employee
+   * in the CRM bot (BotWaitingService, TRIGGER_NOTIFY); whoever the bot could not tell gets a task with
+   * the text in the deal instead, so that nothing is lost.
+   */
+  private async handleNotify(deal: Deal, data: NotifyContents, filters: DealFilter[], originatedBy: User): Promise<TriggerOutcome> {
+    const targetDeal = await this.getTargetDeal(deal, filters, ['agent', 'company', 'ctr_agents', 'stage', 'created_by']);
+    if (!targetDeal) return skipped(NOT_FITTING);
+    const ids = new Set<number>();
+    if (data.user_id) {
+      ids.add((await this.employee(Number(data.user_id), 'получатель уведомления')).id);
+    } else {
+      const to = data.to ?? NotifyWhomEnum.RESPONSIBLE;
+      if (to !== NotifyWhomEnum.MANAGERS && targetDeal.agent?.id) ids.add(targetDeal.agent.id);
+      if (to !== NotifyWhomEnum.RESPONSIBLE) {
+        const bosses: { id: number }[] = await this.dataSource.query(
+          `SELECT id FROM "user" WHERE role IN ($1, $2) AND deleted_at IS NULL`,
+          [RoleEnum.ADMIN, RoleEnum.MANAGER],
+        );
+        bosses.forEach((b) => ids.add(Number(b.id)));
+      }
+    }
+    // only those who work here: the responsible of an old deal may have been dismissed
+    if (ids.size) {
+      const active: { id: number }[] = await this.dataSource.query(
+        `SELECT id FROM "user" WHERE id = ANY($1) AND deleted_at IS NULL AND role <> $2`,
+        [[...ids], RoleEnum.CTR_AGENT],
+      );
+      const keep = new Set(active.map((u) => Number(u.id)));
+      [...ids].forEach((id) => { if (!keep.has(id)) ids.delete(id); });
+    }
+    if (ids.size === 0) return skipped('некого уведомить: у сделки нет ответственного (или он уволен)');
+
+    const text = TriggerActionsService.fillPlaceholders(data.text, targetDeal, false).trim();
+    const base = (process.env.CRM_PUBLIC_URL || '').replace(/\/+$/, '');
+    const message = `${text}\nСделка №${targetDeal.display_id ?? targetDeal.id} «${targetDeal.label}»${base ? `\n${base}/deals/${targetDeal.id}` : ''}`;
+    const payload: TriggerNotification = { user_ids: [...ids], text: message, deal_id: targetDeal.id };
+    let told = new Set<number>();
+    try {
+      const answers = await this.eventEmitter.emitAsync(TRIGGER_NOTIFY, payload);
+      told = new Set((answers ?? []).flat().filter((id) => Number.isFinite(Number(id))).map(Number));
+    } catch (error) {
+      this.logger.warn(`notify trigger: the bot failed for deal ${targetDeal.id}: ${(error as Error).message}`);
+    }
+    const missed = [...ids].filter((id) => !told.has(id));
+    for (const id of missed) {
+      await this.createTaskFor(targetDeal, id, `Авто: ${text}`.slice(0, 255), originatedBy);
+    }
+    return done(`уведомление: в бот ${told.size}${missed.length ? `, задачей в CRM ${missed.length} (бот не подключён)` : ''}`);
+  }
+
+  /**
+   * A task of the automation for one employee in the deal (due by the end of the working day); not a
+   * second one while the same task of this employee is open (a notification of every unanswered message).
+   */
+  private async createTaskFor(deal: Deal, userId: number, label: string, originatedBy: User): Promise<void> {
+    const open = await this.dataSource.query(
+      `SELECT 1 FROM task WHERE deal_id = $1 AND agent_id = $2 AND closed_at IS NULL AND label = $3 LIMIT 1`,
+      [deal.id, userId, label],
+    );
+    if (open.length) return;
+    const agent = await this.helperService.getById(User, userId);
+    const now = new Date();
+    const task = new Task();
+    task.agent = agent;
+    task.created_by = originatedBy ?? deal.created_by ?? deal.agent ?? agent;
+    task.deal = deal;
+    task.company = deal.company ?? null;
+    task.type = await defaultTaskType(this.taskRepository.manager);
+    task.allDay = false;
+    task.start_time = now;
+    task.end_time = endOfWorkingDay(new WorkSchedule(), now, 30 * 60);
+    task.label = label;
+    const saved = await this.taskRepository.save(task);
+    this.eventEmitter.emit(EventTypes.NEW_TASK.toString(), { task: saved, deal, originated_by: task.created_by } as TaskEventDto);
   }
 
   /** Minutes from `lastStageChangeDate` to `inputDate` (kept for the old callers). */

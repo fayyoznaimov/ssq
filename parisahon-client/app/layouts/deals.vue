@@ -71,7 +71,7 @@
         </div>
         <Toast id="GlobalToast" />
         <template #toolbar-title>
-            Parisa CRM
+            {{ pageTitle }}
         </template>
     </TairoCollapseLayout>
 </template>
@@ -81,6 +81,11 @@ import PerPageSelect from '~/components/common/PerPageSelect.vue';
 import Search from '~/components/common/Search.vue';
 import Toast from '~/components/common/Toast.vue';
 import TairoCollapseLayout from '~/components/tairo/TairoCollapseLayout.vue';
+
+// the header names the page («Сделки», the name of an open company), not the CRM; a page without a title
+// of its own gets it in the tab too (its own useHead comes later and wins)
+const pageTitle = usePageTitle();
+useHead({ title: pageTitle });
 
 const route = useRoute();
 const app = useAppConfig();

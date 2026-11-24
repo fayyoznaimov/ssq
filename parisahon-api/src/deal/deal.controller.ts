@@ -126,7 +126,10 @@ export class DealController {
     if (!new Access(request['user']).can('deal', 'create')) {
       throw new ForbiddenException('No right to create deals');
     }
-    return instanceToPlain(this.dealService.create(request['user'].sub, data));
+    // ACL-4: only companies and contacts the user may see are linked
+    return instanceToPlain(
+      this.dealService.create(request['user'].sub, data, { linkedBy: request['user'] }),
+    );
   }
 
   @Post(':id/comments')

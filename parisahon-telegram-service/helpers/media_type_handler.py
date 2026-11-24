@@ -5,6 +5,7 @@ import pyrogram
 from typing import List
 from .file import File
 from .Logger import Logger
+from . import converter as ffmpeg_lookup
 import random
 import string
 from pydub import AudioSegment
@@ -103,10 +104,12 @@ def determine_file_format(file_path: str) -> str:
 
 
 def convert_ogg_to_mp3(source: str, target: str) -> None:
-    """ffmpeg through pydub; blocking, so the listener runs it in a worker thread."""
-    if os.environ.get('USE_CUSTOM_FFMPEG_INSTALLATION') == 'true':
-        AudioSegment.converter = f"{os.environ.get('FFMPEG_INSTALLATION_DIR')}/ffmpeg"
-        AudioSegment.ffprobe = f"{os.environ.get('FFMPEG_INSTALLATION_DIR')}/ffprobe"
+    """ffmpeg through pydub; blocking, so the listener runs it in a worker thread. FFMPEG_BIN (helpers/converter.py)."""
+    binary, probe, ok, tried = ffmpeg_lookup.find()
+    if not ok:
+        raise RuntimeError(f"ffmpeg not found ({'; '.join(tried)}): set FFMPEG_BIN")
+    AudioSegment.converter = binary
+    AudioSegment.ffprobe = probe
     AudioSegment.from_ogg(source).export(target, format="mp3")
 
 

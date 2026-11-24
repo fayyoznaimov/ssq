@@ -43,7 +43,7 @@ class FakeApi:
 
     def __init__(self, service_token="service-token-0123456789"):
         self.service_token = service_token
-        self.tokens = {}            # recorder token -> (user id, CRM name)
+        self.tokens = {}            # recorder token -> (user id, CRM name[, FTPS only])
         self.uploads = []           # what reached the queue: dicts
         self.posts = 0              # every POST /calls/upload, whatever the answer
         self.recorder_calls = 0
@@ -80,7 +80,7 @@ class FakeApi:
                     return self.answer(forced, {"statusCode": forced, "message": "forced"})
                 if not who:
                     return self.answer(401, {"statusCode": 401, "message": "Unauthorized"})
-                self.answer(200, {"user_id": who[0], "username": who[1]})
+                self.answer(200, {"user_id": who[0], "username": who[1], "tls_required": bool(who[2]) if len(who) > 2 else False})
 
             def do_POST(self):
                 body = self.rfile.read(int(self.headers.get("Content-Length") or 0))

@@ -1,12 +1,13 @@
 <template>
-    <div class="flex">
+    <!-- one line on a phone too («25 | На / страницу» took two) -->
+    <div class="flex shrink-0 whitespace-nowrap" title="Строк на странице">
         <BaseButton class="flex items-center !px-3 !rounded-r-none !border-e-0">
             {{ props.modelValue }}
         </BaseButton>
         <BaseDropdown
-            class="per-page-select"
+            class="per-page-select [&_button]:whitespace-nowrap"
             flavor="button"
-            label="На страницу"
+            :label="isPhone ? 'на стр.' : 'На страницу'"
             orientation="start"
         >
             <BaseDropdownItem
@@ -20,9 +21,12 @@
 </template>
 
 <script lang="ts" setup>
+import { useMediaQuery } from '@vueuse/core';
+
 const props = defineProps<{ modelValue: number }>();
 const emit = defineEmits(['update:modelValue']);
 const options = [10, 25, 50, 100];
+const isPhone = useMediaQuery('(max-width: 639px)');
 </script>
 
 <style lang="scss">

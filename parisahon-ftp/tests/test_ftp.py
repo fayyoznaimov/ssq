@@ -425,6 +425,37 @@ class TlsTest(FtpCase):
         self.assertEqual(sorted(self.fake.names()), ["over tls.wav", "plain.wav"])
 
 
+@unittest.skipUnless(shutil.which("openssl"), "no openssl")
+class TlsOnlyTokenTest(FtpCase):
+    """The admin marked a token "FTPS only" (GET /calls/recorder answers tls_required)."""
+    tls = True
+
+    def setUp(self):
+        super().setUp()
+        self.fake.tokens[TOKEN_A] = (5, "Алишер", True)
+
+    def test_plain_session_is_refused_and_ftps_needs_prot_p(self):
+        plain = self.connect()
+        with self.assertLogs("ftp.server", "WARNING") as logs:
+            with self.assertRaises(ftplib.error_perm) as raised:
+                plain.login("crm", TOKEN_A)
+            self.wait_for(lambda: logs.output)
+        self.assertTrue(str(raised.exception).startswith("530"), str(raised.exception))
+        self.assertIn("ftps", str(raised.exception).lower())  # pyftpdlib lower-cases the reason
+        self.assertIn("this token is FTPS only", logs.output[0])
+        secure = self.connect(ftplib.FTP_TLS, context=ssl._create_unverified_context())
+        secure.login("crm", TOKEN_A)
+        with self.assertRaises(ftplib.error_perm) as raised:
+            secure.storbinary("STOR clear.wav", io.BytesIO(b"c" * 100))
+        self.assertTrue(str(raised.exception).startswith("550"), "without PROT P the recording would cross the network in clear")
+        secure.prot_p()
+        secure.storbinary("STOR over tls.wav", io.BytesIO(b"t" * 2000))
+        self.assertTrue(self.received(5, "over tls.wav"))
+        # another manager's token without the mark still works over plain FTP
+        self.login(TOKEN_B).storbinary("STOR plain.wav", io.BytesIO(b"p" * 2000))
+        self.assertTrue(self.received(6, "plain.wav"))
+
+
 class PlainNetworksTest(FtpCase):
     plain_networks = parse_networks("10.99.0.0/16")
 

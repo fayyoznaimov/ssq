@@ -13,6 +13,15 @@ import { HelperService } from 'src/helper/helper.service';
 import { DealStageCollection } from './deal_stage.collection.entity';
 import { CreateCollectionDto } from './dto/create.collection.dto';
 import { FetchQueryDto } from './dto/fetch.query.dto';
+import {
+  CLOSING_STAGE_KINDS,
+  defaultStageName,
+  isClosingStage,
+  isSystemStage,
+  StageKind,
+  SYSTEM_STAGE_KINDS,
+} from './stage-kind';
+import { AuditJournal } from '../audit/audit-journal';
 
 /**
  * What references a set of stages. Deals reference their current stage,
@@ -26,16 +35,12 @@ type StageUsage = {
   is_default_stage: boolean;
 };
 
+/**
+ * Stages and pipelines (collections). What a stage means is its kind (stage-kind.ts): the
+ * names are labels only.
+ */
 @Injectable()
 export class DealStageService {
-  public static defaultStageNames: string[] = [
-    process.env.DEAL_STAGE_UNKNOWN,
-    process.env.DEAL_STAGE_CREATED,
-    process.env.DEAL_STAGE_CLOSED,
-    process.env.DEAL_STAGE_CLOSED_NOT_REALIZED,
-    process.env.DEAL_STAGE_PREPAYMENT,
-  ];
-
   constructor(
     @InjectRepository(DealStage)
     private dealStageRepository: Repository<DealStage>,
@@ -66,9 +71,12 @@ export class DealStageService {
       .addOrderBy('t0.id', 'ASC')
       .getMany();
 
-    // the kanban and the settings page tell the closing columns apart (won / lost)
+    // the kanban and the settings page tell the closing columns apart (won / lost) and the system
+    // stages (no delete, no move to another pipeline); `kind` itself is a column of the stage
     for (const stage of stages) {
-      (stage as DealStage & { is_closing?: boolean }).is_closing = this.isClosingStage(stage);
+      const extra = stage as DealStage & { is_closing?: boolean; is_system?: boolean };
+      extra.is_closing = this.isClosingStage(stage);
+      extra.is_system = isSystemStage(stage);
     }
 
     return stages;
@@ -77,8 +85,9 @@ export class DealStageService {
   /**
    * Stage for deals created without an explicit stage (Telegram, WhatsApp, calls, mail, the bot):
    * the one chosen in «Настроить воронку» when it belongs to the active collection; a stage of a
-   * collection that is not active any more is replaced by the stage of the same name of the active
-   * one; otherwise (and instead of a closing stage) the "unknown" stage of the active collection.
+   * collection that is not active any more is replaced by its counterpart in the active one (same
+   * kind for a system stage, same name for another); otherwise (and instead of a closing stage) the
+   * stage of kind `new` («Неразобранное») of the active collection.
    * Null when nothing fits (no active collection and nothing chosen).
    */
   async findDefaultStage(): Promise<DealStage | null> {
@@ -102,8 +111,8 @@ export class DealStageService {
     }
 
     return (
-      (usable ? await this.stageOfCollection(this.dataSource.manager, active.id, usable.name) : null) ??
-      (await this.stageOfCollection(this.dataSource.manager, active.id, process.env.DEAL_STAGE_UNKNOWN))
+      (usable ? await this.counterpartIn(this.dataSource.manager, active.id, usable) : null) ??
+      (await this.stageOfKind(active.id, StageKind.NEW, this.dataSource.manager))
     );
   }
 
@@ -153,20 +162,50 @@ export class DealStageService {
     return stage;
   }
 
-  /** The stage named `name` of a collection (null for no name / no such stage). */
-  private async stageOfCollection(
+  /**
+   * The stage of a kind in a pipeline (null when it has none). Without a pipeline: in the active one.
+   * The helper other modules use instead of the old DEAL_STAGE_* names.
+   */
+  async stageOfKind(
+    collectionId: number | null,
+    kind: StageKind,
+    manager: EntityManager = this.dataSource.manager,
+  ): Promise<DealStage | null> {
+    const qb = manager
+      .createQueryBuilder(DealStage, 't0')
+      .where('t0.kind = :kind', { kind })
+      .orderBy('t0.id', 'ASC');
+    if (collectionId) {
+      qb.andWhere('t0.collection_id = :collection_id', { collection_id: collectionId });
+    } else {
+      qb.innerJoin('t0.collection', 'c').andWhere('c.is_active = true');
+    }
+    return qb.getOne();
+  }
+
+  /**
+   * The stage of another pipeline that stands for `stage`: of the same kind for a system stage,
+   * of the same name for a stage of an admin (null when there is none).
+   */
+  private async counterpartIn(
     manager: EntityManager,
     collectionId: number,
-    name: string | null | undefined,
+    stage: Pick<DealStage, 'name' | 'kind'> | null | undefined,
   ): Promise<DealStage | null> {
-    if (!name) {
+    if (!stage) {
+      return null;
+    }
+    if (isSystemStage(stage)) {
+      return this.stageOfKind(collectionId, stage.kind, manager);
+    }
+    if (!stage.name) {
       return null;
     }
 
     return manager
       .createQueryBuilder(DealStage, 't0')
       .where('t0.collection_id = :collection_id', { collection_id: collectionId })
-      .andWhere('t0.name = :name', { name })
+      .andWhere('t0.name = :name', { name: stage.name })
       .orderBy('t0.id', 'ASC')
       .getOne();
   }
@@ -276,8 +315,16 @@ export class DealStageService {
       );
     }
 
-    // Stages and their triggers are removed by ON DELETE CASCADE
-    await this.collectionRepository.delete(collection.id);
+    // Stages and their triggers are removed by ON DELETE CASCADE (the journal keeps their last state)
+    await AuditJournal.around(this.dataSource, 'stage', 't.collection_id = $1', [collection.id], () =>
+      AuditJournal.around(
+        this.dataSource,
+        'trigger',
+        't.deal_stage_id IN (SELECT s.id FROM deal_stage s WHERE s.collection_id = $1)',
+        [collection.id],
+        () => this.collectionRepository.delete(collection.id),
+      ),
+    );
   }
 
   async getCollectionStages(id: number): Promise<DealStage[]> {
@@ -330,21 +377,23 @@ export class DealStageService {
       }
 
       const next =
-        (await this.stageOfCollection(manager, targetCollection.id, setting.default_stage?.name)) ??
-        (await this.stageOfCollection(manager, targetCollection.id, process.env.DEAL_STAGE_UNKNOWN));
+        (await this.counterpartIn(manager, targetCollection.id, setting.default_stage)) ??
+        (await this.stageOfKind(targetCollection.id, StageKind.NEW, manager));
       await manager.update(Setting, setting.id, {
         default_stage: next ? ({ id: next.id } as DealStage) : null,
       });
     });
   }
 
+  /** The system stages of a new pipeline (named by DEAL_STAGE_* of .env or the usual names). */
   createDefaultStageEntities(): DealStage[] {
     const stages = [];
 
     let counter = 1;
-    for (const name of DealStageService.defaultStageNames) {
+    for (const kind of SYSTEM_STAGE_KINDS) {
       const newStage = new DealStage();
-      newStage.name = name;
+      newStage.name = defaultStageName(kind);
+      newStage.kind = kind;
       newStage.order = counter++;
 
       stages.push(newStage);
@@ -411,8 +460,10 @@ export class DealStageService {
         }
       }
 
+      // a stage of an admin; the system kinds come with the pipeline
       const newDealStage = new DealStage();
       newDealStage.name = data.name;
+      newDealStage.kind = StageKind.WORK;
       newDealStage.order = order;
       newDealStage.description = data.description;
       newDealStage.color = data.color;
@@ -442,22 +493,18 @@ export class DealStageService {
       throw new BadRequestException('Stage with this name already exists!');
     }
 
-    const isChangingDefaultStage = DealStageService.defaultStageNames.includes(
-      targetDealStage.name,
-    );
-
+    // a system stage stays in its pipeline (every pipeline needs one of each kind); its name is
+    // only a label and can be changed: the code goes by the kind
     if (
       targetDealStage.collection?.id !== data.collection_id &&
-      !isChangingDefaultStage
+      !isSystemStage(targetDealStage)
     ) {
       targetDealStage.collection = await this.helperService.getById(
         DealStageCollection,
         data.collection_id,
       );
     }
-    if (!isChangingDefaultStage) {
-      targetDealStage.name = data.name;
-    }
+    targetDealStage.name = data.name;
     /**
      * Order is not checked for uniqueness here on purpose: the settings page
      * reorders stages by sending a new order for every stage of the collection.
@@ -501,7 +548,10 @@ export class DealStageService {
     const reasons = this.describeStageUsage(usage);
 
     if (reasons.length === 0) {
-      await this.dealStageRepository.delete(stage.id);
+      // its triggers go by ON DELETE CASCADE: the journal keeps their last state
+      await AuditJournal.around(this.dataSource, 'trigger', 't.deal_stage_id = $1', [stage.id], () =>
+        this.dealStageRepository.delete(stage.id),
+      );
       return;
     }
 
@@ -531,38 +581,47 @@ export class DealStageService {
       );
     }
 
-    const isClosingStage = this.getClosedStageNames().includes(
-      targetStage.name,
-    );
+    const closing = this.isClosingStage(targetStage);
 
     await this.dataSource.transaction(async (manager) => {
-      if (isClosingStage) {
-        // closed_at is written by the application clock everywhere else
-        await manager.query(
-          `UPDATE deal SET stage_id = $1, closed_at = COALESCE(closed_at, $3) WHERE stage_id = $2`,
-          [targetStage.id, stage.id, new Date()],
-        );
-      } else {
-        // a working stage: its deals are open (closed_at means closed everywhere)
-        await manager.query(
-          `UPDATE deal SET stage_id = $1, closed_at = NULL WHERE stage_id = $2`,
-          [targetStage.id, stage.id],
-        );
-      }
+      // the journal (src/audit): every moved deal gets its row «Этап: … → …» in this transaction
+      await AuditJournal.around(manager, 'deal', 't.stage_id = $1', [stage.id], async () => {
+        if (closing) {
+          // closed_at is written by the application clock everywhere else
+          await manager.query(
+            `UPDATE deal SET stage_id = $1, closed_at = COALESCE(closed_at, $3) WHERE stage_id = $2`,
+            [targetStage.id, stage.id, new Date()],
+          );
+        } else {
+          // a working stage: its deals are open (closed_at means closed everywhere)
+          await manager.query(
+            `UPDATE deal SET stage_id = $1, closed_at = NULL WHERE stage_id = $2`,
+            [targetStage.id, stage.id],
+          );
+        }
+      });
 
       await manager.query(
         `UPDATE deal_stage_record SET stage_id = $1 WHERE stage_id = $2`,
         [targetStage.id, stage.id],
       );
+      await manager.query(
+        `UPDATE deal_stage_record SET from_stage_id = $1 WHERE from_stage_id = $2`,
+        [targetStage.id, stage.id],
+      );
 
-      // Triggers of the stage are removed by ON DELETE CASCADE
-      await manager.delete(DealStage, stage.id);
+      // Triggers of the stage are removed by ON DELETE CASCADE (the journal keeps their last state)
+      await AuditJournal.around(manager, 'trigger', 't.deal_stage_id = $1', [stage.id], () =>
+        manager.delete(DealStage, stage.id),
+      );
     });
   }
 
   private throwIfDefaultStage(stage: DealStage): void {
-    if (DealStageService.defaultStageNames.includes(stage.name)) {
-      throw new BadRequestException('Not allowed to modify predefined stages!');
+    if (isSystemStage(stage)) {
+      throw new BadRequestException(
+        `Этап «${stage.name}» системный: он нужен каждой воронке, удалить его нельзя (переименовать можно)`,
+      );
     }
   }
 
@@ -580,7 +639,7 @@ export class DealStageService {
       `SELECT
         (SELECT COUNT(*) FROM deal WHERE stage_id = ANY($1::int[]) AND deleted_at IS NULL) AS deals,
         (SELECT COUNT(*) FROM deal WHERE stage_id = ANY($1::int[]) AND deleted_at IS NOT NULL) AS deleted_deals,
-        (SELECT COUNT(*) FROM deal_stage_record WHERE stage_id = ANY($1::int[])) AS history_records,
+        (SELECT COUNT(*) FROM deal_stage_record WHERE stage_id = ANY($1::int[]) OR from_stage_id = ANY($1::int[])) AS history_records,
         (SELECT COUNT(*) FROM setting WHERE default_stage_id = ANY($1::int[])) AS default_stage_settings`,
       [stageIds],
     );
@@ -615,29 +674,19 @@ export class DealStageService {
     return reasons;
   }
 
-  /** Names of the stages that close a deal: «успешно реализовано» and «закрыто и не реализовано». */
-  getClosedStageNames(): string[] {
-    return [
-      process.env.DEAL_STAGE_CLOSED,
-      process.env.DEAL_STAGE_CLOSED_NOT_REALIZED,
-    ].filter(Boolean);
-  }
-
-  /** A deal in this stage is closed (deal.closed_at is set); in any other one it is open. */
-  isClosingStage(stage: Pick<DealStage, 'name'> | null | undefined): boolean {
-    return !!stage && this.getClosedStageNames().includes(stage.name);
+  /**
+   * A deal in this stage is closed (deal.closed_at is set); in any other one it is open:
+   * kind won («успешно реализовано») or lost («закрыто и не реализовано»).
+   */
+  isClosingStage(stage: Pick<DealStage, 'kind'> | null | undefined): boolean {
+    return isClosingStage(stage);
   }
 
   /** Ids of the closing stages of all collections. */
   async closingStageIds(): Promise<number[]> {
-    const names = this.getClosedStageNames();
-    if (names.length === 0) {
-      return [];
-    }
-
     const rows: { id: number }[] = await this.dataSource.query(
-      `SELECT id FROM deal_stage WHERE name = ANY($1::text[])`,
-      [names],
+      `SELECT id FROM deal_stage WHERE kind = ANY($1::text[])`,
+      [CLOSING_STAGE_KINDS],
     );
 
     return rows.map((row) => Number(row.id));

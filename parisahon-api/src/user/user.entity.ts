@@ -72,7 +72,8 @@ interface Permission {
 // created by migration 1795130000000-perf-indexes (partial / expression indexes): TypeORM must leave them alone
 @Index('IDX_user_email_lower', { synchronize: false })
 @Index('IDX_user_group', { synchronize: false })
-// the e-mail is unique among accounts that are not deleted (partial index, migration 1795240000000-user-email-active)
+// the e-mail is unique among accounts that are not deleted, case and spaces not counted (partial index on
+// lower(btrim(email)): migrations 1795240000000-user-email-active, 1795630000000-people-unique)
 @Index('IDX_user_email_active', { synchronize: false })
 @Entity()
 export class User {

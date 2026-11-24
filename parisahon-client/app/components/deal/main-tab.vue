@@ -1,9 +1,19 @@
 <template>
-    <div ref="rootRef" class="flex flex-col h-full">
+    <div ref="rootRef" class="flex flex-col">
         <form id="deal-form" @submit.prevent="onSubmit" novalidate></form>
-        <div class="flex flex-col justif space-y-6 max-h-[40rem] px-2 overflow-y-auto no-scrollbar">
+        <!-- every field is in the flow: the column (single.vue) or the page scrolls, nothing is hidden
+             in an inner box without a scrollbar -->
+        <div class="flex flex-col space-y-6 px-2">
             <section>
                 <div class="flex flex-col space-y-4 mt-2">
+                    <BaseInput
+                        form="deal-form"
+                        name="label"
+                        label="Название сделки"
+                        placeholder="Например: полотенца для отеля"
+                        v-model="deal.label"
+                        maxlength="255"
+                    />
                     <BaseListbox
                         form="deal-form"
                         name="stage"
@@ -17,7 +27,7 @@
                         form="deal-form"
                         name="budget"
                         label="Бюджет"
-                        inputmode="numeric"
+                        inputmode="decimal"
                         v-model="deal.budget"
                         @input="(e: Event) => onChange('budget', (e.target as HTMLInputElement).value)"
                         :error="errors.budget"
@@ -79,7 +89,7 @@
             />
             <Products :deal="deal" />
             <section>
-                <span class="text-medium text-muted-900">Компания</span>
+                <h3 class="block text-sm font-medium text-muted-900 dark:text-muted-100">Компания</h3>
                 <CompanyAutocomplete
                     :contacts="contacts.data"
                     :contacts-loading="contactsLoading"
@@ -133,7 +143,8 @@
                 </ul>
             </section>
         </div>
-        <div class="py-8 flex space-x-2 mt-auto">
+        <!-- always at hand: stuck to the bottom of the column (PC) or of the screen (phone) -->
+        <div class="sticky bottom-0 z-10 mt-4 py-3 px-2 flex space-x-2 bg-muted-100/95 dark:bg-muted-900/95 border-t border-muted-200 dark:border-muted-700">
             <NuxtLink :to="route.query.from">
                 <BaseButton type="button" :disabled="upsertingDeal">
                     Отменить
@@ -205,22 +216,25 @@ const deal = computed(() => props.deal);
 type Check = { ok: true, value: undefined } | { ok: false, error: string };
 const passed: Check = { ok: true, value: undefined };
 
-// a whole sum of money: «1 500 000» is read as 1500000
-function wholeSum(message: string) {
-    return (value: unknown): Check => /^\d+$/.test(String(value ?? '').replace(/\s/g, '')) ? passed : { ok: false, error: message };
+// a sum of money, cents allowed: «1 500 000», «1250,50», «1250.5»
+function moneySum(message: string) {
+    return (value: unknown): Check => /^\d+([.,]\d{1,2})?$/.test(String(value ?? '').replace(/\s/g, '')) ? passed : { ok: false, error: message };
 }
 
 function atLeast(length: number, message: string) {
     return (value: unknown): Check => String(value ?? '').trim().length >= length ? passed : { ok: false, error: message };
 }
 
-const toSum = (value: unknown) => Number(String(value ?? '').replace(/\s/g, '')) || 0;
+// «1 500 000,5» -> 1500000.5 (the API keeps numeric(18,2))
+const toNumber = (value: unknown) => Number(String(value ?? '').replace(/\s/g, '').replace(',', '.'));
+const roundTo = (value: number, digits: number) => Number.isFinite(value) ? Number(value.toFixed(digits)) : 0;
+const toSum = (value: unknown) => roundTo(toNumber(value), 2);
 
 // Required is only what the API requires: the responsible and the required fields of the deal.
 // The company, its e-mail and phone are optional (clients from Telegram, WhatsApp and calls often
 // have none). The required fields of a company: for a new company and for a value it already has.
 const schema: Schema<string> = {
-    budget: [optional(wholeSum('Бюджет — целое число'))],
+    budget: [optional(moneySum('Бюджет — число, копейки через запятую (не больше 2 знаков)'))],
     agent: [required('Обязательное поле')],
     company: [optional(atLeast(3, 'Название компании — от 3 символов'))],
     companyEmail: [optional(validEmail('Неверный формат почты'))],
@@ -635,7 +649,12 @@ function saveCompanyOf(form: ReturnType<typeof readForm>) {
     }));
 }
 
-const products = () => deal.value.deal_products.map((p) => ({ quantity: Number(p.quantity), product_id: p.product.id, price: Number(p.price) }));
+// metres and kilos with up to 3 decimals, prices with cents («12,5» typed with a comma too)
+const products = () => deal.value.deal_products.map((p) => ({
+    quantity: roundTo(toNumber(p.quantity), 3),
+    product_id: p.product.id,
+    price: roundTo(toNumber(p.price), 2),
+}));
 
 async function onCreateImpl(e: Event) {
     const form = readForm(e.target as HTMLFormElement);

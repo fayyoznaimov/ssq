@@ -94,6 +94,7 @@
                         </div>
                         <AudioPlayer
                             :src="r.path"
+                            :duration-ms="r.duration"
                             class="flex-1"
                         />
                     </li>

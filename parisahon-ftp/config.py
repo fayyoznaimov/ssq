@@ -30,6 +30,9 @@ class Config:
     plain_networks: Optional[Tuple[object, ...]] = None
     # FTP_PLAIN_DOWNLOAD: a session without TLS may download files (RETR); FTPS sessions always may
     plain_download: bool = True
+    # FTP_EXTRA_HOMES: more folders of a manager outside FTP_ROOT whose recordings are forwarded too
+    # (the folder an old FTP server still fills, e.g. "47=/legacy/47"); nothing of a path is built in
+    extra_homes: Tuple[Tuple[int, str], ...] = ()
     retain_days: float = 30.0      # 0 = keep the files forever
     settle_sec: float = 5.0        # size and mtime must not change this long before a file is sent
     scan_sec: float = 10.0
@@ -92,6 +95,27 @@ def address_in(networks: Optional[Tuple[object, ...]], address: str) -> bool:
     return any(ip.version == network.version and ip in network for network in networks)
 
 
+def parse_extra_homes(raw: str, root: str, state_dir: str) -> Tuple[Tuple[int, str], ...]:
+    """"47=/legacy/47, 52=/legacy/52" -> ((47, "/legacy/47"), (52, "/legacy/52")); empty -> ().
+    A folder must be an absolute path outside FTP_ROOT (a home there is found by itself) and outside FTP_STATE_DIR."""
+    homes = []
+    for part in [part for part in (raw or "").replace(",", " ").split() if part]:
+        user, sep, path = part.partition("=")
+        if not sep or not user.strip().isdigit() or int(user) <= 0 or not path.strip():
+            raise ConfigError(f"FTP_EXTRA_HOMES must look like 47=/legacy/47, got {part!r}")
+        path = path.strip()
+        if not os.path.isabs(path):
+            raise ConfigError(f"FTP_EXTRA_HOMES: the folder must be an absolute path, got {path!r}")
+        path = os.path.abspath(path)
+        for inside, what in ((root, "FTP_ROOT"), (state_dir, "FTP_STATE_DIR")):
+            if os.path.commonpath([inside, path]) == inside or os.path.commonpath([inside, path]) == path:
+                raise ConfigError(f"FTP_EXTRA_HOMES: {path} must be outside {what} ({inside})")
+        if any(path == known for _, known in homes):
+            raise ConfigError(f"FTP_EXTRA_HOMES: {path} is listed twice")
+        homes.append((int(user), path))
+    return tuple(homes)
+
+
 def parse_passive_ports(raw: str) -> Optional[range]:
     """"21310-21319" -> range(21310, 21320); empty -> None (any free port)."""
     raw = (raw or "").strip()
@@ -140,6 +164,7 @@ def from_env(env: Optional[Mapping[str, str]] = None) -> Config:
         tls_required=tls_required,
         plain_networks=parse_networks(env.get("FTP_PLAIN_NETWORKS", "")),
         plain_download=_flag(env, "FTP_PLAIN_DOWNLOAD", True),
+        extra_homes=parse_extra_homes(env.get("FTP_EXTRA_HOMES", ""), root, state_dir),
         retain_days=_number(env, "FTP_RETAIN_DAYS", 30.0),
         settle_sec=_number(env, "FTP_SETTLE_SEC", 5.0),
         scan_sec=_number(env, "FTP_SCAN_SEC", 10.0, 0.05),

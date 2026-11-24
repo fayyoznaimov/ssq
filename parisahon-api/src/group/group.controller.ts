@@ -4,6 +4,8 @@ import {
   Controller,
   Delete,
   Get,
+  HttpCode,
+  HttpStatus,
   Param,
   ParseIntPipe,
   Patch,
@@ -20,9 +22,33 @@ import { Group } from './group.entity';
 export class GroupController {
   constructor(private groupService: GroupService) {}
 
+  /** Every group (the pickers of the user card and of tasks, the list «Группы»): by name, with `users_count`. */
   @Get()
-  async findAll(): Promise<Group[]> {
+  async findAll(): Promise<(Group & { users_count: number })[]> {
     return this.groupService.fetchAll();
+  }
+
+  /** The group page «Добавить сотрудника»: the employee moves into this group. Answers the new counts. */
+  @Roles(AuthGuard.ADMIN_LEVEL)
+  @HttpCode(HttpStatus.OK)
+  @Post(':id/members/:user_id')
+  async addMember(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('user_id', ParseIntPipe) userId: number,
+  ): Promise<GroupUsage> {
+    await this.groupService.addMember(id, userId);
+    return this.groupService.usage(id);
+  }
+
+  /** The group page «Убрать из группы»: the employee stays without a group. Answers the new counts. */
+  @Roles(AuthGuard.ADMIN_LEVEL)
+  @Delete(':id/members/:user_id')
+  async removeMember(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('user_id', ParseIntPipe) userId: number,
+  ): Promise<GroupUsage> {
+    await this.groupService.removeMember(id, userId);
+    return this.groupService.usage(id);
   }
 
   /** How many staff and open tasks the group has: the delete dialog of the group page asks with them. */

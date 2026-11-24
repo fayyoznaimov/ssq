@@ -72,7 +72,7 @@ export const defaultConfig = {
             font: {
                 color: {
                     light: 'white',
-                    dark: 'white',
+                    dark: 'primary-invert',
                 },
             },
             background: {
@@ -82,7 +82,7 @@ export const defaultConfig = {
                 },
                 hover: {
                     light: 'primary-400',
-                    dark: 'primary-400',
+                    dark: 'primary-600',
                 },
                 active: {
                     light: 'primary-500',

@@ -45,6 +45,16 @@ class TokenTest(unittest.TestCase):
         self.assertEqual(body["states"], {"5": "connected", "7": "revoked"})
         self.assertEqual([p["user_id"] for p in body["problems"]], [7])
 
+    def test_a_send_that_failed_on_the_managers_side_is_400(self):
+        # OMNI-9: the CRM shows the reason under the composer and keeps the text; 502 is for Telegram refusing
+        with self.service.app.app_context():
+            for reason, status in (("Ваш Telegram не подключён к CRM: подключите его в разделе «Телеграм» и отправьте ещё раз", 400),
+                                   ("Ваш Telegram сейчас не на связи с CRM: сообщение не отправлено, попробуйте через минуту", 400),
+                                   ("Ваш Telegram отключён в самом Telegram (сеанс завершён)", 400),
+                                   ("FloodWait", 502)):
+                _, code = self.service.send_answer({"ok": False, "reason": reason, "sent": []})
+                self.assertEqual(code, status, reason)
+
     def test_without_any_token_configured_everything_is_closed(self):
         with mock.patch.object(self.service.config, "HTTP_API_TOKEN", ""):
             response = self.client.get("/get-sessions", headers={"X-Telegram-Service-Token": ""})

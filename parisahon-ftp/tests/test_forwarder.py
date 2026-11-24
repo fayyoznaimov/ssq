@@ -383,6 +383,37 @@ class PruneTest(ForwarderCase):
         self.assertEqual(self.state.known_users(), [5])
 
 
+class ExtraHomeTest(ForwarderCase):
+    """FTP_EXTRA_HOMES: a folder an old FTP server fills for a manager (no path of it is built in)."""
+    retain_days = 0.2 / 86400  # 0.2 s
+
+    def setUp(self):
+        super().setUp()
+        self.legacy = os.path.join(self.tmp, "legacy", "47")
+        self.config.extra_homes = ((47, self.legacy), (8, os.path.join(self.tmp, "not-mounted")))
+
+    def test_recordings_of_the_extra_folder_go_to_its_manager(self):
+        write(os.path.join(self.legacy, "Cube", "a.amr"), b"a" * 300)
+        self.put(47, "b.wav")
+        with self.assertLogs("ftp.forward", "INFO") as logs:
+            self.forwarder.scan_once()
+        self.assertEqual(sorted((u["user_id"], u["file_name"]) for u in self.fake.uploads), [(47, "a.amr"), (47, "b.wav")])
+        self.assertTrue(any('file="@extra-1/Cube/a.amr"' in line for line in logs.output), "the log tells the folder apart")
+        # the same content in both folders is one call; nothing is sent twice
+        write(os.path.join(self.legacy, "copy.wav"), next(u["data"] for u in self.fake.uploads if u["file_name"] == "b.wav"))
+        for _ in range(2):
+            self.forwarder.scan_once()
+        self.assertEqual(self.fake.posts, 2)
+
+    def test_sent_files_of_the_extra_folder_are_pruned_and_a_missing_folder_is_skipped(self):
+        sent = write(os.path.join(self.legacy, "a.wav"), b"a" * 300)
+        self.forwarder.scan_once()
+        time.sleep(0.3)
+        self.assertEqual(self.forwarder.prune(), 1)
+        self.assertFalse(os.path.exists(sent))
+        self.assertEqual(self.state.known_users(), [47], "the manager of the extra folder is not forgotten")
+
+
 class KeepForeverTest(ForwarderCase):
     retain_days = 0
 

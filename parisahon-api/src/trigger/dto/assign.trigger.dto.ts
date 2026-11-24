@@ -1,10 +1,12 @@
 import { TriggerTypes } from '../trigger.entity';
 import {
+  ArrayMaxSize,
   IsArray,
   IsBoolean,
   IsDateString,
   IsEnum,
   IsIn,
+  IsInt,
   IsNumber,
   IsObject,
   IsOptional,
@@ -78,6 +80,20 @@ export class SendEmailContents {
   @IsOptional()
   @IsEnum(TaskResponsibleEnum)
   from: TaskResponsibleEnum;
+
+  // true: always from the shared mailbox of the company; not set: from the sender's own connected
+  // (checked) mailbox, else the shared one (TriggerActionsService.handleSendEmail)
+  @IsOptional()
+  @IsBoolean()
+  shared_mailbox?: boolean;
+
+  // the deal's files of these extensions go with the letter (["pdf"]: the КП uploaded to the deal),
+  // the newest first, at most 5; none in the deal = the run fails visibly (no letter without its file)
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(10)
+  @IsString({ each: true })
+  attach_extensions?: string[];
 }
 
 // endregion
@@ -93,6 +109,52 @@ export class CreateDealContents {
   @IsString()
   @Length(0, 255)
   label: string;
+
+  // the copy takes the custom fields and the products of the deal too (not set = yes)
+  @IsOptional()
+  @IsBoolean()
+  copy_fields?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  copy_products?: boolean;
+}
+
+// endregion
+
+// region Move Stage trigger
+
+export class MoveStageContents {
+  // the stage the deal goes to (of this pipeline or another one)
+  @IsNumber()
+  stage_id: number;
+}
+
+// endregion
+
+// region Notify trigger
+
+export enum NotifyWhomEnum {
+  RESPONSIBLE = 'responsible',
+  MANAGERS = 'managers',
+  BOTH = 'both',
+}
+
+export class NotifyContents {
+  // the text of the message; {{сделка}}, {{клиент}}, {{менеджер}}, {{сумма}} ... are filled in
+  @IsString()
+  @Length(1, 1000)
+  text: string;
+
+  // the responsible of the deal (default), the managers and admins, or both
+  @IsOptional()
+  @IsEnum(NotifyWhomEnum)
+  to?: NotifyWhomEnum;
+
+  // or one chosen employee
+  @IsOptional()
+  @IsNumber()
+  user_id?: number;
 }
 
 // endregion
@@ -103,6 +165,7 @@ export class ChangeFieldContents {
   // DealFilter just happen to have the same fields, reusing
   @IsArray()
   @ValidateNested({ each: true })
+  @Type(() => DealFilter)
   fields: DealFilter[];
 }
 
@@ -111,8 +174,21 @@ export class ChangeFieldContents {
 // region Change Agent trigger
 
 export class ChangeAgentContents {
+  // the new responsible; not needed when the deals are handed out in turn (rotate_user_ids)
+  @ValidateIf((o) => !Array.isArray(o.rotate_user_ids) || o.rotate_user_ids.length === 0)
   @IsNumber()
   agent_id: number;
+
+  // «по очереди»: each deal goes to the next of these employees (round robin over the list)
+  @IsOptional()
+  @IsArray()
+  @IsNumber({}, { each: true })
+  rotate_user_ids?: number[];
+
+  // the open tasks of the deal of the previous responsible go to the new one (not set = yes)
+  @IsOptional()
+  @IsBoolean()
+  transfer_tasks?: boolean;
 }
 
 // endregion
@@ -131,6 +207,8 @@ export class CloseTaskContents {
   @IsString()
   result: string;
 
+  // the type of the tasks to close; 0 or not set = tasks of any type
+  @IsOptional()
   @IsNumber()
   type_id: number;
 
@@ -175,7 +253,16 @@ export class DeleteFilesContents {
 
 // region Assign trigger
 
+// how a condition compares: equal (default), not equal, greater / less (numbers), contains (text)
+export const FILTER_OPS = ['eq', 'ne', 'gt', 'lt', 'contains'] as const;
+export type FilterOp = (typeof FILTER_OPS)[number];
+
+// the channel the deal came from (condition field `source`, see TriggerActionsService.getTargetDeal)
+export const DEAL_SOURCES = ['telegram', 'whatsapp', 'email', 'call', 'manual'] as const;
+
 export class DealFilter {
+  // a column of the deal (agent_id, budget, label), `source` (the channel the deal came from) or
+  // the name of a custom field (is_filler)
   @IsString()
   @Length(1, 255)
   field: string;
@@ -184,6 +271,10 @@ export class DealFilter {
 
   @IsBoolean()
   is_filler: boolean;
+
+  @IsOptional()
+  @IsIn(FILTER_OPS as unknown as string[])
+  op?: FilterOp;
 
   // a custom field is kept by its id too (filled in by the API), so renaming the field keeps the trigger
   @IsOptional()
@@ -202,15 +293,19 @@ export enum ApplyTriggerWhenEnum {
   TG_MESSAGE_RECEIVED = 'tg_message_received',
   WA_MESSAGE_RECEIVED = 'wa_message_received',
   CALL_RECORDED = 'call_recorded',
+  // the client wrote and waits for an answer `after_minutes` working minutes (no answer, no call back)
+  NO_REPLY = 'no_reply',
 }
 
 export class ApplyWhenDto {
   @IsEnum(ApplyTriggerWhenEnum)
   when: ApplyTriggerWhenEnum;
 
+  // right_away: the delay after entering the stage (0 = at once); no_reply: how long the client waits
   @IsNumber()
   @Min(0)
-  @ValidateIf((o) => o.when === ApplyTriggerWhenEnum.RIGHT_AWAY)
+  @Max(525600)
+  @ValidateIf((o) => o.when === ApplyTriggerWhenEnum.RIGHT_AWAY || o.when === ApplyTriggerWhenEnum.NO_REPLY)
   after_minutes: number;
 
   @IsDateString()
@@ -294,10 +389,25 @@ export class ApplyWhenDto {
   cooldown_minutes?: number;
 }
 
+/** PATCH /stages/:id/trigger-order: the ids of every trigger of the stage, in the order they run. */
+export class TriggerOrderDto {
+  @IsArray()
+  @ArrayMaxSize(200)
+  @IsInt({ each: true })
+  ids: number[];
+}
+
 export class AssignTriggerDto {
   // TODO: Something is going wrong when trying to use @IsEnum() here
-  @IsIn([0, 1, 2, 3, 4, 5, 6])
+  @IsIn([0, 1, 2, 3, 4, 5, 6, 7, 8])
   type: TriggerTypes;
+
+  // the order of the triggers of a stage (they run in it, then by id); not set = after the others
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(10000)
+  position?: number;
 
   @ValidateNested({ each: true })
   @Type(() => DealFilter)
@@ -350,6 +460,18 @@ export class AssignTriggerDto {
   @ValidateNested()
   @Type(() => SendEmailContents)
   send_email_data: SendEmailContents;
+
+  @ValidateIf((o) => o.type === TriggerTypes.MOVE_STAGE)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => MoveStageContents)
+  move_stage_data: MoveStageContents;
+
+  @ValidateIf((o) => o.type === TriggerTypes.NOTIFY)
+  @IsObject()
+  @ValidateNested()
+  @Type(() => NotifyContents)
+  notify_data: NotifyContents;
 }
 
 // endregion

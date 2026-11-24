@@ -18,8 +18,11 @@ import { Notification } from 'src/notification/notification.entity';
 
 // the name is unique among the companies that are not deleted, and the last 9 digits of the phone are
 // indexed for the lookups by phone (partial / expression indexes, migration 1795230000000-people-phones)
+// (by lower(btrim(name)) since 1795630000000-people-unique, as the API compares names)
 @Index('IDX_company_name_live', { synchronize: false })
 @Index('IDX_company_phone_key', { synchronize: false })
+// the ИНН is unique among the companies that are not deleted, when filled (1795630000000-people-unique)
+@Index('IDX_company_inn_live', { synchronize: false })
 @Entity()
 export class Company {
   @PrimaryGeneratedColumn()

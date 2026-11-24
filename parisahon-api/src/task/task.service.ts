@@ -1,4 +1,11 @@
-import { Injectable, Logger, BadRequestException, NotFoundException } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DefaultTaskRelations, Task } from './task.entity';
 import { DataSource, Repository } from 'typeorm';
@@ -55,6 +62,53 @@ export function allDaySpan(start: Date, end: Date): [Date, Date] {
   let last = atMidnight && end.getTime() > from.getTime() ? new Date(end.getTime() - 1) : end;
   if (last.getTime() < from.getTime()) last = from;
   return [from, new Date(last.getFullYear(), last.getMonth(), last.getDate(), 23, 59)];
+}
+
+/**
+ * The plan rules of a task, the same for the web client and the bot (bot-crm.service.ts prepareTask):
+ *  - TASK_IN_PAST: the deadline has passed already (a typo in the year, "в пятницу" read as last Friday):
+ *    400 unless the request says it is deliberate (allow_past: the task is already done, or a backdated one);
+ *  - TASK_DUPLICATE: the deal has another open task starting within ±15 minutes (a request repeated by
+ *    voice or text): 409 with that task unless the request says to create it anyway (allow_duplicate).
+ * The answer carries `code` (and `existing`) so the client can ask the user and send the flag back.
+ */
+export const TASK_IN_PAST = 'TASK_IN_PAST';
+export const TASK_DUPLICATE = 'TASK_DUPLICATE';
+export const DUPLICATE_WINDOW_MINUTES = 15;
+// a form opened with "now" and saved a few minutes later is not a task in the past
+const PAST_GRACE_MS = 5 * 60_000;
+
+const WEEKDAYS = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
+
+/** "пт 20.11.2026 10:00" in the server's zone (Asia/Karachi); without the time for an all-day task. */
+export function taskStamp(value: Date | string, withTime = true): string {
+  const d = new Date(value);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const day = `${WEEKDAYS[d.getDay()]} ${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()}`;
+  return withTime ? `${day} ${pad(d.getHours())}:${pad(d.getMinutes())}` : day;
+}
+
+export interface TaskPlan {
+  /** the task itself when it is changed (it is not its own duplicate) */
+  id?: number | null;
+  start: Date;
+  end: Date;
+  allDay: boolean;
+  dealId?: number | null;
+}
+
+export interface TaskPlanIssues {
+  past?: { code: string; message: string };
+  duplicate?: {
+    code: string;
+    message: string;
+    existing: { id: number; label: string; start: Date; end: Date; allDay: boolean; agent: string | null };
+  };
+}
+
+/** Where a task is written from: "bot" — the CRM bot in Telegram (the history says «через бот»). */
+export interface TaskWriteOptions {
+  via?: 'bot' | 'web';
 }
 
 const LINK_NAMES: Record<ViableLinkTargets, string> = {
@@ -159,12 +213,35 @@ export class TaskService {
       }
     }
 
+    // when the tasks were set (the list's «Создана»)
+    if (query.created_from) {
+      qb = qb.andWhere('t0.created_at >= :created_from', { created_from: query.created_from });
+    }
+    if (query.created_till) {
+      qb = qb.andWhere('t0.created_at <= :created_till', {
+        created_till: isPlainDate(query.created_till) ? `${query.created_till} 23:59:59.999` : query.created_till,
+      });
+    }
+
+    // when the tasks were done (the desktop counts the closed tasks of its period by this)
+    if (query.closed_from) {
+      qb = qb.andWhere('t0.closed_at >= :closed_from', { closed_from: query.closed_from });
+    }
+    if (query.closed_till) {
+      qb = qb.andWhere('t0.closed_at <= :closed_till', {
+        closed_till: isPlainDate(query.closed_till) ? `${query.closed_till} 23:59:59.999` : query.closed_till,
+      });
+    }
+
     switch (query.type) {
       case TaskType.CLOSED:
         qb = qb.andWhere('t0.closed_at IS NOT NULL');
         break;
       case TaskType.OVERDUE:
         qb = qb.andWhere('t0.end_time < :current_time AND t0.closed_at IS NULL', { current_time: new Date() });
+        break;
+      case TaskType.UPCOMING:
+        qb = qb.andWhere('t0.end_time >= :current_time AND t0.closed_at IS NULL', { current_time: new Date() });
         break;
       case TaskType.ALL:
         break;
@@ -224,24 +301,39 @@ export class TaskService {
     return task;
   }
 
-  /** `user`: the caller of POST /tasks; the deal, company or contact must be visible to them. */
+  /**
+   * `user`: the caller of POST /tasks; the deal, company or contact must be visible to them, and the
+   * assignee within their task rights (assertCanAssign). `options.via` ("bot"): where the task was set,
+   * kept in its history entry; the bot shows the plan warnings (past, duplicate) in its confirmation, so a
+   * task confirmed there is deliberate.
+   */
   async create(
     creator_id: number,
     data: CreateTaskDto,
     user?: AuthUser,
+    options: TaskWriteOptions = {},
   ): Promise<Record<string, any>> {
-    if (user) await this.assertCanLink(user, data.link_to);
+    if (user) {
+      await this.assertCanLink(user, data.link_to);
+      await this.assertCanAssign(user, data.assign_to);
+    }
 
     let newTask = new Task();
     const creator = await this.helperService.getById(User, creator_id);
 
     newTask = await this.assignValuesToEntity(newTask, data, creator);
+    const confirmed = options.via === 'bot';
+    await this.assertPlan(this.planOf(newTask), {
+      allow_past: data.allow_past || confirmed,
+      allow_duplicate: data.allow_duplicate || confirmed,
+    });
 
     let savedTask = await this.taskRepository.save(newTask);
     savedTask = this.helperService.addUndefinedRelations(
       savedTask,
       DefaultTaskRelations,
     );
+    if (options.via) (savedTask as any).via = options.via;
 
     const eventData: TaskEventDto = {
       task: savedTask,
@@ -312,10 +404,12 @@ export class TaskService {
    * task is already linked to: an automatic task (deal + its company) moved on the board or in the
    * calendar used to lose its deal, because the client sends the company first.
    */
-  async update(id: number, data: UpdateTaskDto, user?: AuthUser): Promise<Task> {
+  async update(id: number, data: UpdateTaskDto, user?: AuthUser, options: TaskWriteOptions = {}): Promise<Task> {
     const task = await this.helperService.getById(Task, id, DefaultTaskRelations);
     const before = {
       start: new Date(task.start_time).getTime(),
+      end: new Date(task.end_time).getTime(),
+      deal: task.deal?.id ?? null,
       agent: task.agent?.id ?? null,
       group: task.group?.id ?? null,
     };
@@ -328,6 +422,11 @@ export class TaskService {
     );
 
     if (data.assign_to) {
+      const same =
+        data.assign_to.target === ViableAssignTargets.AGENT
+          ? before.agent === data.assign_to.id
+          : before.group === data.assign_to.id;
+      if (user && !same) await this.assertCanAssign(user, data.assign_to);
       task.resetAssignTarget();
       await this.assignTo(task, data.assign_to);
     }
@@ -346,6 +445,18 @@ export class TaskService {
       task.type = await this.helperService.getById(TaskTypeEntity, data.type_id);
     } else if (!task.type) {
       task.type = await defaultTaskType(this.taskRepository.manager);
+    }
+
+    // the plan rules apply to a new time or a new deal (an old overdue task may still be renamed or handed over)
+    const moved =
+      before.start !== new Date(task.start_time).getTime() || before.end !== new Date(task.end_time).getTime();
+    const relinked = before.deal !== (task.deal?.id ?? null);
+    if (moved || relinked) {
+      const confirmed = options.via === 'bot';
+      await this.assertPlan(this.planOf(task), {
+        allow_past: data.allow_past || !moved || confirmed,
+        allow_duplicate: data.allow_duplicate || confirmed,
+      });
     }
 
     const saved = await this.taskRepository.save(task);
@@ -368,17 +479,90 @@ export class TaskService {
     return this.helperService.deleteById(Task, id);
   }
 
-  async close(id: number, data: CloseTaskDto, request: Request): Promise<void> {
+  private planOf(task: Task): TaskPlan {
+    return {
+      id: task.id ?? null,
+      start: new Date(task.start_time),
+      end: new Date(task.end_time),
+      allDay: !!task.allDay,
+      dealId: task.deal?.id ?? null,
+    };
+  }
+
+  /**
+   * What is wrong with the plan of a task (TASK_IN_PAST / TASK_DUPLICATE above), without refusing it:
+   * the bot shows these as warnings in its confirmation; POST / PATCH /tasks refuse unless told otherwise.
+   */
+  async planIssues(plan: TaskPlan): Promise<TaskPlanIssues> {
+    const issues: TaskPlanIssues = {};
+    if (plan.end.getTime() < Date.now() - PAST_GRACE_MS) {
+      issues.past = {
+        code: TASK_IN_PAST,
+        message: plan.allDay
+          ? `Задача на прошедший день (${taskStamp(plan.start, false)}). Проверьте дату; если задача уже сделана или так и нужно — подтвердите.`
+          : `Время задачи уже прошло (${taskStamp(plan.start)}). Проверьте дату; если задача уже сделана или так и нужно — подтвердите.`,
+      };
+    }
+    // an all-day task has no time to collide with
+    if (plan.dealId && !plan.allDay) {
+      const window = DUPLICATE_WINDOW_MINUTES * 60_000;
+      const rows: { id: number; label: string; start_time: Date; end_time: Date; allDay: boolean; agent: string | null }[] =
+        await this.dataSource.query(
+          `SELECT t.id, t.label, t.start_time, t.end_time, t."allDay", COALESCE(a.username, g.name) AS agent
+           FROM task t LEFT JOIN "user" a ON a.id = t.agent_id LEFT JOIN "group" g ON g.id = t.group_id
+           WHERE t.deal_id = $1 AND t.closed_at IS NULL AND NOT t."allDay" AND t.id <> $2
+             AND t.start_time BETWEEN $3 AND $4
+           ORDER BY t.start_time, t.id LIMIT 1`,
+          [plan.dealId, plan.id ?? 0, new Date(plan.start.getTime() - window), new Date(plan.start.getTime() + window)],
+        );
+      const row = rows[0];
+      if (row) {
+        issues.duplicate = {
+          code: TASK_DUPLICATE,
+          message:
+            `По этой сделке уже есть открытая задача на ${taskStamp(row.start_time)}: «${row.label}»` +
+            `${row.agent ? ` (${row.agent})` : ''}.`,
+          existing: {
+            id: row.id,
+            label: row.label,
+            start: row.start_time,
+            end: row.end_time,
+            allDay: row.allDay,
+            agent: row.agent,
+          },
+        };
+      }
+    }
+    return issues;
+  }
+
+  /** POST / PATCH /tasks: 400 TASK_IN_PAST or 409 TASK_DUPLICATE (with the existing task) unless the flag says so. */
+  async assertPlan(plan: TaskPlan, flags: { allow_past?: boolean; allow_duplicate?: boolean }): Promise<void> {
+    const issues = await this.planIssues(plan);
+    if (issues.past && !flags.allow_past) {
+      throw new BadRequestException({ statusCode: 400, error: 'Bad Request', ...issues.past });
+    }
+    if (issues.duplicate && !flags.allow_duplicate) {
+      throw new ConflictException({ statusCode: 409, error: 'Conflict', ...issues.duplicate });
+    }
+  }
+
+  /** `options.via` ("bot"): where it was done, kept in the history entry of the closing. */
+  async close(id: number, data: CloseTaskDto, request: Request, options: TaskWriteOptions = {}): Promise<void> {
     const task = await this.helperService.getById(
       Task,
       id,
       DefaultTaskRelations,
     );
+    if (task.closed_at) {
+      throw new BadRequestException('Задача уже выполнена');
+    }
 
     task.result = data.result;
     task.closed_at = new Date();
 
     const savedTask = await this.taskRepository.save(task);
+    if (options.via) (savedTask as any).via = options.via;
 
     const eventData: TaskEventDto = {
       task: savedTask,
@@ -446,6 +630,8 @@ export class TaskService {
   }
 
   private async linkTo(task: Task, link: LinkToDto): Promise<void> {
+    // a personal task of the bot («напомни мне подготовить отчёт») is linked to nothing; POST /tasks still requires link_to
+    if (!link) return;
     const linkTargetEntity = TargetToEntityMapping[link.target];
     task[TargetToEntityAttributeMapping[link.target]] =
       await this.helperService.getById(linkTargetEntity, link.id);
@@ -468,8 +654,40 @@ export class TaskService {
     return false;
   }
 
-  /** A task may be put only on a deal, company or contact the user sees (and that is not in the trash). */
+  /**
+   * Whom the user may give a task to, by the task level of the user card ("Задачи: правка", the same
+   * level that lets change the tasks of others): themselves and their own group always; a colleague of
+   * their group with "group"; anyone with "all" (admin and manager: anyone). "Own" or none: a task for
+   * a colleague would be a task the user may not change afterwards. 403 with the reason otherwise.
+   */
+  private async assertCanAssign(user: AuthUser, assign: AssignToDto | undefined): Promise<void> {
+    if (!assign) return;
+    const access = new Access(user);
+    if (access.isManager) return;
+    const mine = user.group_id ?? null;
+    if (assign.target === ViableAssignTargets.AGENT && Number(assign.id) === user.sub) return;
+    if (assign.target === ViableAssignTargets.GROUP && mine !== null && Number(assign.id) === Number(mine)) return;
+    const scope = access.scope('task', 'update');
+    if (scope === 'all') return;
+    if (scope === 'group' && mine !== null) {
+      if (assign.target === ViableAssignTargets.AGENT) {
+        const row = (await this.dataSource.query('SELECT group_id FROM "user" WHERE id = $1', [assign.id]))[0];
+        if (row && row.group_id !== null && Number(row.group_id) === Number(mine)) return;
+      }
+      throw new ForbiddenException('Задачу можно поставить себе, своей группе или коллеге из своей группы');
+    }
+    throw new ForbiddenException(
+      mine !== null ? 'Задачу можно поставить только себе или своей группе' : 'Задачу можно поставить только себе',
+    );
+  }
+
+  /**
+   * A task may be put only on a deal, company or contact the user sees (and that is not in the trash):
+   * 404 otherwise. A task goes into the history of its deal, so a deal also needs the right to change
+   * it, as a comment does (POST /deals/:id/comments): 403 otherwise.
+   */
   private async assertCanLink(user: AuthUser, link: LinkToDto): Promise<void> {
+    if (!link) return;
     const access = new Access(user);
     let table: string;
     let filter: string;
@@ -500,6 +718,17 @@ export class TaskService {
       .getRawOne();
     if (!row) {
       throw new NotFoundException(`${LINK_NAMES[link.target] ?? 'Запись'} ${link.id} не найдена или нет доступа`);
+    }
+    if (link.target === ViableLinkTargets.DEAL && !access.isManager) {
+      const deal = (
+        await this.dataSource.query(
+          'SELECT d.agent_id, a.group_id FROM deal d LEFT JOIN "user" a ON a.id = d.agent_id WHERE d.id = $1',
+          [link.id],
+        )
+      )[0];
+      if (!deal || !access.allowsDeal('update', deal.agent_id, deal.group_id)) {
+        throw new ForbiddenException('Нет права менять эту сделку, поэтому задачу на неё поставить нельзя');
+      }
     }
   }
 }

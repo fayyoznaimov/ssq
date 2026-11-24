@@ -1,11 +1,12 @@
 <template>
-    <div class="flex gap-6">
-        <section class="max-w-xs w-full">
+    <!-- on a phone the columns go one under the other: templates and signatures used to be cut off -->
+    <div class="flex flex-col gap-6 lg:flex-row">
+        <section class="w-full lg:max-w-xs">
             <div class="flex flex-col gap-4">
                 <h2
                     class="text-sm uppercase font-semibold text-gray-900 dark:text-white"
                 >
-                    Подключенные ящики
+                    Почтовые ящики
                 </h2>
                 <!-- the user's own sender mailboxes: open one to change its password or remove it -->
                 <Spinner v-if="transportersLoading" class="w-6 h-6"/>
@@ -23,15 +24,15 @@
                     </li>
                 </ul>
                 <p v-else-if="!transportersLoading" class="text-xs text-muted-500 dark:text-muted-400">
-                    Своего ящика нет: письма уходят с общего ящика компании.
+                    Ящиков нет — добавьте свой, чтобы отправлять письма от своего имени. Пока письма уходят с общего ящика компании.
                 </p>
                 <BaseButton class="max-w-fit" to="/settings/transporters/new?from=/mails/settings">
                     <Icon name="ph:plus" class="size-4 mr-1" />
-                    Добавить почту
+                    Добавить ящик
                 </BaseButton>
             </div>
         </section>
-        <section class="flex flex-col gap-4">
+        <section class="flex min-w-0 flex-1 flex-col gap-4">
             <BaseCard rounded="md" class="p-4">
                 <h2 class="text-lg text-gray-900 dark:text-white">
                     Шаблоны писем
@@ -58,8 +59,8 @@
                     Создайте несколько подписей для своего бизнеса: для клиентов
                     и для партнеров
                 </BaseParagraph>
-                <div class="flex mt-4 gap-4">
-                    <ul class="max-w-xs w-full">
+                <div class="flex flex-col mt-4 gap-4 lg:flex-row">
+                    <ul class="w-full lg:max-w-xs">
                         <li class="w-full">
                             <input
                                 type="radio"
@@ -105,7 +106,10 @@
                         @submit.prevent="onSignatureSubmit"
                         novalidate
                     >
-                        <Editor v-model="selectedSignature.sign" :error="errors.signatureBody" @update:model-value="(val: string) => onChange('signatureBody', val)" />
+                        <!-- framed, as in a new letter: it used to be unclear where to type -->
+                        <div class="mb-2 rounded-md border border-muted-300 bg-white dark:border-muted-700 dark:bg-transparent">
+                            <Editor v-model="selectedSignature.sign" :error="errors.signatureBody" @update:model-value="(val: string) => onChange('signatureBody', val)" />
+                        </div>
                         <BaseAutocomplete
                             placeholder="Пользователь"
                             :fixed="true"

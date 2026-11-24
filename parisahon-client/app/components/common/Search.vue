@@ -1,16 +1,18 @@
 <template>
-    <div class="flex flex-col md:flex-row gap-2">
+    <div class="flex flex-col sm:flex-row gap-2">
         <BaseInput
             v-model="searchQ"
-            :classes="{wrapper: 'w-full'}"
+            :classes="{wrapper: 'w-full min-w-0'}"
             icon="ph:list-magnifying-glass"
-            placeholder="Поиск"
+            :placeholder="placeholder"
             size="lg"
+            type="search"
         />
+        <!-- an optional narrowing: the search works without choosing a field (the first one is taken) -->
         <BaseListbox
             v-if="fields.length > 1"
             v-model="selected"
-            class="max-w-xs"
+            class="w-full sm:max-w-xs"
             size="lg"
             :items="fields"
             :properties="{ value: 'key', label: 'label' }"
@@ -45,30 +47,47 @@ const emit = defineEmits(["update:modelValue"]);
 const searchQ = ref("");
 const selected = ref<Field[] | Field>([]);
 
-watch([searchQ, selected], deb(update, props.debounce));
-watchEffect(() => {
+/** the field the text is searched in: the chosen one, otherwise the first (nothing was searched before a choice) */
+const field = computed<Field | undefined>(() => {
+    const chosen = selected.value as Field | Field[];
+    if (!Array.isArray(chosen) && chosen?.key) return chosen;
+    return props.fields[0];
+});
+
+const placeholder = computed(() => props.fields.length === 1 ? `Поиск: ${props.fields[0].label}` : "Поиск");
+
+// a new choice of fields keeps the text and searches again; the fields of the page do not reset what was found
+const update = deb(emitQuery, props.debounce);
+watch(searchQ, update);
+watch(selected, () => {
+    if (searchQ.value.trim()) emitQuery();
+});
+
+function initSelection() {
     if (props.multiple) selected.value = props.fields;
     else if (props.fields.length === 1) selected.value = props.fields[0];
-});
+}
+initSelection();
+watch(() => props.fields.map((f) => f.key).join("|"), initSelection);
 
 // useService encodes the query string itself; encoding here as well sent
 // Cyrillic as "%25D0%25..." and the search found nothing
-function toQ(field: Field) {
-    if (props.ilike) return {[field.key]: {$iLike: `%${searchQ.value}%`}};
-    return {[field.key]: searchQ.value};
+function toQ(f: Field, text: string) {
+    if (props.ilike) return {[f.key]: {$iLike: `%${text}%`}};
+    return {[f.key]: text};
 }
 
-function update() {
-    if (!searchQ.value.length) {
+function emitQuery() {
+    const text = searchQ.value.trim();
+    if (!text) {
         return emit("update:modelValue", {});
     }
     let query: Record<string, any> = {};
-    if (!props.multiple && searchQ.value && Object.keys(selected.value).length) {
-        query = {...toQ(selected.value as unknown as Field)};
-    } else if (props.multiple && Array.isArray(selected.value) && selected.value.length) {
-        query = {$or: selected.value.map(toQ)};
+    if (props.multiple && Array.isArray(selected.value) && selected.value.length) {
+        query = {$or: selected.value.map((f) => toQ(f, text))};
+    } else if (field.value) {
+        query = toQ(field.value, text);
     }
     emit("update:modelValue", query);
 }
 </script>
-

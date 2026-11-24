@@ -3,6 +3,10 @@
  * "Похоже, такой клиент уже есть": asks GET /companies/similar while the user types the name,
  * phone, e-mail or INN of a company or contact, and shows matches with the reasons in plain words,
  * plus hints about the phone format and e-mail typos. It only informs: saving is never blocked.
+ * - It asks when a field CHANGES (no `immediate`): mount it with the loaded record, and a saved card
+ *   does not warn about itself on every opening.
+ * - Matches only by the e-mail domain are folded into one line.
+ * - «Это другой клиент» is remembered for the record (localStorage), the same matches are not shown again.
  */
 const props = withDefaults(defineProps<{
     name?: string | null;
@@ -37,6 +41,34 @@ const similarService = useService('companies/similar', { auth: true });
 const matches = ref<SimilarMatch[]>([]);
 const hints = ref<{ phone: string | null; email: string | null; inn: string | null }>({ phone: null, email: null, inn: null });
 const dismissed = ref(false);
+const showDomain = ref(false);
+
+// «Это другой клиент» of a saved record: the matches the user has looked at and rejected
+const storageKey = computed(() => {
+    if (props.excludeCompanyId) return `similar-dismissed:company-${props.excludeCompanyId}`;
+    if (props.excludeContactId) return `similar-dismissed:contact-${props.excludeContactId}`;
+    return null;
+});
+function readDismissed(): string[] {
+    if (!storageKey.value || typeof localStorage === 'undefined') return [];
+    try {
+        const list = JSON.parse(localStorage.getItem(storageKey.value) ?? '[]');
+        return Array.isArray(list) ? list.map(String) : [];
+    } catch {
+        return [];
+    }
+}
+const matchKey = (m: SimilarMatch) => `${m.kind}-${m.id}`;
+function dismiss() {
+    dismissed.value = true;
+    if (!storageKey.value || typeof localStorage === 'undefined') return;
+    const keys = new Set([...readDismissed(), ...matches.value.map(matchKey)]);
+    try {
+        localStorage.setItem(storageKey.value, JSON.stringify([...keys].slice(-200)));
+    } catch {
+        // storage full or off: remembered for this page only
+    }
+}
 let timer: ReturnType<typeof setTimeout> | null = null;
 let requestNo = 0;
 
@@ -67,7 +99,8 @@ watch(
             const result = await promiseResult(similarService.find(q).exec());
             if (mine !== requestNo || !result.ok) return;
             const data: any = result.value;
-            matches.value = data.matches ?? [];
+            const rejected = new Set(readDismissed());
+            matches.value = (data.matches ?? []).filter((m: SimilarMatch) => !rejected.has(matchKey(m)));
             hints.value = data.hints ?? { phone: null, email: null, inn: null };
             dismissed.value = false;
         }, 500);
@@ -78,8 +111,12 @@ onBeforeUnmount(() => {
     if (timer) clearTimeout(timer);
 });
 
+// only «Почта на том же домене …»: weak, often a dozen of them — folded into one line
+const domainOnly = (m: SimilarMatch) => m.level === 'possible' && m.reasons.length > 0 && m.reasons.every((r) => r.startsWith('Почта на том же домене'));
 const sure = computed(() => matches.value.filter((m) => m.level === 'same'));
-const maybe = computed(() => matches.value.filter((m) => m.level === 'possible'));
+const maybe = computed(() => matches.value.filter((m) => m.level === 'possible' && !domainOnly(m)));
+const sameDomain = computed(() => matches.value.filter(domainOnly));
+const shown = computed(() => [...sure.value, ...maybe.value, ...(showDomain.value ? sameDomain.value : [])]);
 
 function linkOf(m: SimilarMatch) {
     return m.kind === 'company' ? `/lists/companies/${m.id}` : `/lists/contacts/${m.id}`;
@@ -105,9 +142,9 @@ function since(date: string | null) {
                 {{ sure.length ? 'Похоже, такой клиент уже есть' : 'Есть похожие записи' }}
             </BaseHeading>
             <ul class="flex flex-col gap-3">
-                <li v-for="m of [...sure, ...maybe]" :key="`${m.kind}-${m.id}`" class="flex flex-col gap-1 rounded-md bg-muted-100 p-3 dark:bg-muted-900">
+                <li v-for="m of shown" :key="`${m.kind}-${m.id}`" class="flex flex-col gap-1 rounded-md bg-muted-100 p-3 dark:bg-muted-900">
                     <div class="flex flex-wrap items-baseline justify-between gap-2">
-                        <NuxtLink v-if="m.visible !== false" :to="linkOf(m)" target="_blank" class="font-medium text-primary-600 hover:underline dark:text-primary-400">
+                        <NuxtLink v-if="m.visible !== false" :to="linkOf(m)" target="_blank" class="font-medium text-primary-600 underline-offset-2 hover:underline dark:text-primary-300">
                             {{ m.name }}
                         </NuxtLink>
                         <span v-else class="font-medium text-muted-800 dark:text-muted-100" title="Клиент другого менеджера: карточка вам не доступна">
@@ -124,8 +161,16 @@ function since(date: string | null) {
                     </span>
                 </li>
             </ul>
+            <button
+                v-if="sameDomain.length && !showDomain"
+                type="button"
+                class="self-start text-xs text-muted-500 underline underline-offset-2 hover:text-primary-500"
+                @click="showDomain = true"
+            >
+                {{ shown.length ? 'Ещё' : 'Записей' }} с почтой на том же домене: {{ sameDomain.length }} — показать
+            </button>
             <div>
-                <BaseButton size="sm" variant="pastel" @click="dismissed = true">Это другой клиент</BaseButton>
+                <BaseButton size="sm" variant="pastel" @click="dismiss">Это другой клиент</BaseButton>
             </div>
         </BaseCard>
     </div>

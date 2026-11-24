@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  NotFoundException,
 } from '@nestjs/common';
 import { ModuleRef } from '@nestjs/core';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -15,7 +16,7 @@ import { LoggerService } from '../helper/logger.service';
 import { RoleEnum, User } from '../user/user.entity';
 import { Email } from './email.entity';
 import { MailConnectionService } from './mail-connection.service';
-import { MailHistoryService } from './mail-history.service';
+import { HistoryItem, MailHistoryService } from './mail-history.service';
 import { addressesIn, domainOf, isFreeMail, messageIdsIn, nameFromAddress } from './mail-text';
 
 /** POST /emails/deals: one deal per client of the chosen letters. */
@@ -29,17 +30,21 @@ export interface DealFromLetters {
 }
 
 /**
- * Which deals a letter belongs to: one rule for letters received, sent from the CRM and sent from
- * a mail program (they come through the Sent mailbox).
- *  - Open deal = not closed (deal.closed_at) and not in the trash, as for Telegram and WhatsApp
- *    (the outgoing side used to check the names of the closing stages instead).
- *  - Received: the open deals of the sender — a contact (whatever their deals are) or the general
- *    address of a company (company.email) — and of the thread (In-Reply-To / References: the deals
- *    of the letter answered, which also catches a reply from the client's colleague).
- *    A contact who had deals but has no open one gets a repeat deal ("повторное обращение"), as in
- *    the messengers, for a letter of the last EMAIL_REPEAT_DEAL_DAYS days (3; 0 never).
- *  - Sent: the open deals of the contacts and company addresses among To / Cc, and of the thread.
- * A sender with no contact is not linked to anything: the manager uses «доб.контакты» / «доб.сделку».
+ * Which deal a letter belongs to: ONE deal, one rule for letters received, sent from the CRM and sent
+ * from a mail program (they come through the Sent mailbox). A letter used to go into every open deal
+ * of the contact, so the correspondence of two orders of one client got mixed.
+ *  - Open deal = not closed (deal.closed_at) and not in the trash, as for Telegram and WhatsApp.
+ *  - The deal it is written from (deal_id of the form): only that one.
+ *  - Else the deal of its thread: the deal of the letter answered (In-Reply-To), else of the newest
+ *    letter of References that is in an open deal. This also catches a reply from the client's
+ *    colleague or from the general address of the company to a letter we sent from a deal.
+ *  - Else the newest open deal of the contact (the sender; for a sent letter a recipient), else of
+ *    the company whose general address (company.email) it is.
+ *  - A received letter of a contact who had deals but has no open one opens a repeat deal
+ *    ("повторное обращение"), as in the messengers, for a letter of the last EMAIL_REPEAT_DEAL_DAYS
+ *    days (3; 0 never); else (no deal of their own) the newest open deal of the contact's company.
+ * Into another deal a letter goes only by «Перенести» in the deal or «Привязать» in Mail.
+ * A sender with no contact is not linked to anything: «Неразобранные» in Mail, «Привязать».
  */
 @Injectable()
 export class MailDealsService {
@@ -53,72 +58,117 @@ export class MailDealsService {
     private loggerService: LoggerService,
   ) {}
 
-  async forReceived(email: Email): Promise<Deal[]> {
+  /** The deal of a received letter (none or one). `noRepeat`: never open a repeat deal (letters linked later). */
+  async forReceived(email: Email, noRepeat = false): Promise<Deal[]> {
     const from = (email.from ?? '').toLowerCase();
     const contact = email.from_user?.role === RoleEnum.CTR_AGENT ? email.from_user : null;
 
-    let found = await this.openDeals(contact ? [contact.id] : [], from ? [from] : []);
-    found = merge(found, await this.threadDeals(threadIdsOf(email)));
+    const thread = await this.threadDeal(email);
+    if (thread) return [thread];
 
-    if (!found.length && contact && this.mayOpenRepeatDeal(email)) {
+    // the contact's own deal, else the deal of the company whose general address wrote
+    const own = await this.newestOpenDeal(contact ? [contact.id] : [], from ? [from] : [], false);
+    if (own) return [own];
+
+    // a client of closed deals writes again: a repeat deal, as in the messengers
+    if (!noRepeat && contact && this.mayOpenRepeatDeal(email)) {
       try {
         const created = await this.repeatDeal(contact, email);
-        if (created) found = [created];
+        if (created) return [created];
       } catch (error) {
         this.loggerService.error(`mail: repeat deal for contact ${contact.id} failed: ${(error as Error)?.message}`, (error as Error)?.stack);
       }
     }
-    return found;
+
+    // a contact of no deal of their own: the open deal of their company (a colleague's order)
+    const ofCompany = contact ? await this.newestOpenDeal([contact.id], [], true, true) : null;
+    return ofCompany ? [ofCompany] : [];
   }
 
-  async forSent(email: Email): Promise<Deal[]> {
+  /** The deal of a sent letter (none or one): the deal it was written from, else its thread, else the recipients'. */
+  async forSent(email: Email, fromDeal?: Deal | null): Promise<Deal[]> {
+    if (fromDeal) return [fromDeal];
+    const thread = await this.threadDeal(email);
+    if (thread) return [thread];
     const recipients = addressesIn([...(email.to ?? []).map((r) => r.value), ...(email.cc ?? []).map((r) => r.value)]);
-    const contacts = await this.contactIdsOf(recipients);
-    return merge(await this.openDeals(contacts, recipients), await this.threadDeals(threadIdsOf(email)));
+    const deal = await this.newestOpenDeal(await this.contactIdsOf(recipients), recipients);
+    return deal ? [deal] : [];
   }
 
-  /** Open deals where one of `contactIds` is a contact, or whose company has one of `companyAddresses`. */
-  async openDeals(contactIds: number[], companyAddresses: string[]): Promise<Deal[]> {
-    if (!contactIds.length && !companyAddresses.length) return [];
-    return this.deals
-      .createQueryBuilder('d')
-      .leftJoinAndSelect('d.stage', 'stage')
-      .leftJoin('d.company', 'company')
-      .where('d.closed_at IS NULL')
+  /**
+   * The newest open deal where one of `contactIds` is a contact; else the newest open deal of a
+   * company that has one of `companyAddresses` as its address or (`contactCompanies`) is the company
+   * of one of the contacts. `companyOnly`: skip the contacts' own deals (already looked at).
+   */
+  async newestOpenDeal(
+    contactIds: number[],
+    companyAddresses: string[],
+    contactCompanies = true,
+    companyOnly = false,
+  ): Promise<Deal | null> {
+    if (contactIds.length && !companyOnly) {
+      const own = await this.openDealsQuery()
+        .andWhere('d.id IN (SELECT du."dealId" FROM deal_user du WHERE du."userId" IN (:...mailContactIds))', {
+          mailContactIds: contactIds,
+        })
+        .getOne();
+      if (own) return own;
+    }
+    const viaContacts = contactCompanies && contactIds.length > 0;
+    if (!viaContacts && !companyAddresses.length) return null;
+    return this.openDealsQuery()
       .andWhere(
         new Brackets((w) => {
-          if (contactIds.length) {
-            w.orWhere('d.id IN (SELECT du."dealId" FROM deal_user du WHERE du."userId" IN (:...mailContactIds))', {
-              mailContactIds: contactIds,
-            });
-          }
           if (companyAddresses.length) {
-            w.orWhere('LOWER(company.email) IN (:...mailCompanyAddresses)', { mailCompanyAddresses: companyAddresses });
+            w.orWhere(
+              'd.company_id IN (SELECT c.id FROM company c WHERE c.deleted_at IS NULL AND LOWER(c.email) IN (:...mailCompanyAddresses))',
+              { mailCompanyAddresses: companyAddresses },
+            );
+          }
+          if (viaContacts) {
+            w.orWhere(
+              'd.company_id IN (SELECT u.company_id FROM "user" u WHERE u.id IN (:...mailCompanyContactIds) AND u.company_id IS NOT NULL)',
+              { mailCompanyContactIds: contactIds },
+            );
           }
         }),
       )
-      .orderBy('d.id', 'DESC')
-      .getMany();
+      .getOne();
   }
 
-  /** Open deals the letters `messageIds` are in (the thread of a reply). */
-  async threadDeals(messageIds: string[]): Promise<Deal[]> {
-    if (!messageIds.length) return [];
-    const rows: { deal_id: number }[] = await this.dataSource.query(
-      `SELECT DISTINCT e.deal_id
-         FROM event e
-         JOIN email m ON (e.after_state -> 'data') ->> 'id' = m.id::text
-        WHERE e.type = 9 AND e.deal_id IS NOT NULL AND m.message_id = ANY($1)`,
-      [messageIds],
-    );
-    const ids = rows.map((row) => Number(row.deal_id));
-    if (!ids.length) return [];
+  private openDealsQuery() {
     return this.deals
       .createQueryBuilder('d')
       .leftJoinAndSelect('d.stage', 'stage')
-      .where('d.id IN (:...threadDealIds)', { threadDealIds: ids })
-      .andWhere('d.closed_at IS NULL')
-      .getMany();
+      .where('d.closed_at IS NULL')
+      .orderBy('d.id', 'DESC');
+  }
+
+  /**
+   * The open deal of the thread of a letter: of the letter answered (In-Reply-To), else of the
+   * newest letter of References that is in an open deal; the newest entry when a letter is in several.
+   */
+  async threadDeal(email: Pick<Email, 'in_reply_to' | 'reference_ids'>): Promise<Deal | null> {
+    const ids = threadIdsOf(email);
+    if (!ids.length) return null;
+    const rows: { deal_id: number; message_id: string; event_id: number }[] = await this.dataSource.query(
+      `SELECT e.deal_id, m.message_id, max(e.id) AS event_id
+         FROM event e
+         JOIN email m ON (e.after_state -> 'data') ->> 'id' = m.id::text
+         JOIN deal d ON d.id = e.deal_id AND d.deleted_at IS NULL AND d.closed_at IS NULL
+        WHERE e.type = 9 AND m.message_id = ANY($1)
+        GROUP BY e.deal_id, m.message_id`,
+      [ids],
+    );
+    if (!rows.length) return null;
+    // In-Reply-To first, then References from the newest (the last one) back
+    const order = [...messageIdsIn(email.in_reply_to), ...messageIdsIn(email.reference_ids).reverse()];
+    const rank = (id: string) => {
+      const i = order.indexOf(id);
+      return i < 0 ? order.length : i;
+    };
+    rows.sort((a, b) => rank(a.message_id) - rank(b.message_id) || Number(b.event_id) - Number(a.event_id));
+    return this.openDealsQuery().andWhere('d.id = :threadDealId', { threadDealId: Number(rows[0].deal_id) }).getOne();
   }
 
   async contactIdsOf(addresses: string[]): Promise<number[]> {
@@ -263,18 +313,139 @@ export class MailDealsService {
       );
       letters += Number(updated?.[1] ?? 0);
 
-      const deals = await this.openDeals([contact.id], []);
-      if (!deals.length) continue;
-      const stored = await this.lettersOf(address, []);
-      history += await this.history.add(
-        stored.map((letter) => ({
-          email: letter,
-          deals,
-          originatedBy: letter.outgoing ? letter.sent_by ?? letter.from_user ?? null : contact,
-        })),
-      );
+      history += await this.addStored(await this.lettersOf(address, []), contact);
     }
     return { letters, history };
+  }
+
+  /**
+   * Letters of no contact whose sender has become a contact since (the e-mail was added to the card,
+   * a contact was created by hand): they point to the contact and go into its deal by the rule.
+   * A few contacts per run (the mail sync calls it every few minutes).
+   */
+  async linkLettersOfNewContacts(limit = 20): Promise<{ letters: number; history: number }> {
+    const rows: { id: number }[] = await this.dataSource.query(
+      `SELECT DISTINCT u.id
+         FROM email e
+         JOIN "user" u ON lower(u.email) = lower(e."from") AND u.role = $1 AND u.deleted_at IS NULL
+        WHERE e.user_id IS NULL AND e.outgoing = false AND e.deleted_at IS NULL AND e.is_spam = false
+        LIMIT $2`,
+      [RoleEnum.CTR_AGENT, limit],
+    );
+    if (!rows.length) return { letters: 0, history: 0 };
+    return this.linkContacts(rows.map((row) => Number(row.id)));
+  }
+
+  /**
+   * Stored letters that are in no deal yet go by the rule of one deal (their thread, else the newest
+   * open deal of the contact / company); no repeat deal is opened for old letters.
+   */
+  async addStored(letters: Email[], contact: User | null): Promise<number> {
+    const items: HistoryItem[] = [];
+    for (const letter of letters) {
+      if (await this.inSomeDeal(letter.id)) continue;
+      if (contact && !letter.outgoing && !letter.from_user) letter.from_user = contact;
+      const deals = letter.outgoing ? await this.forSent(letter) : await this.forReceived(letter, true);
+      if (deals.length) {
+        items.push({ email: letter, deals, originatedBy: letter.outgoing ? letter.sent_by ?? null : letter.from_user ?? contact });
+      }
+    }
+    return this.history.add(items);
+  }
+
+  private async inSomeDeal(emailId: number): Promise<boolean> {
+    const rows = await this.dataSource.query(
+      `SELECT 1 FROM event e JOIN deal d ON d.id = e.deal_id AND d.deleted_at IS NULL
+        WHERE e.type = 9 AND (e.after_state -> 'data') ->> 'id' = $1 LIMIT 1`,
+      [String(emailId)],
+    );
+    return rows.length > 0;
+  }
+
+  /**
+   * «Привязать» in Mail: a letter of no deal goes into the chosen deal (the user must be allowed to
+   * change it; not a closed one), and / or its sender becomes the chosen contact (the contact gets
+   * the address when it has none; the other stored letters of the address follow by the rule).
+   */
+  async linkLetter(
+    letter: Email,
+    input: { deal_id?: number; contact_id?: number },
+    authUser: AuthUser,
+  ): Promise<{ deal: { id: number; display_id: number; label: string } | null; contact: { id: number; username: string } | null; letters: number }> {
+    const access = new Access(authUser);
+    let deal: Deal | null = null;
+    if (input.deal_id) {
+      deal = await this.writableDeal(Number(input.deal_id), access);
+    }
+
+    let contact: User | null = null;
+    let letters = 0;
+    if (input.contact_id) {
+      contact = await this.users.findOne({ where: { id: Number(input.contact_id) }, relations: ['company'] });
+      if (!contact || contact.role !== RoleEnum.CTR_AGENT) {
+        throw new BadRequestException('Выберите контакт клиента');
+      }
+      if (!access.can('contact', 'update')) {
+        throw new ForbiddenException('Нет права изменять контакты');
+      }
+      const address = this.counterpart(letter);
+      if (!address) throw new BadRequestException('В письме нет адреса клиента');
+      if ((await this.staffOf([address])).length) {
+        throw new BadRequestException(`${address} — адрес сотрудника, контакту его не присвоить`);
+      }
+      if (!contact.email) {
+        await this.users.update(contact.id, { email: address });
+        contact.email = address;
+      }
+      const updated: [unknown, number] = await this.dataSource.query(
+        `UPDATE email SET user_id = $1 WHERE user_id IS NULL AND outgoing = false AND lower("from") = $2`,
+        [contact.id, address],
+      );
+      letters = Number(updated?.[1] ?? 0);
+      if (!letter.outgoing) letter.from_user = contact;
+    }
+
+    if (deal) {
+      await this.history.add([
+        { email: letter, deals: [deal], originatedBy: letter.outgoing ? letter.sent_by ?? null : letter.from_user ?? contact },
+      ]);
+    } else if (contact) {
+      await this.addStored([letter], contact);
+    }
+    if (contact) {
+      // the other letters of this address that are in no deal follow the rule too
+      await this.addStored(await this.lettersOf(String(contact.email).toLowerCase(), [letter.id]), contact);
+    }
+
+    return {
+      deal: deal ? { id: deal.id, display_id: deal.display_id, label: deal.label } : null,
+      contact: contact ? { id: contact.id, username: contact.username } : null,
+      letters,
+    };
+  }
+
+  /**
+   * A deal a letter may be written into by `access`: it exists, is not in the trash (404), the user
+   * may change it (403) and it is not closed (400).
+   */
+  async writableDeal(dealId: number, access: Access): Promise<Deal> {
+    const deal = await this.deals
+      .createQueryBuilder('d')
+      .leftJoinAndSelect('d.stage', 'stage')
+      .leftJoinAndSelect('d.agent', 'agent')
+      .leftJoinAndSelect('agent.group', 'agent_group')
+      .where('d.id = :writableDealId', { writableDealId: dealId })
+      .getOne();
+    if (!deal || !access.allowsDeal('view', deal.agent?.id ?? null, (deal.agent as any)?.group?.id ?? null)) {
+      throw new NotFoundException(`Сделка ${dealId} не найдена`);
+    }
+    if (!access.allowsDeal('update', deal.agent?.id ?? null, (deal.agent as any)?.group?.id ?? null)) {
+      throw new ForbiddenException('Нет права изменять эту сделку: письмо в её историю не добавить');
+    }
+    if (deal.closed_at) {
+      throw new BadRequestException('Сделка закрыта: письмо в её историю не добавить. Отправьте письмо без сделки или из открытой сделки');
+    }
+    return deal;
   }
 
   /** The client of a letter: its sender, or for a letter we sent the first recipient that is not ours. */
@@ -423,12 +594,6 @@ export class MailDealsService {
     const { DealService: Service } = await import('../deal/deal.service');
     return this.moduleRef.get(Service, { strict: false });
   }
-}
-
-function merge(first: Deal[], second: Deal[]): Deal[] {
-  const out = [...first];
-  for (const deal of second) if (!out.some((d) => d.id === deal.id)) out.push(deal);
-  return out;
 }
 
 /** The Message-IDs of the letters a letter answers. */

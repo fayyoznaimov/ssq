@@ -180,7 +180,7 @@ const lateWarning = computed(() => (report.value?.summary.in_sla_share ?? 100) <
                     v-for="minutes of SLA_OPTIONS"
                     :key="minutes"
                     color="default"
-                    :class="sla === minutes ? '!bg-muted-200 dark:!bg-muted-600' : ''"
+                    :class="sla === minutes ? 'toggle-selected' : ''"
                     @click="sla = minutes"
                 >
                     <span>Норматив {{ minutes }} мин</span>
@@ -262,7 +262,7 @@ const lateWarning = computed(() => (report.value?.summary.in_sla_share ?? 100) <
                     class="flex flex-wrap items-center justify-between gap-3 py-3"
                 >
                     <div class="flex min-w-0 flex-col gap-1">
-                        <NuxtLink :to="`/deals/${item.deal_id}`" class="font-medium text-primary-600 hover:underline dark:text-primary-400">
+                        <NuxtLink :to="`/deals/${item.deal_id}`" class="font-medium text-primary-600 hover:underline dark:text-primary-200">
                             {{ item.contact_name || item.deal_label }} · {{ CHANNELS[item.channel] ?? item.channel }}
                         </NuxtLink>
                         <span class="truncate text-sm text-muted-500 dark:text-muted-400">

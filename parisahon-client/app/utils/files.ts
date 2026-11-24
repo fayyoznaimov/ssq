@@ -16,7 +16,8 @@ export const getFileIcon = (fileName?: string) => {
         return "ph:file";
     }
 
-    const ext = fileName.split(".").pop()?.toLowerCase();
+    // a file name the API returns is signed ("abc.pdf?e=…&s=…", FileLink): the extension is before the "?"
+    const ext = fileName.split("?")[0].split(".").pop()?.toLowerCase();
     if (ext && supportedExtensions[ext]) return `ph:file-${ext}`;
     return "ph:file";
 };
@@ -24,7 +25,11 @@ export const getFileIcon = (fileName?: string) => {
 /** Per file, the same as FileService.MAX_FILE_SIZE in the API (nginx takes 10 MB per request) */
 export const MAX_UPLOAD_MB = 10;
 
-/** Address of an uploaded file (the `path` of a file row): <apiUrl>/uploads/<path> */
+/**
+ * Address of an uploaded file (the `path` of a file row): <apiUrl>/uploads/<path>. The API returns the
+ * path with its signature (?e=<expiry>&s=<signature>, valid 12 hours), so the link opens without a login
+ * header (<img>, <audio>, <a>) and stops working later; it is used as it is.
+ */
 export const uploadUrl = (path: string) => (path ? `${useApiUrl()}/uploads/${path}` : "");
 
 /**
@@ -40,7 +45,7 @@ export const downloadFile = async (fileUrl: string, fileName?: string) => {
     const url = window.URL.createObjectURL(await response.blob());
     const a = document.createElement("a");
     a.href = url;
-    a.download = fileName || fileUrl.split("/").pop() || "file";
+    a.download = fileName || fileUrl.split("?")[0].split("/").pop() || "file";
     document.body.appendChild(a);
     a.click();
     a.remove();

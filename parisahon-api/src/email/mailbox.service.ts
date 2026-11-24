@@ -40,6 +40,17 @@ const IN_DEALS = `SELECT 1 FROM event eh JOIN deal dh ON dh.id = eh.deal_id AND 
   WHERE eh.type = 9 AND (eh.after_state -> 'data') ->> 'id' = t0.id::text`;
 
 /**
+ * A letter of a client: it is in a deal, or its sender is a contact or the address of a company.
+ * «Неразобранные» are the others (newsletters, a new client's first letter): «Привязать» them.
+ */
+const OF_CLIENT = `(EXISTS (${IN_DEALS})
+  OR EXISTS (SELECT 1 FROM "user" cu WHERE cu.id = t0.user_id AND cu.role = 'ctr_agent')
+  OR EXISTS (SELECT 1 FROM company cc WHERE cc.deleted_at IS NULL AND lower(cc.email) = lower(t0.from)))`;
+
+/** «Прочитано» for the user `:reader` (email_read); letters we sent are read. */
+const READ_BY = `(t0.outgoing = true OR EXISTS (SELECT 1 FROM email_read er WHERE er.email_id = t0.id AND er.user_id = :reader))`;
+
+/**
  * The stored emails as the staff work with them: list, open (marks read),
  * spam, delete. Admin and manager see every email, an agent the emails of their own
  * mailboxes (their address, a mailbox the mail server accepted the password of), the replies
@@ -86,9 +97,12 @@ export class MailboxService {
         );
     }
 
+    // a manager's mailbox: the letters with the address among To (one row per address now; older
+    // rows with several addresses are matched inside the header)
     if (user && AuthGuard.MANAGER_LEVEL.includes(user.role) && query.email_to) {
-      qb.leftJoin('t0.to', 't6').andWhere('t6.value = :email_to', {
-        email_to: query.email_to,
+      const address = addressesIn([query.email_to])[0] ?? query.email_to.trim().toLowerCase();
+      qb.andWhere('EXISTS (SELECT 1 FROM email_to t6 WHERE t6.email_id = t0.id AND t6.value ~* :email_to_re)', {
+        email_to_re: addressPattern([address]),
       });
     }
 
@@ -127,6 +141,13 @@ export class MailboxService {
       qb.andWhere(`NOT EXISTS (${IN_DEALS})`);
     }
 
+    // «От клиентов» / «Неразобранные» (no deal, the sender is no contact or company)
+    if (query.of_client?.toLowerCase() === 'true') {
+      qb.andWhere(OF_CLIENT);
+    } else if (query.of_client?.toLowerCase() === 'false') {
+      qb.andWhere(`NOT ${OF_CLIENT}`);
+    }
+
     if (query.stages?.length) {
       qb.andWhere(`EXISTS (${IN_DEALS} AND dh.stage_id IN (:...stage_ids))`, {
         stage_ids: query.stages,
@@ -156,9 +177,9 @@ export class MailboxService {
     }
 
     if (query.read) {
-      qb.andWhere('t0.read = :read', {
-        read: query.read.toLowerCase() === 'true',
-      });
+      const read = query.read.toLowerCase() === 'true';
+      if (user) qb.andWhere(`${READ_BY} = :read`, { reader: user.id, read });
+      else qb.andWhere('t0.read = :read', { read });
     }
 
     if (query.outgoing) {
@@ -172,12 +193,38 @@ export class MailboxService {
       query,
     );
     await this.describe(page.data ?? [], authUser ?? toAuthUser(user));
+    await this.readFor(page.data ?? [], user);
     return page;
   }
 
-  async fetchOneLocalEmail(id: number, user: User, authUser: AuthUser = null): Promise<Email> {
-    let email = await this.getAccessibleEmail(id, user, ['files']);
+  /** `read` of the letters as the user sees it: opened by them (email_read), or sent by us. */
+  private async readFor(emails: Email[], user: User | null): Promise<void> {
+    if (!user || !emails.length) return;
+    const rows: { email_id: number }[] = await this.dataSource.query(
+      `SELECT email_id FROM email_read WHERE user_id = $1 AND email_id = ANY($2)`,
+      [user.id, emails.map((e) => e.id)],
+    );
+    const read = new Set(rows.map((row) => Number(row.email_id)));
+    for (const email of emails) email.read = email.outgoing || read.has(email.id);
+  }
 
+  /** «Прочитано» for the user (the drawer, «Отметить как прочитанное», the letter opened in a deal). */
+  async markRead(ids: number[], user: User): Promise<{ read: number }> {
+    let read = 0;
+    for (const id of [...new Set(ids.map(Number))]) {
+      const email = await this.getAccessibleEmail(id, user);
+      await this.readBy(email, user);
+      read++;
+    }
+    return { read };
+  }
+
+  /** The user read the letter: their mark, and \Seen on the server (the flag of the shared mailbox). */
+  private async readBy(email: Email, user: User): Promise<void> {
+    await this.dataSource.query(
+      `INSERT INTO email_read (email_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [email.id, user.id],
+    );
     if (email.email_id && email.read === false) {
       // The local copy is readable even when the mail server is not reachable,
       // so a failure to set \Seen there must not block opening the email.
@@ -189,10 +236,16 @@ export class MailboxService {
       } catch (error) {
         this.loggerService.error('Error adding \\Seen flag:', error.stack);
       }
-
       await this.emailRepository.update(email.id, { read: true });
-      email.read = true;
     }
+  }
+
+  async fetchOneLocalEmail(id: number, user: User, authUser: AuthUser = null): Promise<Email> {
+    let email = await this.getAccessibleEmail(id, user, ['files']);
+
+    // read by this user (it used to become read for everyone in Cc)
+    await this.readBy(email, user);
+    email.read = true;
 
     // The relation only served the access check
     delete email.sent_by;
@@ -222,6 +275,11 @@ export class MailboxService {
    */
   async deleteEmail(id: number, user: User): Promise<void> {
     const email = await this.getAccessibleEmail(id, user);
+    // the letters of the shared mailbox are everybody's: an agent deletes only a letter they sent or
+    // one written to them alone (an agent in Cc used to delete a client's letter for the whole department)
+    if (!(await this.mayDelete(email, user))) {
+      throw new ForbiddenException('Удалять письма общего ящика может только администратор или руководитель');
+    }
     const trash = this.connection.mailboxes.trash;
 
     if (email.email_id && trash && email.from_mailbox !== trash) {
@@ -248,6 +306,27 @@ export class MailboxService {
     await this.emailRepository.update(email.id, { deleted_by: { id: user.id } as User });
     await this.emailRepository.softDelete(email.id);
     this.loggerService.log(`mail: letter ${email.id} "${email.subject ?? ''}" deleted by user ${user.id}`);
+  }
+
+  /**
+   * May `user` delete the letter: an admin or a manager any; an agent a letter they sent, or one
+   * written to them and to no colleague (not to the shared mailbox, not to other staff).
+   */
+  private async mayDelete(email: Email, user: User): Promise<boolean> {
+    if (AuthGuard.MANAGER_LEVEL.includes(user.role)) return true;
+    if (email.sent_by?.id === user.id) return true;
+    const own = await this.ownAddresses(user);
+    const recipients = addressesIn([...(email.to ?? []), ...(email.cc ?? [])].map((r) => r.value));
+    if (!recipients.some((address) => own.includes(address))) return false;
+    const others = recipients.filter((address) => !own.includes(address));
+    if (!others.length) return true;
+    const shared = String(process.env.EMAIL_DEFAULT_USER ?? '').trim().toLowerCase();
+    if (shared && others.includes(shared)) return false;
+    const staff = await this.dataSource.query(
+      `SELECT 1 FROM "user" WHERE role <> 'ctr_agent' AND deleted_at IS NULL AND lower(email) = ANY($1) LIMIT 1`,
+      [others],
+    );
+    return !staff.length;
   }
 
   /** «Восстановить»: a deleted letter goes back to INBOX (one we sent: to Sent) and is shown again. */
@@ -559,7 +638,7 @@ export class MailboxService {
 }
 
 /** The access of a user loaded from the database (the request's token carries the same). */
-function toAuthUser(user: User | null): AuthUser | null {
+export function toAuthUser(user: User | null): AuthUser | null {
   if (!user) return null;
   return {
     sub: user.id,

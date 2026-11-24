@@ -1,10 +1,11 @@
 <template>
-    <div class="flex items-center">
+    <div class="flex shrink-0 items-center whitespace-nowrap">
         <BaseButton v-if="selected" @click="update()"
                     class="!px-3 !rounded-r-none !border-e-0">
             <Icon name="ph:x"></Icon>
         </BaseButton>
         <BaseDropdown
+            class="[&_button]:whitespace-nowrap"
             :class="{'date-filter': selected}"
             flavor="button"
             :label="selected || props.label"

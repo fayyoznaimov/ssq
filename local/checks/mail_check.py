@@ -3,7 +3,8 @@
 Regression checks for the mail module (block 6): access rights, outgoing emails in deal
 history, batched sync, UIDVALIDITY changes; the findings of the review of 2026-11 (review_wave:
 threads and names, signature, mailboxes only one's own and checked, a broken letter, a returning
-client, the company address, deals and contacts made from letters, Trash instead of EXPUNGE).
+client, the company address, deals and contacts made from letters, Trash instead of EXPUNGE) and of
+fix wave 1b (wave_1b: one deal per letter, per-user «прочитано», «Неразобранные» / «Привязать»).
 
     py local/checks/mail_check.py
 
@@ -614,8 +615,8 @@ def main():
     s_out2 = P + "-out-with-deal"
     status, body = http("POST", "/emails", {"subject": s_out2, "body": "<p>from the deal card</p>", "to": [client_email], "deal_id": str(deal_other)})
     check("POST /emails with deal_id (the 'Привязать сделку' field) -> 201", status in (200, 201), "%s %s" % (status, message_of((status, body))))
-    check("… history of the chosen deal AND of the recipient's deal, once each",
-          events_for(deal_other, s_out2, wait=10) == 1 and events_for(deal_client, s_out2, wait=10) == 1, (events_for(deal_other, s_out2), events_for(deal_client, s_out2)))
+    check("… history of the chosen deal only, once (wave 1b: a letter goes into one deal, not also the recipient's)",
+          events_for(deal_other, s_out2, wait=10) == 1 and events_for(deal_client, s_out2) == 0, (events_for(deal_other, s_out2), events_for(deal_client, s_out2)))
     status, body = http("POST", "/emails", {"subject": P + "-out-bad-deal", "body": "x", "to": [client_email], "deal_id": "999999999"})
     check("unknown deal_id -> 404, nothing sent", status == 404 and email_row(P + "-out-bad-deal") is None, "%s %s" % (status, message_of((status, body))))
 
@@ -721,6 +722,11 @@ def main():
         "admin_id": admin_id, "shared": shared, "stage_id": stage_id, "agent_a": agent_a, "agent_b": agent_b,
         "no_mail": no_mail, "client_email": client_email, "contact_id": contact_id, "company_id": company_id,
         "deal_client": deal_client, "in1": in1, "s_in1": s_in1, "s_out3": s_out3, "events_for": events_for,
+    })
+
+    wave_1b({
+        "admin_id": admin_id, "shared": shared, "stage_id": stage_id, "agent_a": agent_a, "agent_b": agent_b,
+        "manager": manager, "company_id": company_id, "events_for": events_for,
     })
 
     # ================================================================= client
@@ -993,6 +999,161 @@ def review_wave(x):
           out.get("moved") and count("SELECT count(*) FROM email WHERE subject = %s AND deleted_at IS NULL" % q(s_in1)) == 0
           and count("SELECT count(*) FROM email WHERE subject = %s" % q(s_in1)) == 2 and events_for(deal_client, s_in1) == 1,
           (out, sql("SELECT id, from_mailbox, deleted_at IS NOT NULL FROM email WHERE subject = %s" % q(s_in1)), events_for(deal_client, s_in1)))
+
+
+def wave_1b(x):
+    """Fix wave 1b of the mail (live findings of 2026-11-23): one deal per letter, the thread, the deal
+    written from, per-user «прочитано», who deletes, «Неразобранные» and «Привязать», colleagues' letters."""
+    admin_id, shared, agent_a, agent_b, manager = x["admin_id"], x["shared"], x["agent_a"], x["agent_b"], x["manager"]
+    company_id, events_for = x["company_id"], x["events_for"]
+
+    def new_deal(label, agent, closed=False):
+        return int(scalar(
+            "INSERT INTO deal (label, display_id, budget, stage_id, agent_id, created_by, company_id, closed_at) "
+            "VALUES (%s, %d, 100, %d, %d, %d, %d, %s) RETURNING id"
+            % (q(label), 900000000 + secrets.randbelow(90000000), x["stage_id"], agent, admin_id, company_id,
+               "now() - interval '1 day'" if closed else "NULL")))
+
+    def wait_for(fn, wait=15):
+        deadline = time.time() + wait
+        while True:
+            value = fn()
+            if value or time.time() >= deadline:
+                return value
+            time.sleep(1)
+
+    # ----------------------------------------------------------------- one deal
+    section("Wave 1b: a letter goes into ONE deal — the deal written from, the thread, else the newest (MAIL-3, MAIL-5, MAIL-7)")
+    two_email = "auditml-two-%s@%s" % (RUN, DOMAIN)
+    two_id = int(scalar("INSERT INTO \"user\" (username, email, role, company_id) VALUES (%s, %s, 'ctr_agent', %d) RETURNING id"
+                        % (q(P + "-two"), q(two_email), company_id)))
+    older = new_deal(P + "-two-older", agent_a["id"])
+    newer = new_deal(P + "-two-newer", agent_a["id"])
+    closed = new_deal(P + "-two-closed", agent_a["id"], closed=True)
+    for deal in (older, newer, closed):
+        sql('INSERT INTO deal_user ("dealId", "userId") VALUES (%d, %d)' % (deal, two_id))
+
+    s_two = P + "-two-deals"
+    node("await smtp({ from: %s, to: %s, subject: %s, text: 'which deal?' });" % (json.dumps(two_email), json.dumps(shared), json.dumps(s_two)))
+    sync()
+    check("an incoming letter of a contact with two open deals goes into the newest open deal only (was: into every open deal)",
+          events_for(newer, s_two, wait=10) == 1 and events_for(older, s_two) == 0 and events_for(closed, s_two) == 0,
+          (events_for(newer, s_two), events_for(older, s_two), events_for(closed, s_two)))
+
+    s_from_older = P + "-from-older"
+    status, body = http("POST", "/emails", {"subject": s_from_older, "body": "<p>offer</p>", "to": [two_email], "deal_id": str(older)})
+    check("POST /emails with deal_id -> 201, the letter is in that deal only (was: also in every open deal of the recipient)",
+          status in (200, 201) and events_for(older, s_from_older, wait=10) == 1 and events_for(newer, s_from_older) == 0,
+          "%s %s %s" % (status, message_of((status, body)), (events_for(older, s_from_older), events_for(newer, s_from_older))))
+    status, body = http("POST", "/emails", {"subject": P + "-to-closed", "body": "x", "to": [two_email], "deal_id": str(closed)})
+    check("POST /emails with a closed deal -> 400 in Russian, nothing sent",
+          status == 400 and email_row(P + "-to-closed") is None and re.search("[а-яА-Я]", message_of((status, body)) or ""),
+          "%s %s" % (status, message_of((status, body))))
+
+    mid = scalar("SELECT message_id FROM email WHERE subject = %s" % q(s_from_older))
+    s_reply = "Re: " + s_from_older
+    node("await smtp({ from: %s, to: %s, subject: %s, text: 'agreed', inReplyTo: %s, references: [%s] });"
+         % (json.dumps(two_email), json.dumps(shared), json.dumps(s_reply), json.dumps(mid), json.dumps(mid)))
+    sync()
+    check("the client's reply (In-Reply-To) goes into the deal the letter was written from, not into the newest one",
+          events_for(older, s_reply, wait=10) == 1 and events_for(newer, s_reply) == 0, (mid, events_for(older, s_reply), events_for(newer, s_reply)))
+
+    # ----------------------------------------------------------------- MAIL-17
+    section("Wave 1b: validation in Russian, 400 not 500 (MAIL-17)")
+    status, body = http("POST", "/emails", {"subject": P + "-no-to", "body": "x", "to": []})
+    check("POST /emails without recipients -> 400 «Укажите адрес получателя» (was: 500, SQL error)",
+          status == 400 and "получател" in (message_of((status, body)) or ""), "%s %s" % (status, message_of((status, body))))
+
+    # ----------------------------------------------------------------- MAIL-10 / MAIL-11
+    section("Wave 1b: «прочитано» per user, who deletes a letter of the shared mailbox (MAIL-10, MAIL-11)")
+    s_read = P + "-read-per-user"
+    node("await smtp({ from: 'Someone <auditml-ext5@example.test>', to: %s, cc: %s, subject: %s, text: 'for both' });"
+         % (json.dumps(agent_a["email"]), json.dumps(agent_b["email"]), json.dumps(s_read)))
+    sync()
+    row = email_row(s_read)
+    letter = int(row[0]) if row else 0
+    status, _ = http("GET", "/emails/%d" % letter, token=agent_a["token"])
+    status_a, body_a = http("GET", "/emails?read=false&limit=200&sort[id]=-1", token=agent_a["token"])
+    status_b, body_b = http("GET", "/emails?read=false&limit=200&sort[id]=-1", token=agent_b["token"])
+    check("A opens the letter: it is read for A, still unread for B in Cc (was: read for everybody)",
+          status == 200 and letter not in ids_of(body_a) and letter in ids_of(body_b), (status, status_a, status_b))
+    status, body = http("PATCH", "/emails/read", {"ids": [letter]}, token=agent_b["token"])
+    status_b, body_b = http("GET", "/emails?read=false&limit=200&sort[id]=-1", token=agent_b["token"])
+    check("PATCH /emails/read (B) -> 200, now read for B too",
+          status == 200 and letter not in ids_of(body_b), "%s %s" % (status, message_of((status, body))))
+    status, body = http("DELETE", "/emails/%d" % letter, token=agent_b["token"])
+    check("B in Cc deletes the letter of A and B -> 403, the letter stays (was: erased for everybody)",
+          status == 403 and count("SELECT count(*) FROM email WHERE id = %d AND deleted_at IS NULL" % letter) == 1,
+          "%s %s" % (status, message_of((status, body))))
+    status, body = http("DELETE", "/emails/%d" % letter, token=manager["token"])
+    check("the manager deletes it -> 200, softly, recorded (deleted_by)",
+          status == 200 and scalar("SELECT deleted_by_id FROM email WHERE id = %d" % letter) == str(manager["id"]),
+          "%s %s" % (status, message_of((status, body))))
+
+    # ----------------------------------------------------------------- OMNI-5
+    section("Wave 1b: «Неразобранные» and «Привязать» (OMNI-5, MAIL-8)")
+    unknown = "auditml-unknown-%s@%s" % (RUN, DOMAIN)
+    s_unknown = P + "-unknown-sender"
+    node("await smtp({ from: %s, to: %s, subject: %s, text: 'first letter of a new client' });" % (json.dumps(unknown), json.dumps(shared), json.dumps(s_unknown)))
+    sync()
+    row = email_row(s_unknown)
+    letter = int(row[0]) if row else 0
+    status, unsorted = http("GET", "/emails?of_client=false&outgoing=false&limit=200&sort[id]=-1")
+    status2, sorted_ = http("GET", "/emails?of_client=true&outgoing=false&limit=200&sort[id]=-1")
+    check("the first letter of an unknown sender is in «Неразобранные» (of_client=false), not in «От клиентов»",
+          status == 200 and status2 == 200 and letter in ids_of(unsorted) and letter not in ids_of(sorted_), (status, status2, letter))
+    status, body = http("POST", "/emails/%d/link" % letter, {"deal_id": closed})
+    check("«Привязать» to a closed deal -> 400", status == 400, "%s %s" % (status, message_of((status, body))))
+    status, body = http("POST", "/emails/%d/link" % letter, {"deal_id": newer, "contact_id": two_id})
+    check("«Привязать» to a deal and a contact -> 200: the letter is in the deal's history and points to the contact",
+          status == 200 and events_for(newer, s_unknown, wait=10) == 1 and scalar("SELECT user_id FROM email WHERE id = %d" % letter) == str(two_id),
+          "%s %s" % (status, body))
+    status, body = http("POST", "/emails/%d/link" % letter, {})
+    check("«Привязать» with nothing chosen -> 400", status == 400, status)
+
+    late = "auditml-late-%s@%s" % (RUN, DOMAIN)
+    s_late = P + "-late-contact"
+    node("await smtp({ from: %s, to: %s, subject: %s, text: 'before the card had my e-mail' });" % (json.dumps(late), json.dumps(shared), json.dumps(s_late)))
+    sync()
+    late_id = int(scalar("INSERT INTO \"user\" (username, email, role, company_id) VALUES (%s, %s, 'ctr_agent', %d) RETURNING id"
+                         % (q(P + "-late"), q(late), company_id)))
+    late_deal = new_deal(P + "-late-deal", agent_a["id"])
+    sql('INSERT INTO deal_user ("dealId", "userId") VALUES (%d, %d)' % (late_deal, late_id))
+    sync()
+    check("a letter stored before its sender's e-mail was in a card: the next sync links it to the contact and the contact's deal",
+          wait_for(lambda: scalar("SELECT user_id FROM email WHERE subject = %s" % q(s_late)) == str(late_id))
+          and events_for(late_deal, s_late, wait=10) == 1,
+          (scalar("SELECT user_id FROM email WHERE subject = %s" % q(s_late)), events_for(late_deal, s_late)))
+
+    # ----------------------------------------------------------------- MAIL-18
+    section("Wave 1b: colleagues' letters are incoming, one To row per address (MAIL-18)")
+    domain = shared.split("@")[-1] if "@" in shared else "parisahome.com"
+    colleague = "auditml-colleague-%s@%s" % (RUN, domain)
+    s_colleague = P + "-colleague"
+    node("await smtp({ from: %s, to: %s, subject: %s, text: 'a forwarded request' });" % (json.dumps(colleague), json.dumps(shared), json.dumps(s_colleague)))
+    s_many = P + "-two-recipients"
+    node("await smtp({ from: 'Someone <auditml-ext6@example.test>', to: [%s, '\"Agent B\" <%s>'], subject: %s, text: 'to two' });"
+         % (json.dumps(shared), agent_b["email"], json.dumps(s_many)))
+    sync()
+    check("a colleague's letter to the shared mailbox is incoming (was: in «Отправленные»)",
+          scalar("SELECT outgoing::text FROM email WHERE subject = %s" % q(s_colleague)) == "false",
+          sql("SELECT id, outgoing, from_mailbox FROM email WHERE subject = %s" % q(s_colleague)))
+    check("To with two addresses: two rows, the filter by an address finds the letter",
+          count("SELECT count(*) FROM email_to t JOIN email e ON e.id = t.email_id WHERE e.subject = %s" % q(s_many)) == 2,
+          sql("SELECT t.value FROM email_to t JOIN email e ON e.id = t.email_id WHERE e.subject = %s" % q(s_many)))
+
+    # ----------------------------------------------------------------- client
+    section("Wave 1b: the mail page")
+    page = read_file(CLIENT, os.path.join("pages", "mails", "index.vue"))
+    letter_page = read_file(CLIENT, os.path.join("pages", "mails", "index", "[id].vue"))
+    check("SCR4-1: no fixed column widths (w-96, w-[60rem]) and no column resizing; the date is a column of its own",
+          "w-[60rem]" not in page and "ResizeObserver" not in page and "mail-cols" in page and "shortDate" in page)
+    check("SCR4-3 / OMNI-5: «От клиентов / Неразобранные / Все» (of_client), «Синхронизировать», «Писем нет», «(без темы)»",
+          "of_client" in page and "Неразобранные" in page and "Синхронизировать" in page and "Писем нет" in page and "(без темы)" in page)
+    check("MAIL-10: «Прочитано» goes through PATCH /emails/read (per user), not by opening every letter",
+          'patch("read"' in page)
+    check("OMNI-5: the letter has «Привязать» (POST /emails/:id/link) for a deal and a contact",
+          "/link`" in letter_page and "selectedContact" in letter_page)
 
 
 def run():

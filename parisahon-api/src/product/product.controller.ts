@@ -10,6 +10,7 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
+import { ProductStatsQueryDto } from '../analytics/dto/product-stats.query.dto';
 import { ProductService } from './product.service';
 import {
   PaginationRequestDto,
@@ -36,9 +37,10 @@ export class ProductController {
     return this.productService.fetchAll(query);
   }
 
+  /** «По товарам»: a page of products sold in deals; from_date / till_date — the deals created in that period. */
   @Get('statistics')
   async fetchProductStats(
-    @Query() query: PaginationRequestDto,
+    @Query() query: ProductStatsQueryDto,
   ): Promise<PaginationResponseDto<any>> {
     return this.productService.getProductStats(query);
   }

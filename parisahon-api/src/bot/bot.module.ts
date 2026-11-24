@@ -14,6 +14,8 @@ import { BotReminderService } from './bot-reminder.service';
 import { BotMcpController } from './bot-mcp.controller';
 import { BotLinkController } from './bot-link.controller';
 import { AutomationModule } from '../automation/automation.module';
+import { EventsModule } from '../events/events.module';
+import { AiModule } from '../ai/ai.module';
 
 @Module({
   imports: [
@@ -22,6 +24,9 @@ import { AutomationModule } from '../automation/automation.module';
     TaskModule,
     RecognitionModule,
     AutomationModule,
+    EventsModule,
+    // the bot tool deal_summary (AiDealService)
+    AiModule,
   ],
   providers: [BotService, BotCrmService, BotToolsService, BotAssistantService, BotSpeechService, BotReminderService, BotWaitingService],
   controllers: [BotMcpController, BotLinkController],

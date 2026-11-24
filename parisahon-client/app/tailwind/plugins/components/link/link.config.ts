@@ -6,11 +6,11 @@ export const defaultConfig = {
         color: {
             hover: {
                 light: 'primary-500',
-                dark: 'primary-400',
+                dark: 'primary-200',
             },
             focus: {
                 light: 'primary-500',
-                dark: 'primary-400',
+                dark: 'primary-200',
             },
         },
     },

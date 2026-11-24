@@ -158,8 +158,9 @@ const { runWithId, isLoadingMap } = useAsync();
 
 const columns: Column<Deal>[] = [
     { label: 'Номер', name: 'display_id', sortable: true, headerStyle: { width: '90px' } },
-    { label: 'Название сделки', name: 'label', sortable: true, resizable: true },
-    { label: 'Этап', name: 'stage', field: (deal) => escapeHtml(deal.stage?.name), resizable: true },
+    // on a phone the card is headed by the name, with «Восстановить» under it
+    { label: 'Название сделки', name: 'label', sortable: true, resizable: true, mobile: 'title', maxWidth: 360 },
+    { label: 'Этап', name: 'stage', field: (deal) => escapeHtml(deal.stage?.name), stage: (deal) => deal.stage, resizable: true },
     { label: 'Бюджет', name: 'budget', money: true, field: (deal) => Number(deal.budget), resizable: true },
     { label: 'Ответственный', name: 'agent', field: (deal) => escapeHtml(deal.agent?.username), resizable: true },
     { label: 'Компания', name: 'company', field: (deal) => escapeHtml(deal.company?.name), resizable: true },
@@ -167,10 +168,9 @@ const columns: Column<Deal>[] = [
     { label: '', name: 'actions', headerStyle: { width: '220px' } },
 ];
 
-// BaseTable renders `field` as HTML: names typed by users are escaped
+// BaseTable shows `field` as text (it is not HTML any more): escaping here showed «&amp;» in a name
 function escapeHtml(value?: string | null): string {
-    if (!value) return '—';
-    return value.replace(/[&<>"']/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c] as string));
+    return value || '—';
 }
 
 function errorMessage(error: any): string {

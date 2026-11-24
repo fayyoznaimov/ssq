@@ -369,7 +369,8 @@ def main():
     r = http("POST", "/tasks", {"label": P + "-task", "type_id": task_type_id,
                                 "assign_to": {"target": "agent", "id": own["id"]}, "link_to": {"target": "deal", "id": TID},
                                 "start_time": past.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                                "end_time": (past + datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z"), "allDay": False})
+                                "end_time": (past + datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z"), "allDay": False,
+                                "allow_past": True})  # overdue on purpose (TASK_IN_PAST)
     check("fixture: an overdue task of the deal", r[0] == 201, r)
     body, hdrs = multipart([("files", P + "-own.txt", b"only this deal")])
     r = http("POST", "/deals/%d/files" % TID, raw=body, headers=hdrs)

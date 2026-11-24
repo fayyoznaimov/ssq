@@ -45,7 +45,8 @@ export function htmlToText(html: string | null | undefined): string {
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/(p|div|li|tr|h[1-6]|blockquote|table|ul|ol)\s*>/gi, '\n')
     .replace(/<li\b[^>]*>/gi, '• ')
-    .replace(/<\/t[dh]\s*>/gi, '\t')
+    // cells of a table apart: «Полотенце 50x90 | 300 | 12 500 сум», not «50x9030012 500 сум»
+    .replace(/<\/t[dh]\s*>/gi, ' | ')
     .replace(/<[^>]+>/g, '')
     .replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (match, entity) => decodeEntity(entity) ?? match);
   return noNul(text)
@@ -53,6 +54,8 @@ export function htmlToText(html: string | null | undefined): string {
     .replace(/[ \t ]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .replace(/[ \t ]{2,}/g, ' ')
+    // the separator after the last cell of a row
+    .replace(/[ \t]*\|[ \t]*(?=\n|$)/g, '')
     .trim();
 }
 

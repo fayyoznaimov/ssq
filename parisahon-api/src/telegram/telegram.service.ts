@@ -31,6 +31,7 @@ import {
 } from '../messenger/messenger-services';
 import { normalizePhone } from '../helper/phone';
 import { Deal } from '../deal/deal.entity';
+import { AuditJournal } from '../audit/audit-journal';
 
 interface SentPart {
   tg_message_id: number;
@@ -86,13 +87,22 @@ export class TelegramService {
     private clientDeals: ClientDealsService,
   ) {}
 
-  /** The users with a stored Telegram session, each with `telegram` = the state of the session. */
-  async fetchActiveSessions(): Promise<User[]> {
+  /**
+   * The users with a stored Telegram session, each with `telegram` = the state of the session.
+   * Admin and manager see everybody's (the staff list of the Telegram page); an agent only their own
+   * (the other managers' accounts and phones are not theirs to see).
+   */
+  async fetchActiveSessions(request?: Request): Promise<User[]> {
     const sessions = (await this.call('GET', '/get-sessions')) as unknown as ServiceSession[];
     if (!Array.isArray(sessions) || sessions.length === 0) {
       return [];
     }
-    const user_ids = sessions.map((session) => Number(session.user_id)).filter(Number.isInteger);
+    const me = request ? this.requester(request) : null;
+    const everybody = !me || me.role === RoleEnum.ADMIN || me.role === RoleEnum.MANAGER;
+    const user_ids = sessions
+      .map((session) => Number(session.user_id))
+      .filter((id) => Number.isInteger(id) && (everybody || id === me!.sub));
+    if (!user_ids.length) return [];
     const users = await this.userRepository.findBy({ id: In(user_ids) });
     for (const user of users) {
       const session = sessions.find((s) => Number(s.user_id) === user.id);
@@ -143,6 +153,14 @@ export class TelegramService {
       await this.userRepository.update(user.id, { tg_id: tgId });
     }
     this.logger.log(`telegram of user ${user.id} connected by user ${this.requester(request).sub}`);
+    // the journal (src/audit): who connected whose Telegram
+    await AuditJournal.record(this.userRepository.manager, {
+      entity: 'messenger',
+      entityId: user.id,
+      action: 'insert',
+      summary: 'Telegram подключён',
+      meta: { channel: 'telegram', ...(tgId > 0 ? { account: String(tgId) } : {}) },
+    });
     return answer;
   }
 
@@ -151,6 +169,14 @@ export class TelegramService {
     const user = await this.accountOf(request, userId, true);
     await this.call('POST', '/logout', { user_id: user.id });
     this.logger.log(`telegram of user ${user.id} disconnected by user ${this.requester(request).sub}`);
+    // the journal (src/audit): who disconnected whose Telegram (an admin may disconnect another's)
+    await AuditJournal.record(this.userRepository.manager, {
+      entity: 'messenger',
+      entityId: user.id,
+      action: 'delete',
+      summary: 'Telegram отключён',
+      meta: { channel: 'telegram' },
+    });
     return { status: 'none' };
   }
 

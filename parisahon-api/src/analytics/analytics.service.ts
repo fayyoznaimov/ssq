@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Deal } from 'src/deal/deal.entity';
 import { DealStage } from 'src/deal_stage/deal_stage.entity';
 import { DealStageRecord } from 'src/deal_stage/deal_stage.records.entity';
+import { StageKind } from 'src/deal_stage/stage-kind';
 import { HelperService } from 'src/helper/helper.service';
 import { Repository } from 'typeorm';
 import { DealAnalyticsQuery } from './dto/deal.analytics.dto';
@@ -52,73 +53,82 @@ export class AnalyticsService {
   }
 
   /**
-   * «Анализ продаж»: deals by stage of the active pipeline. With a period (from_date / till_date):
-   * only the deals created in it, like the other reports with a period.
+   * «Анализ продаж»: the deals of the active pipeline by the stage they are in now — counted the way
+   * «Сводный отчёт» counts them (one deal once, deleted deals never), so «N сделок» means the same on
+   * both pages. With a period (from_date / till_date): the deals created in it. is_active: true — open
+   * deals, false — closed ones, none — all.
+   *  - deal_count / total_deal_budget of a stage: the deals in it now and their budget;
+   *  - average_time_in_stage: minutes a deal spent in the stage before it moved on (the finished stays
+   *    in the stage history of those same deals; null — no deal has left it yet), stage_time_count —
+   *    how many stays that is;
+   *  - total_deal_count / total_deal_budget: the deals counted above (the sum of the stages);
+   *  - average_deal_duration_in_minutes: creation to closing of the closed deals among them (null when
+   *    none is closed), closed_deal_count — how many.
+   * Before, every pass of a deal through a stage was a "deal" (a deal that went through two stages
+   * counted twice with its budget), the records of deleted deals were counted, and the total was every
+   * deal of the database — shares of 700 %.
    */
   async dealAnalytics(query: DealAnalyticsQuery): Promise<Record<string, any>> {
     const period = AnalyticsService.periodOf(query);
-    let stageStatsQb = this.dealStageRecordRepository
-      .createQueryBuilder('t0')
-      .select('COUNT(t0.deal_id)', 'deal_count')
-      .addSelect('AVG(t0.moved_after_minutes)', 'average_time_in_stage')
-      .addSelect('SUM(t3.budget)', 'total_deal_budget')
-      .addSelect('t1.id', 'id')
-      .leftJoin('t0.stage', 't1')
-      .leftJoin('t1.collection', 't2')
-      .leftJoin('t0.deal', 't3')
-      .where('t2.is_active = true');
-
-    if (query.is_active === 'true') {
-      stageStatsQb = stageStatsQb.andWhere('t3.closed_at IS NULl');
-    } else if (query.is_active === 'false') {
-      stageStatsQb = stageStatsQb.andWhere('t3.closed_at IS NOT NULl');
-    }
+    const params: any[] = [];
+    let dealFilter = 'd.deleted_at IS NULL';
+    if (query.is_active === 'true') dealFilter += ' AND d.closed_at IS NULL';
+    else if (query.is_active === 'false') dealFilter += ' AND d.closed_at IS NOT NULL';
     if (period) {
-      stageStatsQb = stageStatsQb.andWhere('t3.created_at >= :from_date AND t3.created_at <= :till_date', period);
+      params.push(period.from_date, period.till_date);
+      dealFilter += ' AND d.created_at >= $1 AND d.created_at <= $2';
     }
 
-    const stageStats = await stageStatsQb.groupBy('t1.id').getRawMany();
+    const stageRows: any[] = await this.dealRepository.query(
+      `SELECT s.id, s.name, s.color, s."order", s.description, s.kind,
+              COALESCE(n.deal_count, 0) AS deal_count, COALESCE(n.budget, 0) AS total_deal_budget,
+              t.average AS average_time_in_stage, COALESCE(t.count, 0) AS stage_time_count
+         FROM deal_stage s
+         JOIN collection c ON c.id = s.collection_id AND c.is_active = true
+         LEFT JOIN LATERAL (
+           SELECT COUNT(*) AS deal_count, SUM(d.budget) AS budget FROM deal d WHERE d.stage_id = s.id AND ${dealFilter}
+         ) n ON TRUE
+         LEFT JOIN LATERAL (
+           SELECT AVG(r.moved_after_minutes) AS average, COUNT(r.moved_after_minutes) AS count
+             FROM deal_stage_record r JOIN deal d ON d.id = r.deal_id
+            WHERE r.stage_id = s.id AND r.moved_after_minutes IS NOT NULL AND ${dealFilter}
+         ) t ON TRUE
+        ORDER BY s."order", s.id`,
+      params,
+    );
 
-    const stageStatsMap = this.helperService.createHashMap(stageStats);
-
-    const dealStatsQb = this.dealRepository
-      .createQueryBuilder('t0')
-      .select(
-        'AVG(EXTRACT(EPOCH FROM (t0.closed_at - t0.created_at)) / 60)',
-        'average_deal_duration_in_minutes',
+    const total: any = (
+      await this.dealRepository.query(
+        `SELECT COUNT(*) AS total_deal_count, COALESCE(SUM(d.budget), 0) AS total_deal_budget,
+                COUNT(*) FILTER (WHERE d.closed_at IS NOT NULL) AS closed_deal_count,
+                AVG(EXTRACT(EPOCH FROM (d.closed_at - d.created_at)) / 60) FILTER (WHERE d.closed_at IS NOT NULL)
+                  AS average_deal_duration_in_minutes
+           FROM deal d
+           JOIN deal_stage s ON s.id = d.stage_id
+           JOIN collection c ON c.id = s.collection_id AND c.is_active = true
+          WHERE ${dealFilter}`,
+        params,
       )
-      .addSelect('COUNT(t0.*)', 'total_deal_count');
-    if (period) {
-      dealStatsQb.where('t0.created_at >= :from_date AND t0.created_at <= :till_date', period);
-    }
-    const dealStats = await dealStatsQb.getRawOne();
+    )[0] ?? {};
 
-    const stages = await this.dealStageRepository
-      .createQueryBuilder('t0')
-      .leftJoin('t0.collection', 't1')
-      .where('t1.is_active = true')
-      .getMany();
-
-    const mergedStages = [];
-
-    // TODO: Refactor
-    for (const stage of stages) {
-      if (stageStatsMap.has(stage.id)) {
-        mergedStages.push({ ...stage, ...stageStatsMap.get(stage.id) });
-        continue;
-      }
-
-      mergedStages.push({
-        ...stage,
-        deal_count: 0,
-        average_time_in_stage: 0,
-        total_deal_budget: 0,
-      });
-    }
-
+    const number = (value: unknown) => (value === null || value === undefined ? null : Number(value));
     return {
-      ...dealStats,
-      stages: mergedStages,
+      total_deal_count: Number(total.total_deal_count ?? 0),
+      total_deal_budget: Number(total.total_deal_budget ?? 0),
+      closed_deal_count: Number(total.closed_deal_count ?? 0),
+      average_deal_duration_in_minutes: number(total.average_deal_duration_in_minutes),
+      stages: stageRows.map((row) => ({
+        id: Number(row.id),
+        name: row.name,
+        color: row.color,
+        order: Number(row.order),
+        description: row.description,
+        kind: row.kind,
+        deal_count: Number(row.deal_count),
+        total_deal_budget: Number(row.total_deal_budget),
+        average_time_in_stage: number(row.average_time_in_stage),
+        stage_time_count: Number(row.stage_time_count),
+      })),
     };
   }
 
@@ -126,8 +136,9 @@ export class AnalyticsService {
    * Calls per employee: the call recordings (`recording`, one row per call — the same calls
    * «Контроль» and «По менеджерам» count), of the period when from_date / till_date are given
    * (by the time of the call), else of all time. `recording.duration` is stored in milliseconds
-   * by the recorder; every duration here is returned in minutes (one decimal), which is how the
-   * page labels them.
+   * by the recorder; the old keys hold minutes (one decimal, for older clients), the *_sec keys the
+   * same durations in whole seconds — the page shows them as «2:05» / «1 ч 05 мин» («0.2» минуты
+   * were 12 seconds).
    */
   async callAnalytics(query: PeriodQueryDto = {}): Promise<Record<string, any>> {
     const ms = MS_PER_MINUTE;
@@ -142,7 +153,11 @@ export class AnalyticsService {
       SUM(CASE WHEN NOT r.outgoing THEN 1 ELSE 0 END) AS incoming_call_count,
       ROUND(SUM(CASE WHEN r.outgoing THEN r.duration ELSE 0 END) / ${ms}.0, 1) AS total_outgoing_duration,
       ROUND(SUM(CASE WHEN NOT r.outgoing THEN r.duration ELSE 0 END) / ${ms}.0, 1) AS total_incoming_duration,
-      ROUND(SUM(r.duration) / ${ms}.0, 1) AS total_call_duration
+      ROUND(SUM(r.duration) / ${ms}.0, 1) AS total_call_duration,
+      ROUND(AVG(r.duration) / 1000) AS avg_duration_sec,
+      ROUND(SUM(CASE WHEN r.outgoing THEN r.duration ELSE 0 END) / 1000.0) AS total_outgoing_sec,
+      ROUND(SUM(CASE WHEN NOT r.outgoing THEN r.duration ELSE 0 END) / 1000.0) AS total_incoming_sec,
+      ROUND(SUM(r.duration) / 1000.0) AS total_call_sec
     FROM
         recording r
     JOIN
@@ -167,6 +182,10 @@ export class AnalyticsService {
       total_incoming_duration: +row.total_incoming_duration,
       total_call_duration: +row.total_call_duration,
       duration_unit: 'minutes',
+      avg_duration_sec: +row.avg_duration_sec,
+      total_outgoing_sec: +row.total_outgoing_sec,
+      total_incoming_sec: +row.total_incoming_sec,
+      total_call_sec: +row.total_call_sec,
     }));
   }
 
@@ -174,7 +193,7 @@ export class AnalyticsService {
    * «По менеджерам»: one row per staff member — admin, manager and agent (the salespeople are
    * agents) — for the period, counted the way every other report counts:
    *  - new deals: deals the employee is responsible for (agent_id), created in the period;
-   *  - won: those in the successful stage (DEAL_STAGE_CLOSED) closed in the period (by closed_at),
+   *  - won: those in the successful stage (deal_stage.kind = won) closed in the period (by closed_at),
    *    as the consolidated report and the goals count them;
    *  - new clients: companies the employee created in the period (not marked old);
    *  - calls: the call recordings of the period, as «Звонки» and «Контроль» count them; minutes;
@@ -202,7 +221,7 @@ export class AnalyticsService {
            SELECT COUNT(*) AS count, COALESCE(SUM(d.budget), 0) AS budget
              FROM deal d JOIN deal_stage s ON s.id = d.stage_id
             WHERE d.agent_id = u.id AND d.deleted_at IS NULL AND d.closed_at IS NOT NULL
-              AND d.closed_at >= $1 AND d.closed_at <= $2 AND s.name = $3
+              AND d.closed_at >= $1 AND d.closed_at <= $2 AND s.kind = $3
          ) wd ON TRUE
          LEFT JOIN LATERAL (
            SELECT COUNT(*) AS count, COUNT(*) FILTER (WHERE r.outgoing) AS outgoing, COALESCE(SUM(r.duration), 0) AS duration
@@ -210,7 +229,7 @@ export class AnalyticsService {
          ) rc ON TRUE
         WHERE u.role IN ('admin', 'manager', 'agent')
         ORDER BY u.username`,
-      [from, till, process.env.DEAL_STAGE_CLOSED ?? ''],
+      [from, till, StageKind.WON],
     );
     const control = await this.controlService.report({
       from,
@@ -319,8 +338,9 @@ export class AnalyticsService {
     query: ConsolidatedReportQuery,
   ): Promise<Record<string, any>> {
     const period = periodBounds(query);
-    const wonStageName = process.env.DEAL_STAGE_CLOSED;
-    const lostStageName = process.env.DEAL_STAGE_CLOSED_NOT_REALIZED;
+    // the meaning of a stage is its kind (deal_stage/stage-kind.ts), not its name
+    const wonStageName = StageKind.WON;
+    const lostStageName = StageKind.LOST;
 
     // Bucket boundaries of the graph
     let unit = 'week';
@@ -356,7 +376,7 @@ export class AnalyticsService {
        WHERE t0.deleted_at IS NULL
          AND t0.closed_at IS NOT NULL
          AND t0.closed_at >= $1 AND t0.closed_at <= $2
-         AND t0.stage_id IN (SELECT s.id FROM deal_stage s WHERE s.name = $3)
+         AND t0.stage_id IN (SELECT s.id FROM deal_stage s WHERE s.kind = $3)
        ${bucketGroup('t0.closed_at')}`;
 
     const wonGraphStats: Record<string, any>[] = await this.dealRepository.query(
@@ -390,6 +410,24 @@ export class AnalyticsService {
     for (const row of newGraphStats) bucketOf(row).new_count += +row.count;
     for (const row of wonGraphStats) bucketOf(row).won_count += +row.count;
     for (const row of lostGraphStats) bucketOf(row).lost_count += +row.count;
+
+    // every bucket of the period, the empty ones as zeros (a lone week was drawn as a vertical line);
+    // «за всё время» starts at the first deal, not in 2020, and ends today, not in 2100
+    const span: { first: string | null; last: string | null }[] = await this.dealRepository.query(
+      `SELECT TO_CHAR(DATE_TRUNC('${unit}', GREATEST($1::timestamp, MIN(d.created_at))), 'YYYY-MM-DD') AS first,
+              TO_CHAR(DATE_TRUNC('${unit}', LEAST($2::timestamp, GREATEST(now()::timestamp, MAX(COALESCE(d.closed_at, d.created_at))))), 'YYYY-MM-DD') AS last
+         FROM deal d WHERE d.deleted_at IS NULL`,
+      [period.from_date, period.till_date],
+    );
+    if (span[0]?.first && span[0]?.last && span[0].first <= span[0].last) {
+      const buckets: { date_start: string; date_end: string }[] = await this.dealRepository.query(
+        `SELECT TO_CHAR(g, 'YYYY-MM-DD') AS date_start, TO_CHAR(g + INTERVAL '${bucketEnd}', 'YYYY-MM-DD') AS date_end
+           FROM generate_series($1::timestamp, $2::timestamp, INTERVAL '1 ${unit}') g
+          LIMIT 400`,
+        [span[0].first, span[0].last],
+      );
+      for (const bucket of buckets) bucketOf(bucket);
+    }
 
     const graph = Array.from(graphDataMap.values()).sort((a, b) =>
       String(a.date_start).localeCompare(String(b.date_start)),
@@ -429,19 +467,19 @@ export class AnalyticsService {
       .where('t0.closed_at IS NOT NULL')
       .andWhere('t0.closed_at >= :from_date AND t0.closed_at <= :till_date')
       .select(
-        'COUNT(t0.id) FILTER (WHERE t1.name = :won_stage)',
+        'COUNT(t0.id) FILTER (WHERE t1.kind = :won_stage)',
         'won_deal_count',
       )
       .addSelect(
-        'COALESCE(SUM(t0.budget) FILTER (WHERE t1.name = :won_stage), 0)',
+        'COALESCE(SUM(t0.budget) FILTER (WHERE t1.kind = :won_stage), 0)',
         'won_deal_budget',
       )
       .addSelect(
-        'COUNT(t0.id) FILTER (WHERE t1.name = :lost_stage)',
+        'COUNT(t0.id) FILTER (WHERE t1.kind = :lost_stage)',
         'lost_deal_count',
       )
       .addSelect(
-        'COALESCE(SUM(t0.budget) FILTER (WHERE t1.name = :lost_stage), 0)',
+        'COALESCE(SUM(t0.budget) FILTER (WHERE t1.kind = :lost_stage), 0)',
         'lost_deal_budget',
       )
       .setParameters({
@@ -479,7 +517,7 @@ export class AnalyticsService {
       .addSelect('t0.username', 'username')
       .addSelect('COUNT(DISTINCT t2.id)', 'ctr_agent_count')
       .addSelect('COUNT(DISTINCT t3.id)', 'company_count')
-      .where('t0.role = :agent_role', { agent_role: RoleEnum.AGENT })
+      .where('t0.role IN (:...roles)', { roles: STAFF_ROLES })
       .groupBy('t0.id')
       .getRawMany();
 

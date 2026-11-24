@@ -1,12 +1,14 @@
 import { Transform } from 'class-transformer';
 import {
   ArrayMaxSize,
+  ArrayNotEmpty,
   IsArray,
   IsBooleanString,
   IsEmail,
   IsNumberString,
   IsOptional,
   IsString,
+  MaxLength,
   ValidationArguments,
   isEmail,
 } from 'class-validator';
@@ -40,16 +42,16 @@ function badAddresses(args: ValidationArguments): string {
 export class SendEmailDto {
   @IsOptional()
   @Transform(emptyToUndefined)
-  @IsNumberString()
+  @IsNumberString(undefined, { message: 'Неверный ящик отправителя' })
   transporter_id: number;
 
   /**
-   * A deal the email is written from (the "Привязать сделку" field, the deal card). The email
-   * is added to its history in addition to the open deals of the recipients.
+   * A deal the email is written from (the "Привязать сделку" field, the deal card): the email goes
+   * into its history and no other. The user must be allowed to change it; not a closed one.
    */
   @IsOptional()
   @Transform(emptyToUndefined)
-  @IsNumberString()
+  @IsNumberString(undefined, { message: 'Неверная сделка' })
   deal_id: number;
 
   /**
@@ -58,37 +60,39 @@ export class SendEmailDto {
    */
   @IsOptional()
   @Transform(emptyToUndefined)
-  @IsNumberString()
+  @IsNumberString(undefined, { message: 'Неверное письмо для ответа' })
   reply_to_email_id: number;
 
   /** "true": the sender's signature is added under the text by the server (it used to be put into the editor). */
   @IsOptional()
   @Transform(emptyToUndefined)
-  @IsBooleanString()
+  @IsBooleanString({ message: 'with_signature: true или false' })
   with_signature: string;
 
   /** "false": no quote of the letter answered. */
   @IsOptional()
   @Transform(emptyToUndefined)
-  @IsBooleanString()
+  @IsBooleanString({ message: 'quote: true или false' })
   quote: string;
 
-  @IsString()
+  @IsString({ message: 'Тема письма должна быть текстом' })
+  @MaxLength(998, { message: 'Тема письма слишком длинная (не больше 998 символов)' })
   subject: string;
 
-  @IsString()
+  @IsString({ message: 'Текст письма должен быть текстом' })
   body: string;
 
   @Transform(splitAddresses)
   @IsArray({ message: 'Укажите адрес получателя' })
-  @ArrayMaxSize(50)
+  @ArrayNotEmpty({ message: 'Укажите адрес получателя' })
+  @ArrayMaxSize(50, { message: 'Не больше 50 получателей' })
   @IsEmail(undefined, { each: true, message: badAddresses })
   to: string[];
 
   @IsOptional()
   @Transform(splitAddresses)
-  @IsArray()
-  @ArrayMaxSize(50)
+  @IsArray({ message: 'Неверный список адресов в поле «Копия»' })
+  @ArrayMaxSize(50, { message: 'Не больше 50 адресов в копии' })
   @IsEmail(undefined, { each: true, message: badAddresses })
   cc: string[];
 }

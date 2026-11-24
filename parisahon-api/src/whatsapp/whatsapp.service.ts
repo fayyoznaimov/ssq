@@ -17,6 +17,7 @@ import { ClientDealsService } from '../messenger/client-deals.service';
 import { MessengerHealthService, ServiceSession } from '../messenger/messenger-health.service';
 import { callService, ServiceUnreachable, whatsappServiceConfigured, whatsappServiceHeaders, whatsappServiceUrl } from '../messenger/messenger-services';
 import { normalizePhone } from '../helper/phone';
+import { AuditJournal } from '../audit/audit-journal';
 import { WhatsAppInboxService } from './whatsapp-inbox.service';
 import { SendWhatsAppDto } from './dto/send.whatsapp.dto';
 
@@ -77,13 +78,31 @@ export class WhatsAppService {
     }
     // a local number from the profile ('90 123 45 67') gets the country code
     const full = digits ? normalizePhone(phone) : null;
-    return this.call('POST', `/sessions/${id}/start`, digits ? { phone: full && full.startsWith('+') ? full : '+' + digits } : {});
+    const state = await this.call<WhatsAppState>('POST', `/sessions/${id}/start`, digits ? { phone: full && full.startsWith('+') ? full : '+' + digits } : {});
+    // the journal (src/audit, WA-16): who started connecting whose WhatsApp
+    await AuditJournal.record(this.userRepository.manager, {
+      entity: 'messenger',
+      entityId: id,
+      action: 'insert',
+      summary: `WhatsApp: подключение начато${digits ? ' по номеру' : ' по QR-коду'}`,
+      meta: { channel: 'whatsapp', ...(digits ? { phone: full && full.startsWith('+') ? full : '+' + digits } : {}) },
+    });
+    return state;
   }
 
   async disconnect(me: AuthUser, userId?: number): Promise<WhatsAppState> {
     const id = await this.accountId(me, userId, true);
     this.logger.log(`whatsapp of user ${id} disconnected by user ${me.sub}`);
-    return this.call('DELETE', `/sessions/${id}`);
+    const state = await this.call<WhatsAppState>('DELETE', `/sessions/${id}`);
+    // the journal (src/audit, WA-16): who disconnected whose WhatsApp (an admin may disconnect another's)
+    await AuditJournal.record(this.userRepository.manager, {
+      entity: 'messenger',
+      entityId: id,
+      action: 'delete',
+      summary: 'WhatsApp отключён',
+      meta: { channel: 'whatsapp' },
+    });
+    return state;
   }
 
   /** Admin: every staff user with the state of their WhatsApp (also those who never connected it). */

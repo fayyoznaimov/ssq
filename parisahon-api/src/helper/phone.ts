@@ -55,3 +55,14 @@ export function samePhone(a: unknown, b: unknown): boolean {
 export function phoneKeySql(column: string): string {
   return `right(regexp_replace(COALESCE(${column}, ''), '[^0-9]', '', 'g'), 9)`;
 }
+
+/**
+ * One rule for the e-mails of contacts and companies (stored and compared): trimmed, lower case,
+ * "" is none. "Ivan@Mail.RU " and "ivan@mail.ru" are one address (unique index on lower(email) of the
+ * live accounts, migration 1795630000000-people-unique).
+ */
+export function normalizeEmail(raw: unknown): string | null {
+  if (raw === null || raw === undefined) return null;
+  const text = String(raw).trim().toLowerCase();
+  return text ? text : null;
+}

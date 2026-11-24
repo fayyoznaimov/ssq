@@ -21,8 +21,8 @@ services:
     volumes:
       - ./parisahon-api:/app
       - /root/crm/parisahon-api/public/uploads:/app/public/uploads
-      - /root/crm/parisahon-api/keys:/app/keys:ro
-      - /root/crm/parisahon-telegram-service/ffmpeg-6.1-amd64-static:/opt/ffmpeg:ro
+      # no /opt/ffmpeg or keys mounts (HACK-10): ffmpeg is the Debian one of the image (FFMPEG_BIN=/usr/bin/ffmpeg,
+      # the same variable in telegram.env and whatsapp.env), SSL_KEY_PATH is read by nothing
       - ./claude:/opt/claude:ro
       - ./claude-home:/root/.claude
     networks: [crm-network]
@@ -88,9 +88,10 @@ services:
       - ./parisahon-ftp:/app
       - ./ftp-venv:/venv
       - ./ftp-data:/data
-      # manager 47's phone still uploads to the old FTP (port 21, vsftpd): the same folder is his home here,
-      # so the receiver forwards those recordings too (until the phone is switched to port 2121)
-      - /root/crm/parisahon-telegram-service/recordings/47:/data/files/47
+      # folders an old FTP server still fills (a phone not yet switched to port 2121): LEGACY_RECORDINGS_DIR in
+      # the .env next to this file is that folder on the host (empty ./ftp-legacy when not set); which manager
+      # each subfolder belongs to is FTP_EXTRA_HOMES in ftp.env, e.g. 47=/legacy/47 (parisahon-ftp/README.md)
+      - ${LEGACY_RECORDINGS_DIR:-./ftp-legacy}:/legacy
     networks: [crm-network]
 networks:
   crm-network:

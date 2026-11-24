@@ -24,7 +24,7 @@ STATIC = [
     "/mails", "/mails/new", "/mails/settings", "/telegram", "/whatsapp", "/profile",
     "/analytics/sales", "/analytics/managers", "/analytics/employees", "/analytics/products", "/analytics/events",
     "/analytics/goals", "/analytics/goals/settings", "/analytics/consolidated", "/analytics/calls",
-    "/requests", "/roles", "/settings/deals", "/settings/groups", "/settings/users", "/settings/transporters", "/settings/calls",
+    "/requests", "/settings/deals", "/settings/groups", "/settings/users", "/settings/transporters", "/settings/calls",
 ]
 
 
@@ -128,10 +128,49 @@ def main():
         check(f"{path}: opens without errors, fits a PC screen", not problems, "; ".join(problems))
     print(f"\nphone width: {len(phone_wide)} page(s) wider than the screen (not a failure yet): {', '.join(phone_wide) or 'none'}")
     port_checks(report)
+    shell_checks(report, dynamic)
     agent_rights_checks()
+    settings_checks()
     feed_checks()
     print(f"\nRESULT: {results['PASS']} passed, {results['FAIL']} failed")
     return 1 if results["FAIL"] else 0
+
+
+def shell_checks(report, dynamic):
+    """The frame of the interface and the tables (AUDIT-ui wave 1b): the tab names the page, not only the CRM
+    (SCR16); an API error is a Russian sentence, never «Cannot GET …» (SCR4-6); a list that did not load says so
+    instead of «Пока ничего» (/roles has no API behind it); on a phone the deal list is cards with the stage and
+    the sum, on a PC a table (SCR9); the menu lights the section of an open card (SCR16, SCR4-4)."""
+    pc = [r for r in report if r["size"] == "pc" and r["url"] not in ("/login", "/403")]
+    bare = [r["path"] for r in pc if str(r.get("title") or "").strip() == "Parisa CRM"]
+    check("every page names itself in the tab («Сделки — Parisa CRM», not «Parisa CRM»)", not bare, ", ".join(bare[:6]))
+    raw = [f"{r['path']} ({r['size']})" for r in report if "Cannot GET" in (r.get("text") or "") or "must be a" in (r.get("text") or "")]
+    check("no raw English API error on any page (toasts are Russian)", not raw, ", ".join(raw[:6]))
+    roles = next((r for r in pc if r["path"] == "/roles"), None)
+    if roles:  # the page of roles has no API behind it: its table must say that it did not load
+        text = roles.get("text") or ""
+        check("/roles (no API): the table says «Не удалось загрузить список» with «Повторить», not «Пока ничего нет»",
+              "Пока ничего нет" not in text and "Не удалось загрузить список" in text and "Повторить" in text, text[-300:])
+
+    has_deals = one("select count(*) from deal where deleted_at is null") not in ("", "0")
+    rep, proc = screens(["/deals"], SCREEN_PROBE="[data-cards] [data-card]", SCREEN_OUT=os.path.join(ROOT, "local", "dev", "screens", "ui", "cards"))
+    rows = {r["size"]: r for r in rep or []}
+    if not rows:
+        check("deal list as cards on a phone: screenshots ran", False, (proc.stderr or proc.stdout)[-300:])
+    elif has_deals:
+        phone, pcrow = rows.get("phone") or {}, rows.get("pc") or {}
+        check("/deals on a phone: every row is a card (the table showed two columns); on a PC it is a table",
+              (phone.get("probe") or 0) > 0 and (pcrow.get("probe") or 0) == 0,
+              f"phone cards {phone.get('probe')}, pc cards {pcrow.get('probe')}")
+        text = phone.get("text") or ""
+        check("/deals on a phone: a card shows the stage and the budget",
+              "Этап сделки" in text and "Бюджет" in text, text[:300])
+
+    cards = [p for p in dynamic if p.startswith("/deals/") or p.startswith("/lists/companies/")] + ["/settings/users", "/deals/trash"]
+    rep, proc = screens(cards, SCREEN_PROBE='#sidebar-menu [aria-current="page"]', SCREEN_OUT=os.path.join(ROOT, "local", "dev", "screens", "ui", "menu"))
+    unlit = [r["path"] for r in rep or [] if r["size"] == "pc" and r["url"] not in ("/login", "/403") and not r.get("probe")]
+    check("the menu lights the section of a card and of a page under it (/deals/35, /deals/trash, /settings/users)",
+          rep is not None and not unlit, ", ".join(unlit) or (proc.stderr or proc.stdout)[-300:])
 
 
 def feed_checks():
@@ -200,8 +239,8 @@ def feed_checks():
         text = row.get("text") or ""
         errors = (row.get("pageErrors") or []) + [e for e in row.get("consoleErrors") or [] if "TypeError" in e]
         check("deal feed with typeless tasks, a deleted author, a hidden stage before: no render error", not errors, errors[:2])
-        # comments are textareas: their text is not in innerText, the messages around them are
-        wanted = [f"{tag}-in-1", f"{tag}-out-2", "Задача выполнена", f"{tag}-итог",
+        # notes are shown as text (they were one-line textareas, SCR2-2): their text is in innerText
+        wanted = [f"{tag}-in-1", f"{tag}-out-2", f"{tag}-note", f"{tag}-by-gone", "Задача выполнена", f"{tag}-итог",
                   "Задача поставлена", f"{tag}-gone (удалён)", f"{tag}-letter", f"{tag}-wa",
                   "Входящий звонок", "+998900000000", f"{tag}-edited", "(изменено)", f"Удалён файл: {tag}-price.pdf"]
         missing = [w for w in wanted if w not in text] + ([] if "Сегодня" in text or "Вчера" in text else ["day separator"])
@@ -280,9 +319,13 @@ def agent_rights_checks():
             check("agent with own / group rights: screenshots ran", False, (proc.stderr or proc.stdout)[-800:])
             return
         pc = {r["path"]: r for r in report if r["size"] == "pc"}
+
+        def norm(url):  # a static web server answers /deals with /deals/: the same page
+            return (url or "").rstrip("/") or "/"
+
         for path in opens:
             r = pc.get(path) or {}
-            problems = [f"redirected to {r.get('url')}"] if r.get("url") != path else []
+            problems = [f"redirected to {r.get('url')}"] if norm(r.get("url")) != norm(path) else []
             problems += [f"JS error {e[:200]}" for e in (r.get("pageErrors") or [])[:1]]
             problems += [f"API {', '.join(r.get('api5xx')[:3])}"] if r.get("api5xx") else []
             check(f"agent with own / group rights: {path} opens", r and not problems, "; ".join(problems) or "no result")
@@ -290,17 +333,95 @@ def agent_rights_checks():
         check("agent with own / group rights: the menu has «Сделки» and «Списки»", "Сделки" in text and "Списки" in text, text[:300])
         for path, landing in closed.items():
             r = pc.get(path) or {}
-            check(f"agent without the right: {path} -> {landing}", r.get("url") == landing, r.get("url"))
+            check(f"agent without the right: {path} -> {landing}", norm(r.get("url")) == landing, r.get("url"))
+
+        # OMNI-1: a deal of the agent with a letter in its history; without the mail right the history was
+        # drawn empty (TypeError on the hidden letter). Now: the messages, and the letter as one line.
+        tag = f"AUDIT-ui-{run}-mail"
+        agent_id = body["id"]
+        deal = one(f"insert into deal (label, display_id, budget, stage_id, agent_id, created_by) values ('{tag}', "
+                   f"{900000000 + secrets.randbelow(90000000)}, 100, (select s.id from deal_stage s join collection c "
+                   "on c.id = s.collection_id where c.is_active = true order by s.\"order\", s.id limit 1), "
+                   f"{agent_id}, {agent_id}) returning id")
+        one(f"insert into event (type, deal_id, user_id, outgoing, after_state, created_at) values "
+            f"(12, {deal}, {agent_id}, true, jsonb_build_object('message', '{tag}-tg', 'files', '[]'::jsonb, 'outgoing', true), now() - interval '3 minute'), "
+            f"(9, {deal}, {agent_id}, false, jsonb_build_object('data', jsonb_build_object('id', null, 'subject', '{tag}-secret', "
+            "'body', '<p>secret</p>', 'outgoing', false, 'to', '[]'::jsonb, 'files', '[]'::jsonb)), now() - interval '2 minute'), "
+            f"(5, {deal}, {agent_id}, true, jsonb_build_object('data', jsonb_build_object('comment', '{tag}-note', 'files', '[]'::jsonb)), now() - interval '1 minute') "
+            "returning id")
+        report, proc = screens([f"/deals/{deal}"], SCREEN_TOKEN=token,
+                               SCREEN_OUT=os.path.join(ROOT, "local", "dev", "screens", "ui-agent-mail"))
+        r = next((x for x in report or [] if x["size"] == "pc"), None) or {}
+        # ACL-7: with "own" deals the agent opens the card of a deal they are responsible for (was sent to «/»)
+        check("agent with own rights: the card of their own deal opens (not sent to «/»)",
+              bool(r) and norm(r.get("url")) == f"/deals/{deal}" and not r.get("pageErrors"), r.get("url"))
+        text = r.get("text") or ""
+        errors = (r.get("pageErrors") or []) + [e for e in r.get("consoleErrors") or [] if "TypeError" in e]
+        check("agent without the mail right: a deal with a letter shows its history (messages, note, the letter as a line)",
+              r and not errors and f"{tag}-tg" in text and f"{tag}-note" in text and "нет доступа к почте" in text
+              and f"{tag}-secret" not in text, errors[:2] or text[:300])
     finally:
         try:
             one(";".join([
                 "begin",
                 f"delete from event where user_id in (select id from \"user\" where email like 'audit-ui-{run}-%')",
+                f"delete from event where deal_id in (select id from deal where label = 'AUDIT-ui-{run}-mail')",
+                f"delete from deal where label = 'AUDIT-ui-{run}-mail'",
                 f"delete from \"user\" where email like 'audit-ui-{run}-%'",
                 "commit",
             ]))
         except Exception as error:  # the report goes on; the row is named AUDIT-ui-*
             print(f"cleanup of the AUDIT-ui-{run} account failed: {error}")
+
+
+def settings_checks():
+    """«Пользователи», the user card and the group page as the admin sees them (ACL-15, SCR4-7, SCR4-9, SCR4-17):
+    an agent whose card forbids everything is flagged in the list with «Выдать стандартные права»; the list
+    holds staff only (no customer contacts); the matrix of the card speaks words, not 0–3; the group page
+    lists its members."""
+    import secrets
+
+    run = secrets.token_hex(3)
+    tag = f"AUDIT-ui-{run}-set"
+    zero = {"view": 0, "create": 0, "update": 0, "delete": 0, "export": 0}
+    rights = json.dumps({"deal": zero, "company": zero, "contact": zero, "task": {"update": 0, "delete": 0},
+                         "mail": False, "file": False})
+    try:
+        group = one(f"insert into \"group\" (name) values ('{tag}-group') returning id")
+        bare = one(f"insert into \"user\" (username, email, role, group_id, permissions) values ('{tag}-bare', "
+                   f"'audit-ui-{run}-set-bare@example.test', 'agent', {group}, '{rights}'::jsonb) returning id")
+        contact = one(f"insert into \"user\" (username, email, role) values ('{tag}-client', "
+                      f"'audit-ui-{run}-set-client@example.test', 'ctr_agent') returning id")
+        if not (group and bare and contact):
+            check("settings pages: test rows created", False, (group, bare, contact))
+            return
+        pages = ["/settings/users", f"/settings/users/{bare}", f"/settings/groups/{group}"]
+        report, proc = screens(pages, SCREEN_OUT=os.path.join(ROOT, "local", "dev", "screens", "ui-settings"))
+        if report is None:
+            check("settings pages: screenshots ran", False, (proc.stderr or proc.stdout)[-800:])
+            return
+        pc = {r["path"]: r for r in report if r["size"] == "pc"}
+        text = (pc.get("/settings/users") or {}).get("text") or ""
+        check("«Пользователи»: an agent without rights is flagged «ничего не видит» with «Выдать стандартные права»",
+              f"{tag}-bare" in text and "ничего не видит" in text and "Выдать стандартные права" in text, text[:400])
+        check("«Пользователи»: staff only — no customer contacts, no role «Контр Агент»",
+              f"{tag}-client" not in text and "Контр Агент" not in text, text[:400])
+        text = (pc.get(f"/settings/users/{bare}") or {}).get("text") or ""
+        check("the user card: the rights in words (Просмотр / Свои / Группы / Все) and the warning before saving",
+              "Просмотр" in text and "Группы" in text and "Нет прав на просмотр" in text and "Уровни доступа" not in text,
+              text[:400])
+        text = (pc.get(f"/settings/groups/{group}") or {}).get("text") or ""
+        check("the group page lists its members", "Участники" in text and f"{tag}-bare" in text, text[:400])
+    finally:
+        try:
+            one(";".join([
+                "begin",
+                f"delete from \"user\" where email like 'audit-ui-{run}-set-%'",
+                f"delete from \"group\" where name = '{tag}-group'",
+                "commit",
+            ]))
+        except Exception as error:  # the report goes on; the rows are named AUDIT-ui-*
+            print(f"cleanup of {tag} failed: {error}")
 
 
 if __name__ == "__main__":

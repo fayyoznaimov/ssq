@@ -3,7 +3,7 @@ import tempfile
 import unittest
 
 import helpers  # noqa: F401  (puts the service on sys.path)
-from config import ConfigError, address_in, from_env, parse_networks, parse_passive_ports
+from config import ConfigError, address_in, from_env, parse_extra_homes, parse_networks, parse_passive_ports
 
 
 class ConfigTest(unittest.TestCase):
@@ -92,6 +92,16 @@ class ConfigTest(unittest.TestCase):
         for key, value in (("FTP_PORT", "ftp"), ("FTP_RETAIN_DAYS", "-1"), ("FTP_SCAN_SEC", "0"), ("FTP_PASSIVE_PORTS", "21319-21310"), ("FTP_PASSIVE_PORTS", "a-b")):
             with self.assertRaises(ConfigError, msg=f"{key}={value}"):
                 from_env({**self.base, key: value})
+
+    def test_extra_homes(self):
+        self.assertEqual(from_env(self.base).extra_homes, ())
+        legacy = os.path.join(self.tmp.name, "legacy")
+        config = from_env({**self.base, "FTP_EXTRA_HOMES": f"47={legacy}/47, 52={legacy}/52"})
+        self.assertEqual(config.extra_homes, ((47, os.path.join(legacy, "47")), (52, os.path.join(legacy, "52"))))
+        root, state = self.base["FTP_ROOT"], self.base["FTP_STATE_DIR"]
+        for raw in ("47", "x=/legacy/47", "0=/legacy/0", "47=legacy/47", f"47={root}/47", f"47={state}", f"47={legacy} 48={legacy}"):
+            with self.assertRaises(ConfigError, msg=raw):
+                parse_extra_homes(raw, root, state)
 
     def test_passive_ports(self):
         self.assertEqual(parse_passive_ports("21310-21319"), range(21310, 21320))

@@ -28,13 +28,13 @@ export class UpdateCompanyFillerDto {
 
 export class UpdateCompanyDto {
   @Trim()
-  @IsString()
-  @Length(3, 255)
+  @IsString({ message: 'Название компании: текст' })
+  @Length(3, 255, { message: 'Название компании: от 3 до 255 символов' })
   name: string;
 
   @IsOptional()
   @IsString()
-  @IsEmail()
+  @IsEmail({}, { message: 'Неверный формат почты' })
   @Length(3, 255)
   email: string;
 
@@ -115,14 +115,14 @@ export class FlatUserDto {
   id?: number;
 
   @Trim()
-  @IsString()
-  @Length(2, 255)
+  @IsString({ message: 'Имя контакта: текст' })
+  @Length(2, 255, { message: 'Имя контакта: от 2 до 255 символов' })
   username: string;
 
   @EmptyToNull()
   @IsOptional()
   @IsString()
-  @IsEmail()
+  @IsEmail({}, { message: 'Неверный формат почты' })
   email?: string | null;
 
   @EmptyToNull()
@@ -153,15 +153,15 @@ const emptyToNull = ({ value }: { value: unknown }) =>
 export class CreateCompanyFlatDto extends CompanyRequisitesDto {
   @IsOptional()
   @Trim()
-  @IsString()
-  @Length(3, 255)
+  @IsString({ message: 'Название компании: текст' })
+  @Length(3, 255, { message: 'Название компании: от 3 до 255 символов' })
   name?: string;
 
   @IsOptional()
   @Transform(emptyToNull)
   @IsString()
   @Length(3, 255)
-  @IsEmail()
+  @IsEmail({}, { message: 'Неверный формат почты' })
   email?: string | null;
 
   @IsOptional()

@@ -8,6 +8,13 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Group } from './group.entity';
 import { DataSource, Repository } from 'typeorm';
 import { CreateGroupDto } from './dto/create.group.dto';
+import { RoleEnum } from '../user/user.entity';
+import { AuditJournal } from '../audit/audit-journal';
+
+/** TypeORM answers [rows, count] to UPDATE ... RETURNING on Postgres. */
+function updatedRows(result: any): any[] {
+  return Array.isArray(result?.[0]) ? result[0] : Array.isArray(result) ? result : [];
+}
 
 /** GET /groups/:id/usage: what deleting the group affects. */
 export interface GroupUsage {
@@ -39,8 +46,57 @@ export class GroupService {
     return group;
   }
 
-  async fetchAll(): Promise<Group[]> {
-    return this.groupRepository.find();
+  /**
+   * Every group by name, with `users_count`: its staff accounts that are not deleted (the column «Участников»
+   * of the list «Группы»; the «Для группы» rights of an employee cover the deals of exactly these people).
+   */
+  async fetchAll(): Promise<(Group & { users_count: number })[]> {
+    const groups = await this.groupRepository.find({ order: { name: 'ASC', id: 'ASC' } });
+    const counts: { group_id: number; n: number }[] = await this.dataSource.query(
+      `SELECT group_id, count(*)::int AS n FROM "user"
+        WHERE group_id IS NOT NULL AND deleted_at IS NULL AND role <> $1 GROUP BY group_id`,
+      [RoleEnum.CTR_AGENT],
+    );
+    const byGroup = new Map(counts.map((row) => [Number(row.group_id), Number(row.n)]));
+    return groups.map((group) => Object.assign(group, { users_count: byGroup.get(group.id) ?? 0 }));
+  }
+
+  /**
+   * POST /groups/:id/members/:user_id: the employee (a staff account, not deleted) moves into the group, from
+   * another group or none. Their «Для группы» rights follow the new group at once (AuthGuard reads group_id
+   * on every request).
+   */
+  async addMember(id: number, userId: number): Promise<void> {
+    await this.findById(id);
+    // the journal (src/audit): «Изменение прав — Группа: … → …» of the employee
+    const moved = updatedRows(
+      await AuditJournal.around(this.dataSource, 'user', 't.id = $1', [userId], () =>
+        this.dataSource.query(
+          `UPDATE "user" SET group_id = $1, updated_at = now()
+            WHERE id = $2 AND deleted_at IS NULL AND role <> $3 RETURNING id`,
+          [id, userId, RoleEnum.CTR_AGENT],
+        ),
+      ),
+    );
+    if (!moved.length) throw new NotFoundException(`Сотрудник ${userId} не найден`);
+  }
+
+  /**
+   * DELETE /groups/:id/members/:user_id: the employee leaves the group and stays without one (their «Для группы»
+   * rights cover only their own records then) until their card gets another group.
+   */
+  async removeMember(id: number, userId: number): Promise<void> {
+    await this.findById(id);
+    const removed = updatedRows(
+      await AuditJournal.around(this.dataSource, 'user', 't.id = $1', [userId], () =>
+        this.dataSource.query(
+          `UPDATE "user" SET group_id = NULL, updated_at = now()
+            WHERE id = $2 AND group_id = $1 AND deleted_at IS NULL AND role <> $3 RETURNING id`,
+          [id, userId, RoleEnum.CTR_AGENT],
+        ),
+      ),
+    );
+    if (!removed.length) throw new NotFoundException(`Сотрудника ${userId} нет в этой группе`);
   }
 
   async create(data: CreateGroupDto): Promise<Group> {
@@ -93,7 +149,10 @@ export class GroupService {
 
     await this.dataSource.transaction(async (manager) => {
       if (moveTo !== undefined) {
-        await manager.query(`UPDATE "user" SET group_id = $2 WHERE group_id = $1`, [id, moveTo]);
+        // the journal (src/audit): every moved employee gets «Группа: … → …»
+        await AuditJournal.around(manager, 'user', 't.group_id = $1', [id], () =>
+          manager.query(`UPDATE "user" SET group_id = $2 WHERE group_id = $1`, [id, moveTo]),
+        );
         await manager.query(`UPDATE task SET group_id = $2 WHERE group_id = $1 AND closed_at IS NULL`, [id, moveTo]);
       }
       await manager.delete(Group, id);

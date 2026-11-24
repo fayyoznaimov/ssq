@@ -4,6 +4,8 @@ import { AppModule } from './app.module';
 import { ValidationPipe } from '@nestjs/common';
 import { SeedService } from './seed/seed.service';
 import { FileService } from './file/file.service';
+import { FileLink } from './file/file-link';
+import { FileLinkInterceptor } from './file/file-link.interceptor';
 import * as express from 'express';
 import * as process from 'process';
 import { corsOrigin } from './helper/cors';
@@ -54,12 +56,18 @@ async function bootstrap() {
   await seedService.fixCollectionStatuses();
 
   /**
-   * Uploaded files. The client asks for <apiUrl>/uploads/<name>, i.e.
-   * /api/v1/uploads/...: in production nginx serves that path itself, the dev
-   * and trial copies have no nginx. Without login: <a href>, <img> and <audio>
-   * cannot send the token (the names are 64 random hex characters). A page-like
-   * file (.html, .svg) must not run scripts in the CRM origin: sandboxed.
+   * Uploaded files. The client asks for <apiUrl>/uploads/<name>?e=…&s=…, i.e. /api/v1/uploads/...:
+   * in production nginx serves that path itself (after GET /files/link-check), the dev and trial
+   * copies have no nginx. <a href>, <img> and <audio> cannot send the token, so the API signs every
+   * file name it returns (FileLinkInterceptor: valid 12 hours) and the link is checked here
+   * (FileLink: FILE_LINK_ENFORCE=1 refuses an unsigned or expired one, otherwise it is logged).
+   * A page-like file (.html, .svg) must not run scripts in the CRM origin: sandboxed.
    */
+  app.useGlobalInterceptors(new FileLinkInterceptor());
+  app.use(['/uploads', '/api/v1/uploads'], (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (FileLink.allows(req.originalUrl)) return next();
+    res.status(403).type('text/plain').send('The link to the file is not valid or has expired');
+  });
   app.use(
     ['/uploads', '/api/v1/uploads'],
     express.static(FileService.UPLOADS_DIR, {

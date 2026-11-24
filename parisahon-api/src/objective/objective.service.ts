@@ -8,6 +8,7 @@ import { HelperService } from 'src/helper/helper.service';
 import { ResultsObjectiveQuery } from './dto/results.objective.dto';
 import { Deal } from 'src/deal/deal.entity';
 import { periodBounds } from 'src/analytics/period';
+import { StageKind } from 'src/deal_stage/stage-kind';
 
 @Injectable()
 export class ObjectiveService {
@@ -105,7 +106,7 @@ export class ObjectiveService {
    *
    * Fact = budget of the deals the employee is responsible for that were
    * closed successfully in the period: stage "УСПЕШНО РЕАЛИЗОВАНО"
-   * (DEAL_STAGE_CLOSED) and `closed_at` inside the period. Open deals, deals
+   * (deal_stage.kind = won) and `closed_at` inside the period. Open deals, deals
    * closed without success and deleted deals do not count. The old version
    * summed every non-cancelled deal by creation date, open ones included.
    *
@@ -139,7 +140,7 @@ export class ObjectiveService {
       .select('t0.agent_id', 'user_id')
       .addSelect('COALESCE(SUM(t0.budget), 0)', 'total_budget')
       .addSelect('COUNT(t0.id)', 'deal_count')
-      .where('t1.name = :won_stage', { won_stage: process.env.DEAL_STAGE_CLOSED })
+      .where('t1.kind = :won_stage', { won_stage: StageKind.WON })
       .andWhere('t0.closed_at IS NOT NULL')
       .andWhere('t0.closed_at >= :from_date AND t0.closed_at <= :till_date')
       .andWhere('t0.agent_id IS NOT NULL')

@@ -82,7 +82,9 @@ export async function saveSentFiles(
     file.uploaded_by = uploadedBy;
     file.name = safeFileName(upload.originalname);
     file.path = name;
-    file.size = upload.size ?? upload.buffer?.length ?? 0;
+    file.size = upload.size || upload.buffer?.length || 0;
+    file.extension = File.extensionOf(file.name);
+    file.from = WhichFiles.FROM_EMAILS;
     file.deals = deals;
 
     saved.push(file);

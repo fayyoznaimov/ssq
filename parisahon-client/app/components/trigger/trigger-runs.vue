@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // The schedule and history of one trigger: GET /stages/:id/triggers/:trigger_id/runs
-// (trigger_run rows, newest first). Loaded when opened, refreshed live.
+// (trigger_run rows, newest first). Loaded when opened (at once for a trigger with a problem: its errors
+// are the first thing to see), refreshed live.
 import moment from 'moment';
 
 type Run = {
@@ -15,10 +16,10 @@ type Run = {
     note?: string | null;
 };
 
-const props = defineProps<{ stageId: number; triggerId: number }>();
+const props = defineProps<{ stageId: number; triggerId: number; open?: boolean }>();
 const stagesService = useService('stages', { auth: true });
 const { run, data: runs, isLoading, error } = useAsync<Run[]>([]);
-const open = ref(false);
+const open = ref(!!props.open);
 
 const statusMap: Record<Run['status'], { label: string; color: string }> = {
     pending: { label: 'Запланирован', color: 'text-amber-600 dark:text-amber-400' },
@@ -43,10 +44,12 @@ function onToggle(e: Event) {
 const when = (r: Run) => moment(r.executed_at || r.run_at).format('DD.MM.YYYY HH:mm');
 
 useLive((changes) => { if (open.value && liveTouches(changes, 'triggers')) load(); });
+
+onMounted(() => { if (open.value) load(); });
 </script>
 
 <template>
-    <details class="border-t border-muted-200 dark:border-muted-700" @toggle="onToggle">
+    <details class="border-t border-muted-200 dark:border-muted-700" :open="open" @toggle="onToggle">
         <summary class="px-3 py-2 text-sm cursor-pointer select-none text-muted-600 dark:text-muted-300">
             История запусков
             <span v-if="failedCount" class="ms-1 text-rose-600 dark:text-rose-400">· ошибок: {{ failedCount }}</span>

@@ -19,9 +19,11 @@ import { TaskTypes, TaskTypesToWeights } from '../deal/dto/search.deal.dto';
 import { OrderBy } from './dto/order.by';
 import { Deal } from '../deal/deal.entity';
 import { DealStage } from '../deal_stage/deal_stage.entity';
+import { StageKind } from '../deal_stage/stage-kind';
 import * as process from 'process';
 import { DealFilter } from '../trigger/dto/assign.trigger.dto';
 import { Filler } from '../filler/filler.entity';
+import { AuditJournal } from '../audit/audit-journal';
 
 @Injectable()
 export class HelperService {
@@ -93,9 +95,7 @@ export class HelperService {
   }
 
   async generateNewDeals(amount: number): Promise<Deal[]> {
-    const unknownDealStage = await this.getStageByName(
-      process.env.DEAL_STAGE_UNKNOWN,
-    );
+    const unknownDealStage = await this.getActiveStageOfKind(StageKind.NEW);
     const admin = await this.getAdmin();
 
     return this.dataSource.transaction(async (manager) => {
@@ -132,15 +132,18 @@ export class HelperService {
     return admin;
   }
 
-  async getStageByName(name: string): Promise<DealStage> {
+  /** The stage of a kind (deal_stage/stage-kind.ts) of the active pipeline; it used to be found by name in any pipeline. */
+  async getActiveStageOfKind(kind: StageKind): Promise<DealStage> {
     const stage = await this.dataSource
       .getRepository(DealStage)
-      .findOneBy({ name: name });
+      .createQueryBuilder('s')
+      .innerJoin('s.collection', 'c')
+      .where('s.kind = :kind AND c.is_active = true', { kind })
+      .orderBy('s.id', 'ASC')
+      .getOne();
 
     if (!stage) {
-      throw new NotFoundException(
-        `Deal stage with name ${name} does not exist!`,
-      );
+      throw new NotFoundException(`The active pipeline has no stage of kind ${kind}`);
     }
 
     return stage;
@@ -269,12 +272,16 @@ export class HelperService {
   }
 
   async deleteById<T>(entityType: Type<T>, id: number): Promise<void> {
-    const result = await this.dataSource
-      .createQueryBuilder()
-      .delete()
-      .from(entityType)
-      .where('id = :id', { id })
-      .execute();
+    // the journal (src/audit): a deleted task or note keeps its last state there, with who deleted it
+    const table = this.dataSource.getMetadata(entityType).tableName;
+    const result = await AuditJournal.around(this.dataSource, table, 't.id = $1', [id], () =>
+      this.dataSource
+        .createQueryBuilder()
+        .delete()
+        .from(entityType)
+        .where('id = :id', { id })
+        .execute(),
+    );
 
     if (result.affected === 0) {
       throw new NotFoundException(

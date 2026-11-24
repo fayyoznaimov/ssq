@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Checks for call recordings through the API (src/calls): recorder tokens, POST /calls/upload,
 the queue, processing (ffmpeg -> mp3, `recording`, NEW_CALL_RECORDING in the deal of the client
-with that number), retry / discard, rights.
+with that number), retry / discard, rights; «Записи звонков» (GET /calls/list: everybody's calls for
+admin and manager, one's own for an agent, filters, pages), FTPS per token (PATCH /calls/tokens/:id,
+GET /calls/recorder tls_required), the file links in the answers are signed (?e=&s=, FileLink).
 
 Runs against the local stack (docker) or, with the CRM_* variables from local/dev/env.sh, the dev
 copy on the server. Needs ffmpeg for the API (FFMPEG_BIN) and TELEGRAM_SERVICE_TOKEN in the API
@@ -14,6 +16,7 @@ import io
 import json
 import os
 import random
+import re
 import secrets
 import shlex
 import struct
@@ -65,6 +68,27 @@ def psql(sql):
     return done.stdout.strip()
 
 
+SIGNED = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]{9,254})\?e=(\d{1,12})&s=([0-9a-f]{64})$")
+SIGNED_SEEN = {"signed": 0, "bare": 0}  # file names in the answers: with their signature / without one
+
+
+def unsign(value):
+    """The API signs every file name it returns (path, avatar, raw_path: "<name>?e=…&s=…"): the checks compare bare names."""
+    if isinstance(value, list):
+        return [unsign(v) for v in value]
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if key in ("path", "avatar", "raw_path") and isinstance(item, str) and item:
+                m = SIGNED.match(item)
+                SIGNED_SEEN["signed" if m else "bare"] += 1
+                out[key] = m.group(1) if m else item
+            else:
+                out[key] = unsign(item)
+        return out
+    return value
+
+
 def http(method, path, body=None, token=None, headers=None, raw=None, timeout=120):
     data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
     hdrs = dict(headers or {})
@@ -77,7 +101,7 @@ def http(method, path, body=None, token=None, headers=None, raw=None, timeout=12
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 text = r.read()
-                return r.status, json.loads(text) if text else None
+                return r.status, unsign(json.loads(text)) if text else None
         except urllib.error.HTTPError as e:
             text = e.read()
             if e.code in (502, 504) and attempt < 39 and b"nginx" in text.lower():
@@ -529,6 +553,55 @@ def main():
             extra_contacts.append(r[1].get("contact_id", 0))
             check("... the deal is the agent's", psql(f"select agent_id from deal where id = {r[1]['deal']['id']}") == str(A["id"]))
 
+        print("== «Записи звонков»: GET /calls/list (SCR2-7)")
+        r = http("GET", f"/calls/list?user_id={A['id']}&limit=200", token=admin)
+        n_a = psql(f"select count(*) from recording where user_id = {A['id']}")
+        check("admin: GET /calls/list?user_id=A -> every call of A (count), newest first, with the manager",
+              r[0] == 200 and str(r[1]["count"]) == n_a and all((x.get("user") or {}).get("id") == A["id"] for x in r[1]["data"])
+              and [x["created_at"] for x in r[1]["data"]] == sorted((x["created_at"] for x in r[1]["data"]), reverse=True), (r[0], r[1].get("count") if r[0] == 200 else r, n_a))
+        check("... the file links in the answer are signed (no bare name left)", SIGNED_SEEN["signed"] > 0 and SIGNED_SEEN["bare"] == 0, SIGNED_SEEN)
+        n_out = psql(f"select count(*) from recording where user_id = {A['id']} and outgoing")
+        r = http("GET", f"/calls/list?user_id={A['id']}&direction=out&limit=200", token=admin)
+        check("direction=out: the outgoing calls only", r[0] == 200 and str(r[1]["count"]) == n_out and all(x["outgoing"] for x in r[1]["data"]), (r[0], n_out))
+        r = http("GET", f"/calls/list?user_id={A['id']}&direction=in&limit=200", token=admin)
+        check("direction=in: the incoming calls only", r[0] == 200 and int(r[1]["count"]) == int(n_a) - int(n_out) and not any(x["outgoing"] for x in r[1]["data"]), r[0])
+        r = http("GET", f"/calls/list?user_id={A['id']}&limit=1&page=2", token=admin)
+        check("pages: limit=1&page=2 -> one call, the count of all", r[0] == 200 and len(r[1]["data"]) == (1 if int(n_a) > 1 else 0) and str(r[1]["count"]) == n_a and r[1]["page"] == 2, r[0])
+        r = http("GET", f"/calls/list?user_id={A['id']}&from=2001-01-01&till=2001-01-31", token=admin)
+        check("a period without calls -> none", r[0] == 200 and r[1]["count"] == 0, r[0])
+        r = http("GET", f"/calls/list?user_id={A['id']}&direction=sideways", token=admin)
+        check("an unknown direction -> 400", r[0] == 400, r[0])
+        r = http("GET", "/calls/list?limit=200", token=B["token"])
+        n_b = psql(f"select count(*) from recording where user_id = {B['id']}")
+        check("an agent: their own calls only, whatever user_id says", r[0] == 200 and str(r[1]["count"]) == n_b
+              and all((x.get("user") or {}).get("id") == B["id"] for x in r[1]["data"]), (r[0], r[1].get("count") if r[0] == 200 else r, n_b))
+        r = http("GET", f"/calls/list?user_id={A['id']}", token=B["token"])
+        check("... asking for another manager's calls gives their own", r[0] == 200 and str(r[1]["count"]) == n_b, r[0])
+        check("no login -> 401", http("GET", "/calls/list")[0] == 401)
+
+        print("== FTPS per token (SEC-12)")
+        r = http("GET", "/calls/recorder", headers={"X-Recorder-Token": token_a})
+        check("GET /calls/recorder tells the FTP receiver whether the token is FTPS-only (false by default)",
+              r[0] == 200 and r[1].get("user_id") == A["id"] and r[1].get("tls_required") is False, r)
+        r = http("PATCH", f"/calls/tokens/{A['id']}", {"tls_required": True}, token=admin)
+        check("PATCH /calls/tokens/:id {tls_required: true} -> 200", r[0] == 200 and r[1].get("tls_required") is True, r)
+        r = http("GET", "/calls/recorder", headers={"X-Recorder-Token": token_a})
+        check("... GET /calls/recorder says tls_required: true", r[0] == 200 and r[1].get("tls_required") is True, r)
+        r = http("GET", "/calls/tokens", token=admin)
+        row = next((t for t in r[1] if t["user_id"] == A["id"]), None) if r[0] == 200 else None
+        check("... the token list shows it", row and row.get("tls_required") is True, row)
+        r = http("PATCH", f"/calls/tokens/{A['id']}", {"tls_required": True}, token=B["token"])
+        check("an agent cannot change it -> 403", r[0] == 403, r)
+        r = http("PATCH", f"/calls/tokens/{A['id']}", {"tls_required": "yes"}, token=admin)
+        check("not a boolean -> 400", r[0] == 400, r)
+        r = http("PATCH", "/calls/tokens/999999999", {"tls_required": True}, token=admin)
+        check("a user without a token -> 404", r[0] == 404, r)
+        r = http("PATCH", f"/calls/tokens/{A['id']}", {"tls_required": False}, token=admin)
+        r2 = http("GET", "/calls/recorder", headers={"X-Recorder-Token": token_a})
+        check("switched off again -> plain FTP allowed for the token", r[0] == 200 and r2[0] == 200 and r2[1].get("tls_required") is False, (r, r2))
+        r = http("GET", "/calls/recorder", headers={"X-Recorder-Token": "rec_" + "0" * 48})
+        check("an unknown token -> 401", r[0] == 401, r)
+
         print("== retry, discard, revoke")
         r = http("POST", f"/calls/queue/{up3}/retry", {}, token=admin)
         check("retry -> pending again", r[0] == 201 and r[1].get("status") == "pending", r)
@@ -555,10 +628,12 @@ def main():
         r = http("GET", "/calls/tokens", token=admin)
         row = next((t for t in r[1] if t["user_id"] == A["id"]), None)
         check("the token list shows A without a token", row and row["has_token"] is False, row)
-        r = http("POST", "/calls/tokens", {"user_id": A["id"]}, token=admin)
+        r = http("POST", "/calls/tokens", {"user_id": A["id"], "tls_required": True}, token=admin)
         r2 = http("POST", "/calls/tokens", {"user_id": A["id"]}, token=admin)
         check("reissuing replaces the token: the first one stops working", r[0] == 201 and r2[0] == 201 and
               upload({"duration": "1000"}, [("file", "x.wav", wav, "audio/wav")], {"X-Recorder-Token": r[1]["token"]})[0] == 401, (r[0], r2[0]))
+        check("a token issued FTPS-only, reissued without saying: the new one keeps FTPS-only",
+              r[0] == 201 and r[1].get("tls_required") is True and r2[0] == 201 and r2[1].get("tls_required") is True, (r[1], r2[1]))
 
     finally:
         print("== cleanup")

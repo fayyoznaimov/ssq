@@ -91,6 +91,32 @@ export function letterView(email?: Partial<Email> | null): { html: boolean; main
     return { html: false, ...splitTextQuote(body) };
 }
 
+/**
+ * The line under the subject in the list: the letter's own text without the quote, markdown links
+ * («[View in browser](https://…)» of newsletters) as their words, no bare links, one line.
+ */
+export function letterSnippet(email?: Partial<Email> | null, max = 200): string {
+    const body = String(email?.body ?? '');
+    let text = body;
+    if (LOOKS_HTML.test(body)) {
+        const spaced = body.replace(/<(br|\/p|\/div|\/li|\/tr|\/td|\/th|\/h[1-6])\b[^>]*>/gi, '$& ');
+        text = typeof DOMParser === 'undefined'
+            ? spaced.replace(/<[^>]+>/g, ' ')
+            : new DOMParser().parseFromString(sanitizeHtml(spaced), 'text/html').body.textContent ?? '';
+    }
+    return splitTextQuote(text).main
+        .split('\n')
+        .filter((line) => !line.trim().startsWith('>'))
+        .join(' ')
+        .replace(/!?\[([^\]]*)\]\(\s*(?:https?:|mailto:|cid:)[^)]*\)/gi, '$1')
+        .replace(/<(?:https?:|mailto:)[^>\s]*>/gi, ' ')
+        .replace(/\b(?:https?:\/\/|www\.)\S+/gi, ' ')
+        .replace(/[​-‍⁠﻿͏­]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, max);
+}
+
 /** "Re: " once: a reply to "Re: Цена" stays "Re: Цена". */
 export function replySubject(subject?: string | null): string {
     const text = String(subject ?? '').trim();

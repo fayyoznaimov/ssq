@@ -57,6 +57,7 @@ import type { User } from '~/types/user';
 import { promiseResult } from '~/utils/result';
 import { minLength,required } from '~/utils/validation';
 
+import { confirmTaskPlan, isTaskPlanCancelled } from './taskPlan';
 const props = defineProps<{
     id: string;
 }>();
@@ -143,11 +144,16 @@ async function onSubmit(e: Event) {
         allDay: allDay,
     };
 
-    let promise;
-    if (task.value.id && task.value?.id > 0) promise = taskService.patch(task.value.id, values).exec();
-    else promise = taskService.create(values).exec();
-    const result = await promiseResult(saveTask(promise));
-    if (!result.ok) return toast.show({message: result.error.message, type: 'error', timeout: 3000});
+    // a time in the past or a second task of the deal at the same time: the API asks, the user decides
+    const id = task.value.id && task.value.id > 0 ? task.value.id : null;
+    const send = (flags: Record<string, boolean>) => id
+        ? taskService.patch(id, {...values, ...flags}).exec()
+        : taskService.create({...values, ...flags}).exec();
+    const result = await promiseResult(saveTask(confirmTaskPlan(send)));
+    if (!result.ok) {
+        if (!isTaskPlanCancelled(result.error)) toast.show({message: result.error.message, type: 'error', timeout: 5000});
+        return;
+    }
     closeModal();
 }
 

@@ -6,6 +6,7 @@ import { File } from 'src/file/file.entity';
 import { Request } from 'express';
 import { AuthUser } from 'src/auth/auth.guard';
 import { periodBounds } from 'src/analytics/period';
+import { StageKind } from 'src/deal_stage/stage-kind';
 
 const STAFF_ROLES = [RoleEnum.ADMIN, RoleEnum.MANAGER, RoleEnum.AGENT];
 
@@ -38,9 +39,17 @@ export class DesktopService {
    *                    last week is still to be done)
    *   active_tasks   — open, deadline not passed yet, the task's span touches the period
    *   tasks_closed   — done within the period
+   * The task list gives the same tasks (the counters link to it): status overdue / upcoming with the
+   * period's dates (the span overlaps) / closed with closed_from..closed_till.
+   *   deals_without_tasks — open deals without an open task now, whatever the period (a state, like
+   *                    "overdue"; the deals list "Сделки без задач" shows the same deals); "mine": responsible
+   *   comments       — notes (comments) written in the period (by the user for "mine" / the picked users)
    * "Mine" are the tasks assigned to the user or to the user's group, as in the task list ("Мои") and in
    * the bot. Picked users (user_ids): their tasks, deals, calls and files. Tasks of a deal in the trash
    * are not counted (they come back with the deal).
+   *   succesfull_deals — deals won (the stage of kind "won") and closed in the period, by the responsible
+   *                    user: the reports count won deals the same way (analytics: by closed_at)
+   * won_stage: the stage of kind "won" of the active pipeline (the card links to the deals list by it).
    * total_manager_stats: deals created in the period with a staff user responsible — the sum of the
    * "Сделки по менеджерам" list (by the responsible user, all staff roles; it used to count only the
    * deals created by role "manager").
@@ -64,6 +73,7 @@ export class DesktopService {
       manager_stats: await this.managerStats(who, period.from_date, period.till_date),
       total_manager_stats: await this.totalManagerStats(who, period.from_date, period.till_date),
       file_stats: await this.fileStats(who, period.from_date, period.till_date),
+      won_stage: await this.wonStage(),
     };
   }
 
@@ -74,7 +84,7 @@ export class DesktopService {
     const me = who.kind === 'me' ? p.add(who.id) : null;
     const group = who.kind === 'me' && who.group != null ? p.add(who.group) : null;
     const users = who.kind === 'users' ? p.add(who.ids) : null;
-    const closedStage = p.add(process.env.DEAL_STAGE_CLOSED ?? '');
+    const closedStage = p.add(StageKind.WON);
 
     const taskWho = (a: string) =>
       who.kind === 'all'
@@ -82,12 +92,9 @@ export class DesktopService {
         : who.kind === 'me'
           ? `(${a}.agent_id = ${me}${group ? ` OR ${a}.group_id = ${group}` : ''})`
           : `${a}.agent_id = ANY(${users}::int[])`;
-    const dealWho = (a: string) =>
-      who.kind === 'all'
-        ? 'TRUE'
-        : who.kind === 'me'
-          ? `(${a}.agent_id = ${me} OR ${a}.created_by = ${me})`
-          : `${a}.agent_id = ANY(${users}::int[])`;
+    // the responsible user, as the deals list filters "Только мои" / by the user
+    const responsible = (a: string) =>
+      who.kind === 'all' ? 'TRUE' : who.kind === 'me' ? `${a}.agent_id = ${me}` : `${a}.agent_id = ANY(${users}::int[])`;
     const eventWho = (a: string, column: 'user_id' | 'target_user_id') =>
       who.kind === 'all' ? 'TRUE' : who.kind === 'me' ? `${a}.${column} = ${me}` : `${a}.${column} = ANY(${users}::int[])`;
     const notInTrash = (a: string) =>
@@ -107,7 +114,10 @@ export class DesktopService {
         (SELECT COUNT(*) FROM deal a4
           WHERE a4.deleted_at IS NULL AND a4.closed_at IS NULL
             AND NOT EXISTS (SELECT 1 FROM task a5 WHERE a5.deal_id = a4.id AND a5.closed_at IS NULL)
-            AND ${inPeriod('a4.created_at')} AND ${dealWho('a4')}) AS deals_without_tasks,
+            AND ${responsible('a4')}) AS deals_without_tasks,
+        (SELECT COUNT(*) FROM event a11
+          WHERE a11.type = 5 AND ${inPeriod('a11.created_at')} AND ${eventWho('a11', 'user_id')}
+            AND NOT EXISTS (SELECT 1 FROM deal dd WHERE dd.id = a11.deal_id AND dd.deleted_at IS NOT NULL)) AS comments,
         (SELECT COUNT(*) FROM event a6
           WHERE a6.type = 10 AND a6.outgoing = true AND ${inPeriod('a6.created_at')} AND ${eventWho('a6', 'user_id')}) AS outgoing_calls,
         (SELECT COUNT(*) FROM event a7
@@ -115,11 +125,20 @@ export class DesktopService {
         (SELECT COUNT(*) FROM deal a8
           WHERE a8.deleted_at IS NULL AND a8.closed_at IS NOT NULL
             AND a8.stage_id IN (SELECT a9.id FROM deal_stage a9 LEFT JOIN collection a10 ON a9.collection_id = a10.id
-                                 WHERE a9.name = ${closedStage} AND a10.is_active = true)
-            AND ${inPeriod('a8.created_at')} AND ${dealWho('a8')}) AS succesfull_deals`,
+                                 WHERE a9.kind = ${closedStage} AND a10.is_active = true)
+            AND ${inPeriod('a8.closed_at')} AND ${responsible('a8')}) AS succesfull_deals`,
       p.values,
     );
     return rows[0];
+  }
+
+  private async wonStage(): Promise<{ id: number; name: string } | null> {
+    const rows: { id: number; name: string }[] = await this.dataSource.query(
+      `SELECT s.id, s.name FROM deal_stage s LEFT JOIN collection c ON c.id = s.collection_id
+       WHERE s.kind = $1 ORDER BY (c.is_active IS TRUE) DESC, s.id LIMIT 1`,
+      [StageKind.WON],
+    );
+    return rows[0] ?? null;
   }
 
   /** Deals of the period per staff user (responsible), the same rows as "По сотрудникам". */

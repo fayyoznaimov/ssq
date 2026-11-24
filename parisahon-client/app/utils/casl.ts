@@ -95,6 +95,30 @@ export function accessFromUser(user: User): AccessModel {
 }
 
 /**
+ * «Стандартные права» of an agent: their own deals, companies and contacts — see, create, change; their own
+ * tasks — change; nothing to delete. The same template as STANDARD_LEVELS in src/auth/access.ts of the API
+ * (POST /auth/standard-rights/:id gives it to an existing employee).
+ */
+export const STANDARD_PERMISSIONS = {
+    deal: {view: 1, create: 3, update: 1, delete: 0, export: 0},
+    company: {view: 1, create: 3, update: 1, delete: 0, export: 0},
+    contact: {view: 1, create: 3, update: 1, delete: 0, export: 0},
+    task: {update: 1, delete: 0},
+};
+
+/**
+ * What the card of an agent leaves them unable to see, by the API's rules: 'nothing' — no deals, companies or
+ * contacts at all; 'deals' — not even the deals they are responsible for. null: nothing to warn about (admin
+ * and manager see everything). The list «Пользователи» and the user card warn with it.
+ */
+export function blindSpot(user: Pick<User, 'role' | 'permissions'> & Partial<User>): 'nothing' | 'deals' | null {
+    if (user.role !== UserRole.Agent) return null;
+    const {scopes} = accessFromUser(user as User);
+    if (scopes.deal.view !== 'none') return null;
+    return scopes.company.view === 'none' && scopes.contact.view === 'none' ? 'nothing' : 'deals';
+}
+
+/**
  * CASL conditions of a deal scope on the deal object (deal.agent is the responsible user), as the API
  * decides (Access.allowsDeal): null means every deal, false none.
  */

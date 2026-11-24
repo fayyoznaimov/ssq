@@ -305,7 +305,10 @@ def main():
     status, body = http("POST", "/tasks", {
         "label": "%s-company-task" % P, "type_id": task_type_id,
         "assign_to": {"target": "agent", "id": admin_id}, "link_to": {"target": "company", "id": company_id},
-        "start_time": now.strftime("%Y-%m-%dT%H:%M:%S"), "end_time": (now + datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S"),
+        # with the offset: a bare "now" is read in the API's time zone (+05) and was hours in the past when the
+        # checks ran elsewhere (UTC) — a task in the past is refused now (TASK_IN_PAST)
+        "start_time": now.astimezone().isoformat(timespec="seconds"),
+        "end_time": (now + datetime.timedelta(hours=1)).astimezone().isoformat(timespec="seconds"),
         "allDay": False,
     })
     check("a task linked to the company -> 201", status == 201, "%s %s" % (status, message_of((status, body))))
@@ -366,6 +369,59 @@ def main():
     sql("DELETE FROM event WHERE id IN (%s)" % ",".join(str(i) for i in mail_events))
     sql("UPDATE deal SET agent_id = NULL WHERE id = %d" % deal2)
 
+    section("Notes of a card and the client of an event (SCR2-4, DB-9, SALE-16)")
+    # the task of the company (no deal) names its company as a column, not only in the JSON
+    if company_task:
+        check("a task of the company: its event has event.company_id (DB-9)",
+              count("SELECT count(*) FROM event WHERE type = 6 AND task_id = %d AND company_id = %d" % (company_task, company_id)) == 1,
+              sql("SELECT id, company_id, contact_id FROM event WHERE task_id = %d" % company_task))
+    status, note = http("POST", "/companies/%d/comments" % company_id, {"comment": "%s-note-company клиент просил прайс" % P})
+    check("POST /companies/:id/comments -> 201, a note of the company without a deal",
+          status == 201 and isinstance(note, dict) and note.get("company_id") == company_id and not note.get("deal"),
+          "%s %s" % (status, note))
+    company_note = note.get("id") if status == 201 and isinstance(note, dict) else None
+    author = (note or {}).get("originated_by") or {} if isinstance(note, dict) else {}
+    check("... its author is a name, not an account (no rights, Telegram id, token version)",
+          author.get("id") == admin_id and not set(author) - {"id", "username", "avatar", "role", "deleted_at"}, author)
+    status, note = http("POST", "/users/%d/comments" % contact_id, {"comment": "%s-note-contact перезвонить в пн" % P}, token=agent["token"])
+    check("POST /users/:contact/comments by an agent -> 201, the contact and its company as columns",
+          status == 201 and isinstance(note, dict) and note.get("contact_id") == contact_id and note.get("company_id") == company_id,
+          "%s %s" % (status, note))
+    contact_note = note.get("id") if status == 201 and isinstance(note, dict) else None
+    st, rows = feed_of("/companies/%d/events?limit=50" % company_id)
+    check("both notes are in the company feed", st == 200 and company_note in rows and contact_note in rows, (st, list(rows)[:15]))
+    st, rows = feed_of("/users/%d/events?limit=50" % contact_id)
+    check("the contact's note is in the contact feed, the company's is not",
+          st == 200 and contact_note in rows and company_note not in rows, (st, list(rows)[:15]))
+    people = [e.get(k) for e in rows.values() for k in ("originated_by", "target_user") if isinstance(e.get(k), dict)]
+    check("feed people carry only id, name, avatar, role, deleted_at (SALE-16)",
+          people and all(not set(x) - {"id", "username", "avatar", "role", "deleted_at"} for x in people),
+          [sorted(x) for x in people][:3])
+    check("no employee rights anywhere in the feed snapshots",
+          '"permissions"' not in json.dumps(list(rows.values())) and '"token_version"' not in json.dumps(list(rows.values())))
+    status, _ = http("POST", "/users/%d/comments" % admin_id, {"comment": "%s-note-staff" % P})
+    check("a note on an employee instead of a client -> 400", status == 400, status)
+    status, _ = http("POST", "/companies/%d/comments" % company_id, {"comment": ""})
+    check("an empty note -> 400", status == 400, status)
+    if company_note:
+        status, _ = http("PATCH", "/companies/%d/comments/%d" % (company_id, company_note), {"comment": "%s-hack" % P}, token=agent["token"])
+        check("another user cannot change the note -> 403", status == 403, status)
+        status, body = http("PATCH", "/companies/%d/comments/%d" % (company_id, company_note), {"comment": "%s-note-company изменено" % P})
+        check("the author changes it -> 200, the old text kept as a version",
+              status == 200 and ((body or {}).get("after_state") or {}).get("data", {}).get("comment") == "%s-note-company изменено" % P
+              and ((body or {}).get("before_state") or {}).get("data", {}).get("versions"), "%s %s" % (status, body))
+        status, _ = http("PATCH", "/companies/%d/comments/%d" % (company_empty, company_note), {"comment": "%s-x" % P})
+        check("... not through another company -> 404", status == 404, status)
+        st, logs = http("GET", "/logs?company_id=%d&limit=50" % company_id)
+        check("the journal filters by the client (/logs?company_id=)",
+              st == 200 and company_note in [e.get("id") for e in (logs or {}).get("data", [])], st)
+        status, _ = http("DELETE", "/companies/%d/comments/%d" % (company_id, company_note))
+        check("the author deletes it -> 200 and it is gone",
+              status == 200 and count("SELECT count(*) FROM event WHERE id = %d" % company_note) == 0, status)
+    if contact_note:
+        status, _ = http("DELETE", "/users/%d/comments/%d" % (contact_id, contact_note), token=agent["token"])
+        check("the agent deletes their note of the contact -> 200", status == 200, status)
+
     section("Source of a contact (GET /companies/:id/agent/:contact/source)")
     status, body = http("GET", "/companies/%d/agent/%d/source" % (company_id, contact_id))
     check("contact of the company -> 200 (was 500)", status == 200, "%s %s" % (status, message_of((status, body))))
@@ -397,12 +453,12 @@ def main():
         return payload
 
     status, body = http("POST", "/companies", company_payload("%s-co" % P))
-    check("duplicate name -> 400 'already exists'", status == 400 and "already exists" in message_of((status, body)),
-          "%s %s" % (status, message_of((status, body))))
+    check("SALE-11: duplicate name -> 409 «Компания … уже есть» (Russian, not 500)",
+          status == 409 and "уже есть" in message_of((status, body)), "%s %s" % (status, message_of((status, body))))
     status, body = http("POST", "/companies", company_payload("%s-co-x" % P, users=[
         {"username": "%s-x" % P, "email": "audit-mod-contact-%s@example.test" % RUN, "phone": "+998900000009", "role": "ctr_agent", "fillers": []}]))
-    check("contact with an e-mail that is taken -> 400 about the contact, not 'company already exists'",
-          status == 400 and "ctr_agent" in message_of((status, body)) and "Company with name" not in message_of((status, body)),
+    check("contact with an e-mail that is taken -> 409 about the contact, not «Компания … уже есть»",
+          status == 409 and "Контакт" in message_of((status, body)) and "Компания" not in message_of((status, body)),
           "%s %s" % (status, message_of((status, body))))
     check("no company was created by the failed request", count("SELECT count(*) FROM company WHERE name = '%s-co-x'" % P) == 0)
 
@@ -640,8 +696,10 @@ def main():
     status, body = http("GET", "/companies/%d/sources?limit=50" % company_id)
     check("CO-11: GET /companies/:id/sources -> 200 with the files of the company's deals",
           status == 200 and any(f.get("path") == "uploads/%s-file.txt" % P for f in body.get("files", [])), "%s %s" % (status, message_of((status, body))))
-    check("CALL-3: ... and the call made from the contact's phone (the tab was always empty)",
-          status == 200 and any(r.get("path") == rec_path for r in body.get("recordings", [])), (body or {}).get("recordings") if status == 200 else status)
+    # file names come signed (src/file/file-link.ts): "<name>?e=<expiry>&s=<hmac>"
+    check("CALL-3: ... and the call made from the contact's phone (the tab was always empty), its link signed",
+          status == 200 and any(re.fullmatch(re.escape(rec_path) + r"\?e=\d+&s=[0-9a-f]{64}", r.get("path") or "")
+                                for r in body.get("recordings", [])), (body or {}).get("recordings") if status == 200 else status)
     sql("DELETE FROM recording WHERE path = '%s'" % rec_path)
 
     # CO-8: a deleted company can be found and restored; its name can be used again
@@ -662,9 +720,31 @@ def main():
     check("CO-8: GET /fillers/:id/usage counts the values a deleted field would take with it",
           status == 200 and isinstance(body, dict) and body.get("values") == 2, "%s %s" % (status, body))
 
-    # CO-13: a rename to a taken name is a 400, not a 500
-    status, body = http("PATCH", "/companies/%d" % company_empty, {"name": "%s-co" % P})
-    check("CO-13: renaming to the name of another company -> 400 (was 500)", status == 400, "%s %s" % (status, message_of((status, body))))
+    # CO-8 / DB-5: a deleted company is not restored over a live one with its name
+    status, body = http("PATCH", "/companies/%d/restore" % trash_co, {})
+    check("DB-5: restoring a company whose name a live company took meanwhile -> 409, it stays deleted",
+          status == 409 and count("SELECT count(*) FROM company WHERE id = %d AND deleted_at IS NOT NULL" % trash_co) == 1,
+          "%s %s" % (status, message_of((status, body))))
+
+    # CO-13 / SALE-11: a rename to a taken name (other case, spaces around) is a 409, not a 500
+    status, body = http("PATCH", "/companies/%d" % company_empty, {"name": "  %s-CO " % P})
+    check("CO-13 / SALE-11: renaming to the name of another company (other case, spaces) -> 409 in Russian (was 500)",
+          status == 409 and "уже есть" in message_of((status, body)), "%s %s" % (status, message_of((status, body))))
+    status, body = http("PATCH", "/companies/%d" % company_empty, {"name": "   "})
+    check("SALE-11: a name of spaces only -> 400 «Название компании…»",
+          status == 400 and "Название компании" in message_of((status, body)), "%s %s" % (status, message_of((status, body))))
+    status, body = http("PATCH", "/companies/%d" % company_empty, {"phone": "abc"})
+    check("SALE-11: the phone «abc» in the company card -> 400",
+          status == 400 and "Телефон" in message_of((status, body)), "%s %s" % (status, message_of((status, body))))
+
+    # DB-5: the database itself keeps one live company per name / ИНН and one live user per e-mail
+    indexes = dict((r[0], r[1]) for r in sql(
+        "SELECT indexname, indexdef FROM pg_indexes WHERE indexname IN ('IDX_company_name_live', 'IDX_user_email_active', 'IDX_company_inn_live')"))
+    check("DB-5: unique index on lower(btrim(company.name)) of live companies",
+          "lower(btrim" in indexes.get("IDX_company_name_live", "") and "UNIQUE" in indexes.get("IDX_company_name_live", ""), indexes)
+    check("DB-5: unique index on lower(btrim(user.email)) of live users",
+          "lower(btrim" in indexes.get("IDX_user_email_active", "") and "UNIQUE" in indexes.get("IDX_user_email_active", ""), indexes)
+    check("DB-5: unique index on the ИНН of live companies", "UNIQUE" in indexes.get("IDX_company_inn_live", ""), indexes)
 
     # ACL-6 / TASK-17: the staff list of the pickers
     status, body = http("GET", "/users/staff", token=agent["token"])
@@ -684,6 +764,11 @@ def main():
     check("ACL-7: «own» contact view: GET /contacts does not list a colleague's contact",
           status == 200 and all(not (r["type"] == "ctr_agent" and r["id"] == contact_id) for r in body.get("data", [])),
           "%s %s" % (status, message_of((status, body))))
+    status, body = http("GET", "/companies/similar?name=%s-co" % P, token=agent["token"])
+    hidden = [m for m in (body or {}).get("matches", []) if m.get("id") == company_id and m.get("kind") == "company"] if status == 200 else []
+    check("ACL-2: the duplicate hint of an «own» agent names a colleague's company only as «другого менеджера», without its date",
+          status == 200 and hidden and all(m.get("visible") is False and P not in str(m.get("name")) and not m.get("last_deal_at") for m in hidden),
+          "%s %s" % (status, hidden or message_of((status, body))))
     status, body = http("POST", "/users", {"username": "%s-no-right" % P, "role": "ctr_agent"}, token=agent["token"])
     check("ACL-12: no «Создание контактов»: POST /users (a contact) -> 403", status == 403, "%s %s" % (status, message_of((status, body))))
     status, body = http("POST", "/companies", company_payload("%s-co-no-right" % P, users=[
@@ -699,12 +784,72 @@ def main():
     status, body = http("PATCH", "/users/me", {"username": "%s-agent" % P, "phone": ""}, token=agent["token"])
     check("ACL-18: ... and \"\" clears it", status == 200 and scalar("SELECT phone FROM \"user\" WHERE id = %d" % agent["id"]) in (None, ""), status)
 
+    # SALE-13 / DB-14: one form of a contact e-mail; the same address in capitals is the same contact
+    status, body = http("POST", "/users", {"username": "%s-mixed-mail" % P, "role": "ctr_agent", "fillers": list(prod_required_user),
+                                           "email": " Audit-Mod-Mixed-%s@Example.TEST " % RUN})
+    check("SALE-13: a contact e-mail is stored trimmed and in lower case",
+          status == 201 and scalar("SELECT email FROM \"user\" WHERE username = '%s-mixed-mail'" % P) == "audit-mod-mixed-%s@example.test" % RUN,
+          "%s %s" % (status, message_of((status, body))))
+    status, body = http("POST", "/users", {"username": "%s-mixed-mail-2" % P, "role": "ctr_agent", "fillers": list(prod_required_user),
+                                           "email": "AUDIT-MOD-MIXED-%s@example.test" % RUN})
+    check("SALE-13: the same e-mail in capitals -> 409 naming the contact that has it",
+          status == 409 and "%s-mixed-mail" % P in message_of((status, body)), "%s %s" % (status, message_of((status, body))))
+
+    # ACL-17: a deal of a colleague carries only the public fields of the colleague's account
+    staff_deal = new_deal("%s-deal-acl17" % P, agent_id=str(admin_id))
+    status, body = http("GET", "/deals/%d" % staff_deal, token=agent["token"])
+    deal_agent = (body or {}).get("agent") if status == 200 and isinstance(body, dict) else None
+    check("ACL-17: an agent reads a deal of a colleague: its agent has no permissions, objectives, tg_id, wa_id",
+          isinstance(deal_agent, dict) and deal_agent.get("id") == admin_id
+          and not any(k in deal_agent for k in ("permissions", "objectives", "tg_id", "wa_id")),
+          "%s %s" % (status, sorted(deal_agent) if isinstance(deal_agent, dict) else message_of((status, body))))
+    status, body = http("GET", "/deals/%d" % staff_deal)
+    check("ACL-17: ... the admin still sees them", status == 200 and "permissions" in ((body or {}).get("agent") or {}), status)
+
+    # OMNI-6: «Объединить контакты» — the second record of one client goes into the first
+    tg_b = 990000000000 + int(RUN)
+    merge_a = int(scalar("INSERT INTO \"user\" (username, role, company_id) VALUES ('%s-merge-A', 'ctr_agent', %d) RETURNING id" % (P, company_empty)))
+    merge_b = int(scalar("INSERT INTO \"user\" (username, role, phone, tg_id, email) VALUES ('%s-merge-B', 'ctr_agent', '+998%s', %d, 'audit-mod-merge-%s@example.test') RETURNING id"
+                         % (P, free_local9(), tg_b, RUN)))
+    merge_deal = new_deal("%s-deal-merge" % P, company="NULL")
+    sql('INSERT INTO deal_user ("dealId", "userId") VALUES (%d, %d)' % (merge_deal, merge_b))
+    status, body = http("POST", "/users/%d/merge" % merge_a, {"from_id": merge_a})
+    check("OMNI-6: merging a contact with itself -> 400", status == 400, "%s %s" % (status, message_of((status, body))))
+    status, body = http("POST", "/users/%d/merge" % merge_a, {"from_id": merge_b})
+    check("OMNI-6: POST /users/:id/merge -> 200", status == 200 and (body or {}).get("merged_id") == merge_b,
+          "%s %s" % (status, message_of((status, body))))
+    row = sql("SELECT (SELECT deleted_at IS NOT NULL FROM \"user\" WHERE id = %d), tg_id::text, email, phone IS NOT NULL FROM \"user\" WHERE id = %d" % (merge_b, merge_a))
+    check("OMNI-6: B is deleted; A took its Telegram id, e-mail and phone",
+          row and row[0] == ["t", str(tg_b), "audit-mod-merge-%s@example.test" % RUN, "t"], row)
+    check("OMNI-6: B's deal is A's now and has the company of A",
+          count('SELECT count(*) FROM deal_user WHERE "dealId" = %d AND "userId" = %d' % (merge_deal, merge_a)) == 1
+          and count('SELECT count(*) FROM deal_user WHERE "userId" = %d' % merge_b) == 0
+          and count("SELECT count(*) FROM deal WHERE id = %d AND company_id = %d" % (merge_deal, company_empty)) == 1)
+    for _ in range(10):  # the history is written by an event listener
+        if count("SELECT count(*) FROM event WHERE deal_id = %d AND after_state::text LIKE '%%%s-merge-B%%'" % (merge_deal, P)):
+            break
+        time.sleep(0.5)
+    check("OMNI-6: the merge is in the history of the deal",
+          count("SELECT count(*) FROM event WHERE deal_id = %d AND after_state::text LIKE '%%%s-merge-B%%'" % (merge_deal, P)) >= 1)
+    status, body = http("GET", "/users/%d" % merge_b)
+    check("OMNI-6: the merged contact is gone from the API (404)", status == 404, status)
+
     # CO-12: a product has an article, a unit and a price with kopecks
     prod_required_product = [{"filler_id": int(r[0]), "value": "x"} for r in sql("SELECT id FROM filler WHERE target = 'product' AND is_required AND field NOT LIKE 'AUDIT-%'")]
     status, body = http("POST", "/products", {"name": "%s-prod-price" % P, "sku": "AUD-1", "unit": "м", "price": "12,50", "fillers": prod_required_product})
     check("CO-12: a product with an article, a unit and the price 12,50 -> 201",
           status == 201 and scalar("SELECT price::text || '/' || sku || '/' || unit FROM product WHERE name = '%s-prod-price'" % P) == "12.50/AUD-1/м",
           "%s %s" % (status, message_of((status, body))))
+
+    # SCR2-8 / SCR2-13: the cards
+    for card in (("companies", "DeleteCompanyConfirmation"), ("contacts", "DeleteContactConfirmation"), ("products", "DeleteProductConfirmation")):
+        vue = client_file(os.path.join("pages", "lists", card[0], "[id].vue"))
+        check("SCR2-8: the %s card asks before deleting (Confirmation), no confirm(), «Удалить» after «Сохранить»" % card[0],
+              card[1] in vue and "confirm(`" not in vue and vue.find('type="submit"') < vue.find("onDelete\""),
+              card[0])
+        check("SCR2-13: the %s card names its record (useRecordTitle)" % card[0], "useRecordTitle(" in vue, card[0])
+    contact_vue = client_file(os.path.join("pages", "lists", "contacts", "[id].vue"))
+    check("OMNI-6: the contact card has «Объединить контакты»", "MergeContactModal" in contact_vue and "Объединить контакты" in contact_vue)
 
     # ================================================================= products
     section("Products")
@@ -720,8 +865,10 @@ def main():
         check("GET /products/statistics?sort[%s]=-1 -> 200 (was 500)" % key, status == 200, "%s %s" % (status, message_of((status, body))))
     status, body = http("GET", "/products/statistics?sort[deal_count]=-1&limit=200")
     row = next((r for r in (body or {}).get("data", []) if r["id"] == product_id), None) if status == 200 else None
-    check("the statistics row of the product: 1 deal, quantity 2, sum 300",
-          row and row["deal_count"] == 1 and row.get("average_quantity_per_deal") == 2 and row["total_price_sold"] == 300, row)
+    # deal_product.price is the price of one unit (the deal card shows quantity × price): 2 × 300 sold for 600
+    check("the statistics row of the product: 1 deal, quantity 2, unit price 300, sum 2 × 300 = 600",
+          row and row["deal_count"] == 1 and row.get("average_quantity_per_deal") == 2
+          and row.get("average_price_per_product") == 300 and row["total_price_sold"] == 600, row)
     status, body = http("GET", "/products/statistics?sort[name]=-1")
     check("sorting by a column that is not allowed -> 400", status == 400, status)
     analytics_vue = client_file(os.path.join("pages", "analytics", "products", "index.vue"))
@@ -797,7 +944,8 @@ def main():
           'name="allDay"' in client_scheduler and 'name="all_day"' not in client_scheduler)
 
     # TASK-9: "Мои", every status, the client's tasks
-    status, t_agent, body = new_task("%s-task-of-agent" % P, {"target": "deal", "id": deal1}, assignee=agent["id"], type_id=task_type_id)
+    status, t_agent, body = new_task("%s-task-of-agent" % P, {"target": "deal", "id": deal1}, assignee=agent["id"], type_id=task_type_id,
+                                     start_time=iso(now + 30 * hour), end_time=iso(now + 31 * hour))
     status, body = http("GET", "/tasks?mine=true&limit=1000", token=agent["token"])
     mine = [t["id"] for t in (body or {}).get("data", [])] if status == 200 else None
     check("GET /tasks?mine=true -> the caller's tasks only", mine is not None and t_agent in mine and t_notype not in mine, mine)
@@ -818,6 +966,63 @@ def main():
         sql("DELETE FROM event WHERE task_id = %d; DELETE FROM task WHERE id = %d" % (t_agent, t_agent))
     status, body = http("GET", "/tasks?sort[end_time]=1&limit=5")
     check("the list sorts by the deadline (sort[end_time]) -> 200", status == 200, "%s %s" % (status, message_of((status, body))))
+
+    # BOT-7: a task in the past is refused in Russian unless the request says it is deliberate (allow_past)
+    status, t_past, body = new_task("%s-task-past" % P, {"target": "deal", "id": deal2}, type_id=task_type_id,
+                                    start_time=iso(now - 50 * hour), end_time=iso(now - 49 * hour))
+    check("BOT-7: POST /tasks with a time in the past -> 400 TASK_IN_PAST with a Russian message",
+          status == 400 and (body or {}).get("code") == "TASK_IN_PAST" and "прошло" in message_of((status, body)) and not t_past,
+          "%s %s" % (status, body))
+    status, t_past, body = new_task("%s-task-past" % P, {"target": "deal", "id": deal2}, type_id=task_type_id,
+                                    start_time=iso(now - 50 * hour), end_time=iso(now - 49 * hour), allow_past=True)
+    check("BOT-7: ... with allow_past (the task is already done) -> 201", status == 201 and t_past, "%s %s" % (status, message_of((status, body))))
+    if t_past:
+        status, body = http("PATCH", "/tasks/%d" % t_past, {"label": "%s-task-past renamed" % P})
+        check("BOT-7: an overdue task may still be renamed (the rule is for a new time) -> 200", status == 200, "%s %s" % (status, message_of((status, body))))
+    if t_notype:
+        status, body = http("PATCH", "/tasks/%d" % t_notype, {"start_time": iso(now - 30 * hour), "end_time": iso(now - 29 * hour)})
+        check("BOT-7: moving a task into the past -> 400 TASK_IN_PAST, the task keeps its time",
+              status == 400 and (body or {}).get("code") == "TASK_IN_PAST"
+              and scalar("SELECT start_time > now() FROM task WHERE id = %d" % t_notype) == "t", "%s %s" % (status, body))
+
+    # BOT-8: a second open task of the same deal within 15 minutes -> 409 with the existing task
+    status, t_dup, body = new_task("%s-task-dup" % P, {"target": "deal", "id": deal1}, type_id=task_type_id,
+                                   start_time=iso(now + 24 * hour + datetime.timedelta(minutes=10)),
+                                   end_time=iso(now + 25 * hour))
+    existing = (body or {}).get("existing") or {} if isinstance(body, dict) else {}
+    check("BOT-8: a second task of the deal 10 minutes from an open one -> 409 TASK_DUPLICATE naming the existing task",
+          status == 409 and body.get("code") == "TASK_DUPLICATE" and existing.get("id") == t_notype and "уже есть" in message_of((status, body)),
+          "%s %s" % (status, body))
+    status, t_dup, body = new_task("%s-task-dup" % P, {"target": "deal", "id": deal1}, type_id=task_type_id,
+                                   start_time=iso(now + 24 * hour + datetime.timedelta(minutes=10)),
+                                   end_time=iso(now + 25 * hour), allow_duplicate=True)
+    check("BOT-8: ... with allow_duplicate -> 201", status == 201 and t_dup, "%s %s" % (status, message_of((status, body))))
+    status, t_far, body = new_task("%s-task-far" % P, {"target": "deal", "id": deal1}, type_id=task_type_id,
+                                   start_time=iso(now + 26 * hour), end_time=iso(now + 27 * hour))
+    check("BOT-8: an hour and more apart is not a duplicate -> 201", status == 201 and t_far, "%s %s" % (status, message_of((status, body))))
+    for extra in (t_dup, t_far):
+        if extra:
+            sql("DELETE FROM event WHERE task_id = %d; DELETE FROM task WHERE id = %d" % (extra, extra))
+
+    # SCR10: «Создана» filters by the creation date, «Срок» by the deadline
+    today_day = now.strftime("%Y-%m-%d")
+    tomorrow_day = (now + 24 * hour).strftime("%Y-%m-%d")
+    status, body = http("GET", "/tasks?type=all&limit=1000&created_from=%s&created_till=%s&deal_id=%d" % (today_day, today_day, deal1))
+    created_today = [t["id"] for t in (body or {}).get("data", [])] if status == 200 else []
+    status, body = http("GET", "/tasks?type=all&limit=1000&created_from=%s&created_till=%s&deal_id=%d" % (tomorrow_day, tomorrow_day, deal1))
+    created_tomorrow = [t["id"] for t in (body or {}).get("data", [])] if status == 200 else None
+    check("SCR10: created_from / created_till filter by the creation date (a task due tomorrow is created today)",
+          t_notype in created_today and created_tomorrow is not None and t_notype not in created_tomorrow, (created_today, created_tomorrow))
+    tasks_list_vue = client_file(os.path.join("pages", "tasks", "index.vue"))
+    check("client: the task list shows the deadline (not closed_at) and paints only the deadline cell of an overdue task",
+          "taskWhen(item.end" in tasks_list_vue and "'!text-red-600'" not in tasks_list_vue and 'label="Создана"' in tasks_list_vue)
+    kanban_vue = client_file(os.path.join("pages", "tasks", "kanban.vue"))
+    calendar_vue = client_file(os.path.join("pages", "tasks", "calendar.vue"))
+    check("SCR11: the board and the calendar load every page of their tasks (all: true), not the list's 25",
+          "all: true" in kanban_vue and "all: true" in calendar_vue and "async function allPages(" in client_file("pages/tasks.vue"))
+    column_vue = client_file(os.path.join("components", "task", "TaskColumn.vue"))
+    check("SCR12: the board cards say «1 задача / 3 задачи / 10 задач» and show the time without seconds",
+          "tasksCount(tasks.length)" in column_vue and "toLocaleString('ru')" not in column_vue)
 
     # TASK-3: an agent with "own" rights does not read or link other people's deals through tasks
     own = {"view": 1, "create": 3, "update": 1, "delete": 1, "export": 0}
@@ -842,6 +1047,44 @@ def main():
     status_get, _ = http("GET", "/tasks/%d" % (t_own2 or 0), token=agent2["token"])
     check("own rights: a task on the agent's own deal -> 201 and readable", t_own2 and status_get == 200, (status, message_of((status, body)), status_get))
 
+    # ACL-8 / ACL-13: rights of a task follow the task level of the card (own / group / all)
+    status, _, body = new_task("%s-task-for-admin" % P, {"target": "deal", "id": deal_own2}, assignee=admin_id, token=agent2["token"],
+                               type_id=task_type_id, start_time=iso(now + 40 * hour), end_time=iso(now + 41 * hour))
+    check("ACL-8: own task level: a task for a colleague -> 403 in Russian", status == 403 and "Задачу можно поставить" in message_of((status, body)),
+          "%s %s" % (status, message_of((status, body))))
+    status, _, body = new_task("%s-task-for-group" % P, {"target": "deal", "id": deal_own2}, token=agent2["token"], type_id=task_type_id,
+                               assign_to={"target": "group", "id": group_id}, start_time=iso(now + 42 * hour), end_time=iso(now + 43 * hour))
+    check("... a task for the own group -> 201", status == 201, "%s %s" % (status, message_of((status, body))))
+    # a task without a client of someone outside the agent's group (no group at all)
+    outsider = int(scalar(
+        "INSERT INTO \"user\" (username, email, role, password) VALUES ('%s-outsider', 'audit-mod-outsider-%s@example.test', 'agent', 'x') RETURNING id"
+        % (P, RUN)))
+    t_loose = int(scalar(
+        "INSERT INTO task (label, start_time, end_time, type_id, agent_id, \"createdById\") VALUES ('%s-task-loose', '%s', '%s', %d, %d, %d) RETURNING id"
+        % (P, ts(now + 24 * hour), ts(now + 25 * hour), task_type_id, outsider, outsider)))
+    status, _ = http("GET", "/tasks/%d" % t_loose, token=agent2["token"])
+    status_list, body = http("GET", "/tasks?type=all&limit=1000&assigned_to[]=%d" % outsider, token=agent2["token"])
+    listed = [t["id"] for t in (body or {}).get("data", [])] if status_list == 200 else None
+    check("ACL-8: own task level: a colleague's task without a client is not readable (404) nor listed",
+          status == 404 and listed is not None and t_loose not in listed, (status, status_list))
+    sql("UPDATE \"user\" SET permissions = jsonb_set(permissions, '{task}', '{\"update\": 2, \"delete\": 2}') WHERE id = %d" % agent2["id"])
+    agent2["token"] = login(agent2["email"], agent2["password"])
+    colleague = int(scalar(
+        "INSERT INTO \"user\" (username, email, role, group_id, password) VALUES ('%s-colleague', 'audit-mod-colleague-%s@example.test', 'agent', %d, 'x') RETURNING id"
+        % (P, RUN, group_id)))
+    t_colleague = int(scalar(
+        "INSERT INTO task (label, start_time, end_time, type_id, agent_id, \"createdById\") VALUES ('%s-task-colleague', '%s', '%s', %d, %d, %d) RETURNING id"
+        % (P, ts(now + 24 * hour), ts(now + 25 * hour), task_type_id, colleague, colleague)))
+    status, body = http("PATCH", "/tasks/%d" % t_colleague, {"label": "%s-task-colleague changed" % P}, token=agent2["token"])
+    check("ACL-13: group task level: the task of a colleague of the group (task.group_id empty) can be changed -> 200",
+          status == 200, "%s %s" % (status, message_of((status, body))))
+    status, _, body = new_task("%s-task-for-colleague" % P, {"target": "deal", "id": deal_own2}, assignee=colleague, token=agent2["token"],
+                               type_id=task_type_id, start_time=iso(now + 44 * hour), end_time=iso(now + 45 * hour))
+    check("ACL-13: ... and a task for that colleague -> 201", status == 201, "%s %s" % (status, message_of((status, body))))
+    status, _ = http("PATCH", "/tasks/%d" % t_loose, {"label": "%s-task-loose hacked" % P}, token=agent2["token"])
+    check("ACL-13: ... but not a task of someone outside the group -> 403/404", status in (403, 404), status)
+    sql("DELETE FROM event WHERE task_id IN (%d, %d); DELETE FROM task WHERE id IN (%d, %d)" % (t_loose, t_colleague, t_loose, t_colleague))
+
     # TASK-10: linkables find Cyrillic names, not deleted records, within the rights
     status, body = http("GET", "/linkables?name=Иванов")
     found = [(l.get("type"), l.get("id")) for l in (body or [])] if status == 200 and isinstance(body, list) else []
@@ -855,15 +1098,29 @@ def main():
     task_modal = client_file(os.path.join("components", "task", "TaskModal.vue"))
     check("client: the task window does not encode the search twice", "encodeURIComponent" not in task_modal)
 
-    # deleting a task type moves its tasks to another type (a typeless task broke the board)
+    # HACK-13: a used task type is deleted only with ?move_to (its tasks move); a task never loses its type
     status, body = http("POST", "/task-types", {"name": "%s-type" % P})
     type_tmp = body.get("id") if status == 201 and isinstance(body, dict) else None
     if type_tmp:
         sql("UPDATE task SET type_id = %d WHERE id = %d" % (type_tmp, t_notype))
+        status, types = http("GET", "/task-types")
+        row = next((t for t in (types or []) if t.get("id") == type_tmp), {}) if status == 200 and isinstance(types, list) else {}
+        check("GET /task-types gives task_count and one default type", row.get("task_count") == 1
+              and sum(1 for t in types if t.get("default")) == 1, row)
         status, body = http("DELETE", "/task-types/%d" % type_tmp)
-        check("DELETE /task-types/:id -> its tasks get another type, not none",
-              status == 200 and scalar("SELECT type_id FROM task WHERE id = %d" % t_notype) not in (None, "", str(type_tmp)),
-              "%s %s" % (status, message_of((status, body))))
+        check("HACK-13: DELETE of a type with tasks without move_to -> 409 TASK_TYPE_IN_USE, the type and its task stay",
+              status == 409 and (body or {}).get("code") == "TASK_TYPE_IN_USE" and (body or {}).get("task_count") == 1
+              and scalar("SELECT type_id FROM task WHERE id = %d" % t_notype) == str(type_tmp), "%s %s" % (status, body))
+        status, body = http("DELETE", "/task-types/%d?move_to=%d" % (type_tmp, type_tmp))
+        check("... move_to the deleted type itself -> 400", status == 400, status)
+        status, body = http("DELETE", "/task-types/%d?move_to=%d" % (type_tmp, task_type_id))
+        check("... with move_to -> 200, its tasks get that type",
+              status == 200 and scalar("SELECT type_id FROM task WHERE id = %d" % t_notype) == str(task_type_id)
+              and count("SELECT count(*) FROM task_type WHERE id = %d" % type_tmp) == 0, "%s %s" % (status, message_of((status, body))))
+        check("HACK-13: the database keeps every task typed (task.type_id NOT NULL, ON DELETE RESTRICT)",
+              scalar("SELECT is_nullable FROM information_schema.columns WHERE table_name = 'task' AND column_name = 'type_id'") == "NO"
+              and scalar("SELECT confdeltype FROM pg_constraint WHERE conrelid = 'task'::regclass AND contype = 'f' "
+                         "AND conkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = 'task'::regclass AND attname = 'type_id')]") == "r")
     else:
         check("POST /task-types -> 201", False, "%s %s" % (status, message_of((status, body))))
 
@@ -882,14 +1139,26 @@ def main():
     task("%s-active" % P, now - 1 * day, now + 1 * day)                        # open, deadline ahead
     task("%s-closed" % P, now - 3 * day, now - 2 * day, closed=now - 2 * day)  # closed
     deal_agent = new_deal("%s-deal-agent" % P, agent_id=str(agent["id"]))     # deal of the agent without tasks
-    new_deal("%s-deal-agent-2" % P, agent_id=str(agent["id"]), created=now - 60 * day)  # outside of the period
+    new_deal("%s-deal-agent-2" % P, agent_id=str(agent["id"]), created=now - 60 * day)  # an old one, also without tasks
+    # won now, created long ago: «Успешные сделки» counts it by the closing date, as the reports do
+    won_stage = scalar("SELECT s.id FROM deal_stage s JOIN collection c ON c.id = s.collection_id WHERE s.kind = 'won' AND c.is_active ORDER BY s.id LIMIT 1")
+    deal_won = new_deal("%s-deal-won" % P, agent_id=str(agent["id"]), created=now - 60 * day)
+    if won_stage:
+        sql("UPDATE deal SET stage_id = %s, closed_at = now() WHERE id = %d" % (won_stage, deal_won))
 
     period = "from_date=%s&till_date=%s" % ((now - 7 * day).strftime("%Y-%m-%d"), (now + 7 * day).strftime("%Y-%m-%d"))
     status, body = http("GET", "/desktop?%s&my_stats=true" % period, token=agent["token"])
     check("agent: GET /desktop?my_stats=true -> 200", status == 200, "%s %s" % (status, message_of((status, body))))
     stats = (body or {}).get("task_stats", {}) if status == 200 else {}
     check("tasks_overdue = 1 (open, deadline passed) — was counting future deadlines", str(stats.get("tasks_overdue")) == "1", stats)
-    check("active_tasks = 1 (open, deadline ahead) — was counting closed tasks", str(stats.get("active_tasks")) == "1", stats)
+    # "mine" are the agent's tasks and the group's (the «task for the own group» above, real ones of the group)
+    group_active = count(
+        "SELECT count(*) FROM task t WHERE t.closed_at IS NULL AND t.end_time >= now() AND t.group_id = %d "
+        "AND t.agent_id IS DISTINCT FROM %d AND (t.start_time, t.end_time) OVERLAPS ('%s'::timestamp, '%s 23:59:59'::timestamp) "
+        "AND NOT EXISTS (SELECT 1 FROM deal d WHERE d.id = t.deal_id AND d.deleted_at IS NOT NULL)"
+        % (group_id, agent["id"], (now - 7 * day).strftime("%Y-%m-%d"), (now + 7 * day).strftime("%Y-%m-%d")))
+    check("active_tasks = 1 + the group's open tasks ahead (open, deadline ahead) — was counting closed tasks",
+          str(stats.get("active_tasks")) == str(1 + group_active), (stats, group_active))
     # "my" numbers count the tasks of the agent and of their group (wave 1, group tasks are visible to the group):
     # the closed task above plus whatever the agent's real group closed in the period
     group_closed = count(
@@ -897,7 +1166,14 @@ def main():
         "AND closed_at >= '%s' AND closed_at < '%s'"
         % (group_id, agent["id"], (now - 7 * day).strftime("%Y-%m-%d"), (now + 8 * day).strftime("%Y-%m-%d")))
     check("tasks_closed = 1 + the group's closed tasks of the period", str(stats.get("tasks_closed")) == str(1 + group_closed), (stats, group_closed))
-    check("deals_without_tasks = 1 (the agent's open deal of the period)", str(stats.get("deals_without_tasks")) == "1", stats)
+    check("SCR14: deals_without_tasks = 2 — every open deal of the agent without an open task now, whatever its age "
+          "(the deals list «Сделки без задач» shows the same deals)", str(stats.get("deals_without_tasks")) == "2", stats)
+    check("SCR14: succesfull_deals = 1 — won and closed in the period (created 60 days ago), as the reports count it",
+          won_stage and str(stats.get("succesfull_deals")) == "1", (won_stage, stats))
+    check("SCR14: the comments of the period are counted (the card «Примечания» showed a fixed 0)",
+          str(stats.get("comments", "")).isdigit(), stats)
+    check("SCR15: the desktop names the won stage the card links to", ((body or {}).get("won_stage") or {}).get("id") == (int(won_stage) if won_stage else None),
+          (body or {}).get("won_stage"))
     today_only = "from_date=%s&till_date=%s" % (now.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d"))
     status, body = http("GET", "/desktop?%s&my_stats=true" % today_only, token=agent["token"])
     stats = (body or {}).get("task_stats", {}) if status == 200 else {}
@@ -923,6 +1199,14 @@ def main():
     check("client: the desktop of an agent asks only for their own numbers (no 403 widgets)",
           "ownOnly" in desktop_vue and "my_stats: ownOnly.value || sel.value === Selector.Mine" in desktop_vue)
     check("client: the placeholder row 'Jane Doe' is gone from 'Сделки по менеджерам'", "Jane Doe" not in desktop_vue)
+    check("SCR14: the goal progress is a share in per cent (it was floor(budget / goal) * 100: 0 % until the plan was met)",
+          "Math.floor(budgetTotal / goalTotal)" not in desktop_vue and "budgetTotal / goalTotal * 100" in desktop_vue)
+    check("SCR15: every counter card shows one number; the task and deal cards link to the filtered lists",
+          "tasksLink('overdue')" in desktop_vue and "tasksLink('upcoming')" in desktop_vue and "tasksLink('closed')" in desktop_vue
+          and "preset: 'no-task'" in desktop_vue and "Недастаточно" not in desktop_vue and "<span>0</span>" not in desktop_vue)
+    status, body = http("GET", "/desktop?%s&my_stats=false" % period)
+    comments_all = int(((body or {}).get("task_stats") or {}).get("comments", -1)) if status == 200 else -1
+    check("SCR14: admin: the comments of the period include the notes of the test deals", comments_all >= 2, comments_all)
 
     # ================================================================= deals kanban / profile / admin-only buttons (client)
     section("Client pages")

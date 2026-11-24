@@ -1,3 +1,8 @@
+import { THOUSANDS_SEPARATOR } from './format';
+
+/** the sum and its currency stay on one line */
+const NO_BREAK_SPACE = String.fromCharCode(0xa0);
+
 export function stringToMask(val: string): Array<string | RegExp> {
     // '+### (##) ###-##-##'
     const res = [];
@@ -61,13 +66,13 @@ export function formatMoney(value: number, decimals: number | null, options: any
     if (!isFinite(value) || (!value && value !== 0)) return '';
     let symbol = useText('currency.symbol');
     decimals = decimals != null ? decimals : 2;
-    const thousandsSeparator = options.thousandsSeparator != null ? options.thousandsSeparator : ',';
+    // «11 400 000 ₽»: thin no-break spaces between thousands (the commas of «11,400,000» read as decimals)
+    const thousandsSeparator = options.thousandsSeparator != null ? options.thousandsSeparator : THOUSANDS_SEPARATOR;
     const symbolOnLeft = options.symbolOnLeft != null ? options.symbolOnLeft : true;
     const spaceBetweenAmountAndSymbol = options.spaceBetweenAmountAndSymbol != null ? options.spaceBetweenAmountAndSymbol : false;
     let stringified = Math.abs(value).toFixed(decimals);
-    stringified = options.decimalSeparator ?
-        stringified.replace('.', options.decimalSeparator) :
-        stringified;
+    // «1 250,50 ₽»: a Russian decimal comma unless the caller asks for another
+    stringified = stringified.replace('.', options.decimalSeparator ?? ',');
     const _int = decimals ?
         stringified.slice(0, -1 - decimals) :
         stringified;
@@ -79,7 +84,7 @@ export function formatMoney(value: number, decimals: number | null, options: any
         stringified.slice(-1 - decimals) :
         '';
     symbol = spaceBetweenAmountAndSymbol ?
-        (symbolOnLeft ? symbol + ' ' : ' ' + symbol) :
+        (symbolOnLeft ? symbol + NO_BREAK_SPACE : NO_BREAK_SPACE + symbol) :
         symbol;
     symbol = symbolOnLeft ?
         symbol + head +

@@ -23,6 +23,8 @@ import {
   PaginationResponseDto,
 } from '../helper/dto/pagination.dto';
 import { SearchProductDto } from './dto/search.product.dto';
+import { ProductStatsQueryDto } from '../analytics/dto/product-stats.query.dto';
+import { periodBounds } from '../analytics/period';
 
 @Injectable()
 export class ProductService {
@@ -72,8 +74,13 @@ export class ProductService {
     ]);
   }
 
+  /**
+   * «По товарам»: the products of the deals (not deleted), a page of them with the total count. With
+   * from_date / till_date: the deals created in that period. The page is cut (LIMIT / OFFSET) outside the
+   * aggregate, after the total is counted: inside it the total was never more than one page (HACK-18).
+   */
   async getProductStats(
-    query: PaginationRequestDto,
+    query: ProductStatsQueryDto,
   ): Promise<PaginationResponseDto<any>> {
     const [sortBy, sortByType] = this.helperService.validateAndGetSortOptions(
       query,
@@ -94,33 +101,40 @@ export class ProductService {
      */
     // The sort columns are aggregates, so the ORDER BY has to use their
     // aliases: `t0.deal_count` was a 500 for every sorted request.
-    const sql = this.productRepository
+    const qb = this.productRepository
       .createQueryBuilder('t0')
       .select('t0.id', 'id')
       .addSelect('t0.name', 'name')
-      .addSelect('COUNT(t1.deal_id)', 'deal_count')
-      .addSelect(
-        'AVG(t1.price / NULLIF(t1.quantity, 0))',
-        'average_price_per_product',
-      )
-      .addSelect('AVG(t1.price)', 'average_price_per_deal')
+      .addSelect('COUNT(DISTINCT t1.deal_id)', 'deal_count')
+      // deal_product.price is the price of one unit (metre, kilo, piece) and quantity may be
+      // fractional (numeric since 1795620000100): «за шт» is the unit price, «сделка» and the sum
+      // are quantity × price (the old bigint division price / quantity cut the cents off)
+      .addSelect('AVG(t1.price)', 'average_price_per_product')
+      .addSelect('AVG(t1.price * t1.quantity)', 'average_price_per_deal')
       .addSelect('AVG(t1.quantity)', 'average_quantity_per_deal')
-      .addSelect('SUM(t1.price)', 'total_price_sold')
+      .addSelect('SUM(t1.price * t1.quantity)', 'total_price_sold')
       .leftJoin('t0.deal_products', 't1')
       .where('t1.deal_id is not null')
-      .groupBy('t0.id')
-      .orderBy(`"${sortBy}"`, sortByType)
-      .addOrderBy('t0.id', 'ASC')
-      .offset(skip)
-      .limit(limit)
-      .getSql();
-
+      // deals in the trash are not sales
+      .andWhere('EXISTS (SELECT 1 FROM deal pd WHERE pd.id = t1.deal_id AND pd.deleted_at IS NULL)')
+      .groupBy('t0.id');
+    if (query.from_date && query.till_date) {
+      qb.andWhere(
+        'EXISTS (SELECT 1 FROM deal pp WHERE pp.id = t1.deal_id AND pp.created_at >= :from_date AND pp.created_at <= :till_date)',
+        periodBounds({ from_date: query.from_date, till_date: query.till_date }),
+      );
+    }
+    const [sql, params] = qb.getQueryAndParameters();
+    // sortBy is one of the names above (validateAndGetSortOptions), the direction ASC / DESC
+    const direction = String(sortByType).toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
     const mainQuery = `
-    WITH statistics as (${sql})
-    SELECT *, COUNT(*) OVER() as total_count from statistics
+    WITH statistics AS (${sql})
+    SELECT *, COUNT(*) OVER() AS total_count FROM statistics
+     ORDER BY "${sortBy}" ${direction} NULLS LAST, id ASC
+     LIMIT $${params.length + 1} OFFSET $${params.length + 2}
     `;
 
-    const data = await this.dataSource.query(mainQuery);
+    const data = await this.dataSource.query(mainQuery, [...params, Number(limit), Number(skip)]);
 
     const response = new PaginationResponseDto();
     response.count = 0;
@@ -145,7 +159,7 @@ export class ProductService {
     response.data = responseData;
     response.page_size = Number(limit);
     response.current_page = Math.floor(skip / limit + 1);
-    response.last_page = Math.floor(response.count / limit + 1);
+    response.last_page = Math.max(1, Math.ceil(response.count / limit));
 
     return response;
   }

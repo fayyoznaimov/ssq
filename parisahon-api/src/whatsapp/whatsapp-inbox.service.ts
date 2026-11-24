@@ -7,6 +7,7 @@ import { Deal } from '../deal/deal.entity';
 import { Event, EventTypes } from '../events/event.entity';
 import { EventBuilder } from '../events/event.builder';
 import { File } from '../file/file.entity';
+import { FileService } from '../file/file.service';
 import { ApplyTriggerWhenEnum, WhichFiles } from '../trigger/dto/assign.trigger.dto';
 import { TriggerService } from '../trigger/trigger.service';
 import { InboxOptions, InboxResult, TelegramInboxService } from '../telegram/telegram-inbox.service';
@@ -15,6 +16,7 @@ import { MessengerLookupService } from '../messenger/messenger-lookup.service';
 import { ClientDealsService } from '../messenger/client-deals.service';
 import { MessengerFilterService, PHONE_KEY_SQL, keyOf } from '../messenger/messenger-filter.service';
 import { normalizePhone } from '../helper/phone';
+import { ACCOUNT_SQL, CHAT_SQL, isUniqueViolation, withChatLock } from '../messenger/message-key';
 
 const STAFF = [RoleEnum.ADMIN, RoleEnum.MANAGER, RoleEnum.AGENT];
 
@@ -28,7 +30,8 @@ const STAFF = [RoleEnum.ADMIN, RoleEnum.MANAGER, RoleEnum.AGENT];
  *    otherwise a contact (ctr_agent) is created;
  *  - the message goes into ONE deal (ClientDealsService); a message from the phone never opens one;
  *  - the stage's triggers «при сообщении в WhatsApp» run, like for Telegram;
- *  - the same WhatsApp message (wa_message_id between these two people) is never saved twice, in any deal;
+ *  - the same WhatsApp message (key: the manager's account, the chat, wa_message_id — messenger/message-key.ts,
+ *    a unique index) is never saved twice, in any deal, also when delivered twice at once;
  *  - a manager who is no longer a staff user: 410 (the service keeps the message aside).
  */
 @Injectable()
@@ -51,7 +54,11 @@ export class WhatsAppInboxService {
     if (agent.deleted_at || !STAFF.includes(agent.role)) {
       throw new GoneException(`User ${data.agent_id} is not a staff user any more: the WhatsApp session is to be disconnected`);
     }
+    // one chat at a time: two copies of a first message must not open two contacts or deals
+    return withChatLock(`wa:${agent.id}:${data.chat?.wa_id || data.chat?.phone || ''}`, () => this.receiveFor(agent, data, options));
+  }
 
+  private async receiveFor(agent: User, data: IncomingWhatsAppDto, options: InboxOptions): Promise<InboxResult> {
     const empty: InboxResult = { status: 'ignored', deal_ids: [], event_ids: [], created_contact: false, created_deal: false };
     const phone = normalizePhone(data.chat.phone ?? null);
     // the manager's own number is never a client
@@ -86,34 +93,22 @@ export class WhatsAppInboxService {
     const fromUser = data.outgoing ? agent : contact;
     const toUser = data.outgoing ? contact : agent;
 
-    // idempotent: the same WhatsApp message between these two people, in any deal (also one moved by hand)
-    const already: { id: number; deal_id: number | null }[] = await this.eventRepository.query(
-      `SELECT id, deal_id FROM event WHERE type = $1 AND external_id = $2 AND user_id = $3 AND target_user_id = $4 ORDER BY id`,
-      [EventTypes.NEW_WHATSAPP_MESSAGE, data.wa_message_id, fromUser.id, toUser.id],
-    );
-    if (already.length) {
-      return {
-        status: 'duplicate',
-        contact_id: contact.id,
-        deal_ids: [...new Set(already.map((e) => e.deal_id).filter((id): id is number => Boolean(id)))],
-        event_ids: already.map((e) => e.id),
-        created_contact: createdContact,
-        created_deal: false,
-      };
-    }
+    // idempotent: the same WhatsApp message of this account in this chat, in any deal (also one moved by hand)
+    const already = await this.stored(data.wa_message_id, agent.id, contact.id);
+    if (already.length) return TelegramInboxService.duplicate(already, contact.id, createdContact);
 
     // ONE deal (ClientDealsService); a message from the phone never opens one
     const choice = await this.clientDeals.dealForMessage(agent, contact, {
       outgoing: data.outgoing,
       dealId: data.deal_id ?? null,
       afterCloseGrace: !data.outgoing,
+      channel: 'WhatsApp',
     });
     if (!choice.deal) {
       return { ...empty, contact_id: contact.id, created_contact: createdContact, reason: choice.reason ?? 'no_deal' };
     }
     const deal = choice.deal;
 
-    await this.saveFiles(data, fromUser, [deal]);
     const afterState = {
       message: data.text ?? '',
       files: (data.files ?? []).map((f) => ({ name: TelegramInboxService.fileName(f), path: f.path, type: f.type, caption: f.caption ?? null })),
@@ -130,7 +125,15 @@ export class WhatsAppInboxService {
       .addCreatedAt(date && !isNaN(date.getTime()) ? date : null);
     event.outgoing = data.outgoing;
     event.external_id = data.wa_message_id;
-    const saved = await this.eventRepository.save(event);
+    let saved: Event;
+    try {
+      saved = await this.eventRepository.save(event);
+    } catch (error) {
+      // stored meanwhile by another delivery (another API process): the unique key says so
+      if (!isUniqueViolation(error)) throw error;
+      return TelegramInboxService.duplicate(await this.stored(data.wa_message_id, agent.id, contact.id), contact.id, createdContact);
+    }
+    await this.saveFiles(data, fromUser, [deal]);
 
     // triggers that wait for a WhatsApp message (WA-3), like Telegram's
     await this.triggerService.onDealEvent(fromUser, deal, ApplyTriggerWhenEnum.WA_MESSAGE_RECEIVED, {
@@ -147,6 +150,16 @@ export class WhatsAppInboxService {
       created_contact: createdContact,
       created_deal: choice.created,
     };
+  }
+
+  /** The events of a WhatsApp message by its key (account, chat, message id): one, or none. */
+  private async stored(waMessageId: string, agentId: number, contactId: number): Promise<{ id: number; deal_id: number | null }[]> {
+    return this.eventRepository.query(
+      `SELECT id, deal_id FROM event
+        WHERE type = ${EventTypes.NEW_WHATSAPP_MESSAGE} AND external_id IS NOT NULL AND ${ACCOUNT_SQL} = $1 AND ${CHAT_SQL} = $2 AND external_id = $3
+        ORDER BY id`,
+      [agentId, contactId, waMessageId],
+    );
   }
 
   private async findContact(phone: string | null, waId: string): Promise<User | null> {
@@ -186,6 +199,8 @@ export class WhatsAppInboxService {
       file.name = TelegramInboxService.fileName(f);
       file.path = f.path;
       file.extension = extname(f.path) || extname(file.name) || null;
+      // the «Размер» of the files list (was 0 for every file of a message)
+      file.size = FileService.sizeOnDisk(f.path, (f as { size?: number | null }).size);
       file.from = WhichFiles.FROM_MESSAGES;
       file.uploaded_by = uploadedBy;
       file.deals = deals;

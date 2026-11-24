@@ -2,15 +2,20 @@ import { Injectable, Logger, OnApplicationBootstrap, OnApplicationShutdown } fro
 import { DataSource } from 'typeorm';
 import { loadStaffUser } from './bot-access';
 import { BotService } from './bot.service';
-import { humanStamp, localStamp } from './bot-crm.service';
+import { BotCrmService, TaskView, localStamp } from './bot-crm.service';
+
+/** TypeORM returns [rows, count] for INSERT ... ON CONFLICT DO UPDATE ... RETURNING on Postgres. */
+function returned(result: any): any[] {
+  return Array.isArray(result?.[0]) ? result[0] : result ?? [];
+}
 
 /**
  * Reminders before tasks and the morning digest, sent by the bot to managers
  * who linked their Telegram. No AI here.
  *
- * A task is reminded to its assignee, a task of a group to every member of the group who linked
- * the bot. A bot_reminder row marks a task as reminded; TaskService.update removes it when the task
- * is moved to another time or handed to someone else, so the new time is reminded again.
+ * A task is reminded to its assignee, a task of a group to every member of the group who linked the bot
+ * and may close it. A bot_reminder row marks a task as reminded for its start time: a task moved to
+ * another time is reminded again (TaskService.update also removes the row when it is handed over).
  *
  *   CRM_BOT_REMINDER_SEC        how often to look for due tasks (default 60)
  *   CRM_BOT_REMIND_BEFORE_MIN   remind this many minutes before the start (default 15)
@@ -26,6 +31,7 @@ export class BotReminderService implements OnApplicationBootstrap, OnApplication
   constructor(
     private dataSource: DataSource,
     private bot: BotService,
+    private crm: BotCrmService,
   ) {}
 
   onApplicationBootstrap() {
@@ -51,54 +57,52 @@ export class BotReminderService implements OnApplicationBootstrap, OnApplication
     }
   }
 
+  /**
+   * Tasks starting within CRM_BOT_REMIND_BEFORE_MIN (or that started at most 2 minutes ago: a pass may be late):
+   * each once per start time — bot_reminder keeps the start it was reminded for, so a task moved by any path
+   * (the web, the bot, a trigger) is reminded again before its new start. A task that started earlier is not
+   * reminded with «сейчас» (the digest and /tasks have it). To the assignee, or to every member of the task's group
+   * who may see and close it (as the web); one message per chat for the tasks of one pass.
+   */
   private async remindDueTasks() {
     const now = new Date();
     const before = Math.max(1, Number(process.env.CRM_BOT_REMIND_BEFORE_MIN || 15));
-    // to the assignee, or to the members of the task's group, who linked the bot
-    const rows = await this.dataSource.query(
-      `SELECT t.id, t.label, t.start_time, t.agent_id, t.group_id, g.name AS group_name, tt.name AS type,
-         coalesce(c.name, dc.name) AS company, d.display_id AS deal_number
+    const rows: { id: number; start_time: Date }[] = await this.dataSource.query(
+      `SELECT t.id, t.start_time
        FROM task t
-       LEFT JOIN task_type tt ON tt.id = t.type_id
-       LEFT JOIN "group" g ON g.id = t.group_id
-       LEFT JOIN company c ON c.id = t.company_id
        LEFT JOIN deal d ON d.id = t.deal_id
-       LEFT JOIN company dc ON dc.id = d.company_id
        WHERE t.closed_at IS NULL AND NOT t."allDay"
          AND t.start_time > $1 AND t.start_time <= $2
          AND (d.id IS NULL OR d.deleted_at IS NULL)
-         AND NOT EXISTS (SELECT 1 FROM bot_reminder r WHERE r.task_id = t.id)
+         AND NOT EXISTS (SELECT 1 FROM bot_reminder r WHERE r.task_id = t.id AND r.start_time = t.start_time)
          AND EXISTS (SELECT 1 FROM bot_account ba JOIN "user" bu ON bu.id = ba.user_id
                       WHERE bu.deleted_at IS NULL
                         AND (ba.user_id = t.agent_id OR (t.agent_id IS NULL AND bu.group_id = t.group_id)))
-       ORDER BY t.start_time
+       ORDER BY t.start_time, t.id
        LIMIT 200`,
-      [new Date(now.getTime() - 10 * 60_000), new Date(now.getTime() + before * 60_000)],
+      [new Date(now.getTime() - 2 * 60_000), new Date(now.getTime() + before * 60_000)],
     );
+    const byChat = new Map<string, { userId: number; tasks: TaskView[] }>();
     for (const t of rows) {
-      // claim first, so two instances or a slow send never remind twice
+      // claim first, so two instances or a slow send never remind twice about the same start
       const claimed = await this.dataSource.query(
-        'INSERT INTO bot_reminder (task_id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING task_id',
-        [t.id],
+        `INSERT INTO bot_reminder (task_id, start_time) VALUES ($1, $2)
+         ON CONFLICT (task_id) DO UPDATE SET start_time = EXCLUDED.start_time, sent_at = now()
+           WHERE bot_reminder.start_time IS DISTINCT FROM EXCLUDED.start_time
+         RETURNING task_id`,
+        [t.id, t.start_time],
       );
-      if (!claimed.length) continue;
-      const minutes = Math.round((new Date(t.start_time).getTime() - now.getTime()) / 60_000);
-      const when = minutes > 0 ? `через ${minutes} мин, в ${localStamp(t.start_time).split(' ')[1]}` : `сейчас (${humanStamp(t.start_time)})`;
-      const about = [t.company, t.deal_number ? `сделка №${t.deal_number}` : null].filter(Boolean).join(', ');
-      const forGroup = t.agent_id === null && t.group_name ? `\nЗадача группы «${t.group_name}»` : '';
-      const text = `⏰ ${t.type ?? 'Задача'} ${when}:\n${t.label}${about ? `\n${about}` : ''}${forGroup}`;
-      const people: { user_id: number; chat_id: string }[] = await this.dataSource.query(
-        `SELECT ba.user_id, ba.chat_id FROM bot_account ba JOIN "user" bu ON bu.id = ba.user_id
-         WHERE bu.deleted_at IS NULL
-           AND (ba.user_id = $1::int OR ($1::int IS NULL AND $2::int IS NOT NULL AND bu.group_id = $2::int))`,
-        [t.agent_id, t.group_id],
-      );
-      for (const person of people) {
-        if (!(await loadStaffUser(this.dataSource, person.user_id))) continue;
-        await this.bot
-          .send(person.chat_id, text, [[{ text: '✅ Выполнено', callback_data: `done:${t.id}` }]])
-          .catch((error) => this.logger.warn(`reminder for task ${t.id} to user ${person.user_id}: ${(error as Error).message}`));
+      if (!returned(claimed).length) continue;
+      for (const r of await this.crm.taskRecipients(t.id)) {
+        const entry = byChat.get(r.chatId) ?? { userId: r.user.sub, tasks: [] };
+        entry.tasks.push(r.task);
+        byChat.set(r.chatId, entry);
       }
+    }
+    for (const [chatId, entry] of byChat) {
+      await this.bot
+        .sendReminder(chatId, entry.userId, entry.tasks, now)
+        .catch((error) => this.logger.warn(`reminder to user ${entry.userId}: ${(error as Error).message}`));
     }
   }
 
@@ -119,8 +123,7 @@ export class BotReminderService implements OnApplicationBootstrap, OnApplication
          WHERE user_id = $1 AND (digest_on IS NULL OR digest_on < $2::date) RETURNING user_id`,
         [account.user_id, today],
       );
-      const rows = Array.isArray(updated?.[0]) ? updated[0] : updated;
-      if (!rows?.length) continue;
+      if (!returned(updated).length) continue;
       const user = await loadStaffUser(this.dataSource, account.user_id);
       if (!user) continue;
       await this.bot

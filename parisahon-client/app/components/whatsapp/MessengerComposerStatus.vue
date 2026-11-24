@@ -2,7 +2,9 @@
 // Under the composer of a deal, for Telegram / WhatsApp: from which account the message goes and
 // whether it works now (GET /messenger/status), a warning in another manager's deal, and «Не клиент»
 // for the chosen contact (POST /messenger/ignored: the chats with this person stop coming into the CRM).
-type Health = { state: 'ok' | 'connecting' | 'broken' | 'off' | 'unknown'; text: string; phone?: string | null };
+// `blocked` (emitted): the manager's own Telegram / WhatsApp is not connected or was ended on the phone — the
+// deal form keeps the text and does not send (OMNI-9); the state is asked again when the tab gets the focus back.
+type Health = { state: 'ok' | 'connecting' | 'broken' | 'off' | 'unknown'; text: string; status?: string; phone?: string | null };
 type Status = { telegram: Health; whatsapp: Health };
 
 const props = defineProps<{
@@ -11,6 +13,7 @@ const props = defineProps<{
     deal?: { id?: number; agent?: { id?: number; username?: string } | null } | null;
 }>();
 
+const emit = defineEmits<{ (e: 'blocked', value: boolean): void }>();
 const me = useState<any>('user');
 const toast = useToast('GlobalToast');
 const service = useService('messenger', { auth: true });
@@ -60,14 +63,32 @@ async function notClient() {
     }
 }
 
+// sending cannot work: nothing connected, or the session was ended in Telegram / unlinked on the phone
+// (a session that reconnects by itself, or a service that did not answer, does not block)
+const blocked = computed(() => {
+    const h = health.value;
+    if (!h) return false;
+    return h.state === 'off' || (h.state === 'broken' && ['revoked', 'logged_out'].includes(h.status ?? ''));
+});
+watch(blocked, (value) => emit('blocked', value), { immediate: true });
+
+function onFocus() {
+    load(true);
+}
+
 watch(() => props.channel, () => load());
-onMounted(() => load());
+onMounted(() => {
+    load();
+    window.addEventListener('focus', onFocus);
+});
+onBeforeUnmount(() => window.removeEventListener('focus', onFocus));
 </script>
 
 <template>
     <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
         <span v-if="health" :class="stateClass">
-            С вашего {{ name }}{{ health.phone ? ` ${health.phone}` : '' }}: {{ health.state === 'ok' ? 'подключён' : health.text }}
+            <template v-if="blocked">Ваш {{ name }} не подключён к CRM — сообщение не уйдёт.</template>
+            <template v-else>С вашего {{ name }}{{ health.phone ? ` ${health.phone}` : '' }}: {{ health.state === 'ok' ? 'подключён' : health.text }}</template>
             <NuxtLink v-if="health.state !== 'ok'" :to="props.channel === 'tg' ? '/telegram' : '/whatsapp'" class="underline">подключить</NuxtLink>
         </span>
         <span v-if="foreign" class="text-amber-600">Сделка менеджера {{ foreign.username || '' }}: клиент получит сообщение с вашего {{ name }}.</span>

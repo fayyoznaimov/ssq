@@ -121,6 +121,61 @@ export function queryToString<T = any>(query: Query<T>): string {
 }
 
 
+// --- Errors the user reads ---
+
+/** the names of the fields of the API in the messages of its checks («label must be a string») */
+const FIELD_NAMES: Record<string, string> = {
+    label: "Название", name: "Название", username: "Имя", budget: "Бюджет", price: "Цена", phone: "Телефон",
+    phones: "Телефон", email: "Почта", emails: "Почта", password: "Пароль", agent_id: "Ответственный",
+    company_id: "Компания", stage_id: "Этап", ctr_agent_ids: "Контакты", ctr_agents: "Контакты", fillers: "Доп. поля",
+    products: "Товары", description: "Описание", start: "Начало", end: "Срок", type: "Тип", role: "Роль",
+    inn: "ИНН", text: "Текст", subject: "Тема", to: "Кому",
+};
+
+const hasCyrillic = (text: string) => /[А-Яа-яЁё]/.test(text);
+
+/**
+ * A short Russian message for an error of the API. A Russian message of the server is kept (it says what is wrong);
+ * an English one becomes a sentence by the status; the raw text stays in the console and in `data`.
+ */
+export function humanError(status: number, raw: unknown, data?: any): string {
+    const texts = (Array.isArray(raw) ? raw : [raw]).map((t) => String(t ?? "").trim()).filter(Boolean);
+    const russian = texts.filter(hasCyrillic);
+    if (russian.length) return russian.join("; ");
+
+    if (!status) return "Нет связи с сервером. Проверьте интернет и попробуйте ещё раз";
+    if (status === 400 || status === 422) {
+        // class-validator: "<field> must be …" for every field that did not pass
+        const fields = Array.from(new Set(texts
+            .map((t) => /([\w.]+) (?:must|should|has to)\b/.exec(t)?.[1]?.split(".").pop() ?? "")
+            .map((f) => FIELD_NAMES[f])
+            .filter(Boolean)));
+        return fields.length ? `Проверьте ${fields.length > 1 ? "поля" : "поле"}: ${fields.map((f) => `«${f}»`).join(", ")}` : "Сервер не принял данные: проверьте заполненные поля";
+    }
+    if (status === 401) return /password/i.test(texts[0] ?? "") ? "Неверная почта или пароль" : "Сессия истекла, войдите заново";
+    if (status === 403) return "Недостаточно прав для этого действия";
+    if (status === 404) return /^Cannot (GET|POST|PATCH|PUT|DELETE)\b/.test(texts[0] ?? "") ? "Этот раздел недоступен" : "Не найдено: запись удалена или недоступна";
+    if (status === 409) return "Данные уже изменились: обновите страницу и попробуйте ещё раз";
+    if (status === 413) return "Файл слишком большой";
+    if (status === 429) return "Слишком много запросов: подождите немного и попробуйте ещё раз";
+    if (status >= 500) return "Сервер не отвечает, попробуйте ещё раз";
+    void data;
+    return "Не получилось, попробуйте ещё раз";
+}
+
+/**
+ * Lists that did not load: a GET without an answer, with a 5xx or to an unknown address (404 «Cannot GET»).
+ * BaseTable counts them while it is loading, to say «Не удалось загрузить» instead of «Пока ничего нет».
+ * (400 and 403 are left out: an auxiliary request a role may not make must not mark the list as failed.)
+ */
+export const loadFailures = ref(0);
+
+function noteLoadFailure(e: any) {
+    const status = e?.statusCode || e?.response?.status || 0;
+    const raw = String(e?.data?.message ?? e?.response?._data?.message ?? "");
+    if (!status || status >= 500 || (status === 404 && /^Cannot GET\b/.test(raw))) loadFailures.value++;
+}
+
 // --- Service Response Wrapper ---
 export interface ServiceResponse<T> {
     _promise: Promise<any>;
@@ -167,17 +222,22 @@ function serviceResponse<T extends object | any[]>(promise: Promise<T>): Service
             } catch (e: any) {
                 // Improved error handling from ofetch/unjs
                 const errorData = e.data || e.response?._data; // Try to get parsed error data
+                // no answer at all (no network, the server is down): no status
+                const answered = !!(e.statusCode || e.response?.status);
                 const statusCode = e.statusCode || e.response?.status || 500;
                 const statusMessage = e.statusMessage || e.response?.statusText || "Request Failed";
-                const message = errorData?.message || e.message || "An unexpected error occurred";
+                const raw = errorData?.message ?? e.message ?? "";
+                // what the toast shows: the server's own Russian text, otherwise a Russian sentence by the status
+                // (it showed «Cannot GET /api/v1/requests?$limit=25&…» and «label must be a string»)
+                const message = humanError(answered ? statusCode : 0, raw, errorData);
 
-                console.error(`[Service Error] ${statusCode} ${statusMessage}: ${message}`, errorData || e);
+                console.error(`[Service Error] ${statusCode} ${statusMessage}: ${Array.isArray(raw) ? raw.join("; ") : raw}`, errorData || e);
 
                 return Promise.reject(createError({
                     statusCode: statusCode,
                     statusMessage: statusMessage,
-                    message: message, // More specific error message
-                    data: errorData, // Include detailed error data if available
+                    message: message, // what the user reads
+                    data: errorData, // the answer of the server as it is (its own message too)
                     fatal: statusCode >= 500 // Consider server errors fatal
                 }));
             }
@@ -254,7 +314,7 @@ export const useService = (service: string, meta?: { auth?: boolean }) => {
     function request<T>(url: string, options: Record<string, any>): Promise<T> {
         if (sessionExpired()) return Promise.reject(unauthorizedError());
 
-        return $fetch<T>(url, {
+        const promise = $fetch<T>(url, {
             ...options,
             headers: authHeaders(),
             onResponseError({ response }) {
@@ -263,6 +323,13 @@ export const useService = (service: string, meta?: { auth?: boolean }) => {
                 if (response.status === 401 && !isLogin) handleUnauthorized();
             },
         }) as Promise<T>;
+        if (options.method === "GET") {
+            return promise.catch((e) => {
+                noteLoadFailure(e);
+                throw e;
+            });
+        }
+        return promise;
     }
 
     return {

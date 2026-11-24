@@ -264,6 +264,11 @@ export class MessengerHealthService implements OnApplicationBootstrap, OnApplica
     return this.bot;
   }
 
+  /** A message from the CRM bot to a staff user (ClientDealsService: a client wrote to a colleague). */
+  async tellUser(userId: number, text: string): Promise<boolean> {
+    return this.tell(userId, text);
+  }
+
   /** A message from the CRM bot to the user, when they linked it. false when it could not be sent. */
   private async tell(userId: number, text: string): Promise<boolean> {
     const api = this.api();

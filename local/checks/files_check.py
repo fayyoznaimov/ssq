@@ -19,7 +19,9 @@ Covered: upload limits (size, count, file names, page-like files), the list with
 pagination and rights (admin / agent / agent without the "files" switch / no login; an agent with
 "own deals" sees the files of their deals and their own uploads, e-mail attachments only with the
 mail switch and of their own address), download
-(no login, no path traversal), deleting from a deal (the row and the file on disk go only when
+(signed expiring links: every file name the API returns carries ?e=&s=, nginx / the API check it,
+GET /files/link-check; FILE_LINK_ENFORCE=1 refuses unsigned links; no path traversal), where a file
+of a message came from (the list names the messenger, the deal and the client), deleting from a deal (the row and the file on disk go only when
 nothing else refers to the file: another deal, a deal in the trash, an e-mail, a Telegram
 message), the file in the comment history, no files left on disk by failed requests.
 """
@@ -61,6 +63,7 @@ HEX_NAME = re.compile(r"^[0-9a-f]{64}(\.[a-z0-9]{1,16})?$")
 
 EVENT_NEW_COMMENT = 5
 EVENT_NEW_TELEGRAM_MESSAGE = 12
+EVENT_NEW_WHATSAPP_MESSAGE = 16
 
 for stream in (sys.stdout, sys.stderr):
     try:
@@ -302,6 +305,26 @@ UNION ALL SELECT 'event', count(*) FROM event WHERE after_state::text LIKE '%AUD
 """
 
 CREATED_ON_DISK = set()  # names this run wrote to the uploads folder
+SIGNED = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]{9,254})\?e=(\d{1,12})&s=([0-9a-f]{64})$")
+SIGNED_SEEN = []  # (bare name, the signed name the API returned)
+
+
+def unsign(row):
+    """A file row of an API answer: its path signed (FileLink) -> the bare name in `path`, the signed one in `signed`."""
+    if isinstance(row, dict) and isinstance(row.get("path"), str):
+        m = SIGNED.match(row["path"])
+        if m:
+            SIGNED_SEEN.append((m.group(1), row["path"]))
+            row["signed"] = row["path"]
+            row["path"] = m.group(1)
+    return row
+
+
+def enforced():
+    try:
+        return env("FILE_LINK_ENFORCE").strip() == "1"
+    except SystemExit:
+        return False
 
 
 def cleanup():
@@ -378,6 +401,9 @@ def main():
         before = disk_names()
         response = http("POST", "/deals/%d/%s" % (deal_id, route), raw=raw, headers=hdr, token=token)
         CREATED_ON_DISK.update(disk_names() - before)
+        if isinstance(response[1], list):
+            for row in response[1]:
+                unsign(row)
         return response, disk_names() - before
 
     def file_row(file_id):
@@ -408,6 +434,9 @@ def main():
     check("response: uploader is {id, username} only (no permissions / phone / email)",
           ok and set((note_file.get("uploaded_by") or {}).keys()) == {"id", "username"}, ok and note_file.get("uploaded_by"))
     check("response: no deal list", ok and "deals" not in note_file, ok and list(note_file))
+    check("response: the path is a signed link (<name>?e=<expiry>&s=<64 hex>), about 12 hours ahead",
+          ok and note_file.get("signed") and 11 * 3600 <= int(SIGNED.match(note_file["signed"]).group(2)) - time.time() <= 13 * 3600 + 60,
+          ok and note_file.get("signed"))
 
     r, _ = upload(deal1, [("files", P + "-Договор поставки.pdf", b"%PDF-1.4 audit", "application/pdf")])
     cyr = r[1][0] if r[0] == 201 else {}
@@ -474,14 +503,24 @@ def main():
     mine = "name=" + urllib.parse.quote(P)
     status, body = http("GET", "/files?%s&limit=100" % mine, token=admin)
     ok = check("admin -> 200", status == 200, (status, message_of((status, body))))
-    data = body.get("data", []) if ok else []
+    data = [unsign(f) for f in body.get("data", [])] if ok else []
     ids = [f["id"] for f in data]
+    check("every path in the list is a signed link", data and all(f.get("signed") for f in data), [f.get("path") for f in data[:2]])
     check("all files of this run are listed (count = rows)",
           ok and body.get("count") == len(data) == count("SELECT count(*) FROM file WHERE name LIKE %s" % q(P + "%")),
           (body.get("count") if ok else None, len(data)))
     check("newest first without a sort", ids == sorted(ids, reverse=True), ids[:5])
-    check("uploader: {id, username} only", data and all(set((f.get("uploaded_by") or {}).keys()) <= {"id", "username"} for f in data),
-          [f.get("uploaded_by") for f in data[:2]])
+    # wave 1b (calls/files list): the list also names the uploader's role, so a client who sent a file in a
+    # messenger (ctr_agent) is told apart from a colleague; still no permissions / phone / e-mail
+    uploaders = [f.get("uploaded_by") for f in data if f.get("uploaded_by")]
+    check("uploader: {id, username, role} only, role is a real role",
+          uploaders and all(set(u.keys()) <= {"id", "username", "role"}
+                            and u.get("role") in ("admin", "manager", "agent", "ctr_agent") for u in uploaders),
+          uploaders[:2])
+    check("... the role is the uploader's own",
+          uploaders and all(u.get("role") == scalar("SELECT role FROM \"user\" WHERE id = %d" % int(u["id"]))
+                            for u in {u["id"]: u for u in uploaders}.values()),
+          uploaders[:2])
     check("deals: the linked deal is listed (id, label)",
           any(f["id"] == note_file.get("id") and [d["id"] for d in f.get("deals", [])] == [deal1] for f in data))
     check("no e-mail body / subject in the list (behind the mail switch)",
@@ -524,6 +563,21 @@ def main():
           s == s2 == 200 and len(names) >= 9 and names2 == [], (len(names) if isinstance(names, list) else names, names2))
     s, b = http("GET", "/files?uploaded_from=nonsense", token=admin)
     check("unknown source -> 400", s == 400, s)
+
+    # SCR2-15: a file of a message says which messenger, when and in which deal (the history row that holds it)
+    jpg_path = jpg.get("path", "")
+    sql("INSERT INTO event (type, deal_id, user_id, after_state) VALUES (%d, %d, %d, %s::jsonb)"
+        % (EVENT_NEW_WHATSAPP_MESSAGE, deal1, admin_id,
+           q(json.dumps({"message": P + " wa", "files": [{"name": "Photo", "path": jpg_path, "type": "photo"}]}))))
+    s, b = http("GET", "/files?name=%s&limit=10" % urllib.parse.quote(P + "-PHOTO"), token=admin)
+    row = ((b or {}).get("data") or [{}])[0] if s == 200 else {}
+    message = row.get("message") or {}
+    check("a file of a WhatsApp message: message.type = 16, its time and its deal (id, label)",
+          s == 200 and message.get("type") == EVENT_NEW_WHATSAPP_MESSAGE and message.get("at")
+          and (message.get("deal") or {}).get("id") == deal1, (s, message))
+    s, b = http("GET", "/files?%s&limit=100" % mine, token=admin)
+    plain = [f for f in (b or {}).get("data", []) if f.get("name") == P + "-note.txt"]
+    check("a file of the files tab: message is null", s == 200 and plain and plain[0].get("message") is None, plain[:1])
 
     section("Rights")
     check("no login -> 401", http("GET", "/files")[0] == 401)
@@ -612,17 +666,40 @@ def main():
 
     # ================================================================= download
     section("Download (/api/v1/uploads/<path>, /uploads/<path>)")
-    s, headers, data = fetch_raw("%s/uploads/%s" % (BASE, note_file.get("path", "")))
-    check("<apiUrl>/uploads/<path> (what the client asks for) -> 200, same bytes", s == 200 and data == content, s)
-    note("downloads need no login: <a href>, <img>, <audio> cannot send the token; names are 64 random hex chars")
+    signed_note = note_file.get("signed") or note_file.get("path", "")
+    s, headers, data = fetch_raw("%s/uploads/%s" % (BASE, signed_note))
+    check("<apiUrl>/uploads/<signed path> (what the client asks for) -> 200, same bytes", s == 200 and data == content, s)
+    note("downloads need no login header (<a href>, <img>, <audio> cannot send it): the link is signed and expires in 12 h")
     check("nosniff header", headers.get("x-content-type-options") == "nosniff", headers.get("x-content-type-options"))
-    s, headers, _ = fetch_raw("%s/uploads/%s" % (api_root, note_file.get("path", "")))
-    check("/uploads/<path> (old address) -> 200", s == 200, s)
-    s, headers, _ = fetch_raw("%s/uploads/%s" % (BASE, page.get("path", "")))
+    s, headers, _ = fetch_raw("%s/uploads/%s" % (api_root, signed_note))
+    check("/uploads/<signed path> (old address) -> 200", s == 200, s)
+    s, headers, _ = fetch_raw("%s/uploads/%s" % (BASE, page.get("signed") or page.get("path", "")))
     check("the uploaded .html comes as a download, not a page",
           s == 200 and "text/html" not in headers.get("content-type", ""), (s, headers.get("content-type")))
+    strict = enforced()
+    note("FILE_LINK_ENFORCE=%s: links without a valid signature are %s" % ("1" if strict else "0", "refused" if strict else "served and logged"))
+    s, _, _ = fetch_raw("%s/uploads/%s" % (BASE, note_file.get("path", "")))
+    check("unsigned link -> %s" % ("403" if strict else "200 (switch-over: logged)"), s == (403 if strict else 200), s)
+    tampered = signed_note[:-1] + ("0" if signed_note[-1] != "0" else "1")
+    s, _, _ = fetch_raw("%s/uploads/%s" % (BASE, tampered))
+    check("link with a wrong signature -> %s" % ("403" if strict else "200 (logged)"), s == (403 if strict else 200), s)
+    other = page.get("path", "")
+    m = SIGNED.match(signed_note)
+    swapped = "%s?e=%s&s=%s" % (other, m.group(2), m.group(3)) if m else other
+    s, _, _ = fetch_raw("%s/uploads/%s" % (BASE, swapped))
+    check("the signature of one file on another file -> %s" % ("403" if strict else "200 (logged)"), s == (403 if strict else 200), s)
+    # the endpoint nginx asks (auth_request): no login, only the signature
+    s, _ = http("GET", "/files/link-check", headers={"X-Original-URI": "/api/v1/uploads/" + signed_note})
+    check("GET /files/link-check with a valid link -> 204 (no login needed)", s == 204, s)
+    s, _ = http("GET", "/files/link-check", headers={"X-Original-URI": "/api/v1/uploads/" + tampered})
+    check("GET /files/link-check with a wrong signature -> %s" % ("403" if strict else "204"), s == (403 if strict else 204), s)
+    expired = "%s?e=1000000000&s=%s" % (note_file.get("path", ""), "0" * 64)
+    s, _ = http("GET", "/files/link-check", headers={"X-Original-URI": "/uploads/" + expired})
+    check("GET /files/link-check with an old forged link -> %s" % ("403" if strict else "204"), s == (403 if strict else 204), s)
+    s, _ = http("GET", "/files/link-check", headers={"X-Original-URI": "/api/v1/deals/1"})
+    check("GET /files/link-check for an address outside /uploads -> %s" % ("403" if strict else "204"), s == (403 if strict else 204), s)
     s, _, _ = fetch_raw("%s/uploads/%s" % (BASE, "0" * 64 + ".txt"))
-    check("unknown name -> 404", s == 404, s)
+    check("unknown name -> 404 (403 when unsigned links are refused)", s == (403 if strict else 404), s)
     leaked = []
     for probe in ("/uploads/../../package.json", "/uploads/..%2F..%2Fpackage.json", "/uploads/%2e%2e/%2e%2e/package.json",
                   "/uploads/..%5C..%5Cpackage.json", "/uploads/../../.env", "/uploads/"):

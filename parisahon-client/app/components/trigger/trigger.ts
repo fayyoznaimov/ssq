@@ -14,6 +14,8 @@ export function toStageTrigger(tr: Trigger): StageTrigger {
         case TriggerType.CreateTask: trigger = {type: TriggerType.CreateTask, data: tr.create_task_data}; break;
         case TriggerType.DeleteFiles: trigger = {type: TriggerType.DeleteFiles, data: tr.delete_files_data}; break;
         case TriggerType.SendEmail: trigger = {type: TriggerType.SendEmail, data: tr.send_email_data}; break;
+        case TriggerType.MoveStage: trigger = {type: TriggerType.MoveStage, data: tr.move_stage_data}; break;
+        case TriggerType.Notify: trigger = {type: TriggerType.Notify, data: tr.notify_data}; break;
         default:
             break;
     }
@@ -45,16 +47,46 @@ export function toTrigger(base: StageTrigger): Trigger {
         case TriggerType.CreateTask: trigger = {type: TriggerType.CreateTask, create_task_data: base.data}; break;
         case TriggerType.DeleteFiles: trigger = {type: TriggerType.DeleteFiles, delete_files_data: base.data}; break;
         case TriggerType.SendEmail: trigger = {type: TriggerType.SendEmail, send_email_data: base.data}; break;
+        case TriggerType.MoveStage: trigger = {type: TriggerType.MoveStage, move_stage_data: base.data}; break;
+        case TriggerType.Notify: trigger = {type: TriggerType.Notify, notify_data: base.data}; break;
         default:
             break;
     }
 
     return {
-        id: base.id, 
-        position: base.position, 
-        apply_when: base.apply_when_data, 
-        deal_filters: base.deal_filters, 
+        id: base.id,
+        position: base.position,
+        apply_when: base.apply_when_data,
+        deal_filters: base.deal_filters,
         status: base.status,
         ...trigger
     };
 }
+
+/** The action of a trigger as the settings page names it. */
+export const actionNames: Record<number, string> = {
+    [TriggerType.CreateTask]: 'Создать задачу',
+    [TriggerType.CreateDeal]: 'Создать сделку',
+    [TriggerType.SendEmail]: 'Отправить письмо',
+    [TriggerType.CloseTasks]: 'Завершить задачи',
+    [TriggerType.ChangeAgent]: 'Сменить ответственного',
+    [TriggerType.ChangeFields]: 'Изменить поля',
+    [TriggerType.DeleteFiles]: 'Удалить файлы',
+    [TriggerType.MoveStage]: 'Перевести в этап',
+    [TriggerType.Notify]: 'Уведомить',
+};
+
+/** The channels a deal comes from (the condition «Источник сделки»). */
+export const sourceNames: Record<string, string> = {
+    telegram: 'Telegram',
+    whatsapp: 'WhatsApp',
+    email: 'Почта',
+    call: 'Звонок',
+    manual: 'Создана вручную',
+};
+
+/** A stage of any pipeline, for «Создать сделку» and «Перевести в этап» (GET /triggers/stages). */
+export type AnyStage = { id: number; name: string; collection_id: number | null; collection: string | null; is_active: boolean };
+
+/** The placeholders a letter or a message of a trigger may use (TriggerActionsService.fillPlaceholders). */
+export const placeholderHint = '{{клиент}}, {{компания}}, {{сделка}}, {{номер}}, {{сумма}}, {{менеджер}}, {{этап}}, {{ссылка}}';

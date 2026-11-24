@@ -62,9 +62,12 @@ export type ObjectiveResultStat = {
   users: (UserObjective & {total_budget: number})[];
 }
 
+// GET /analytics/deals (AnalyticsService.dealAnalytics): the deals by the stage they are in now
 export type DealStats = {
-  average_deal_duration_in_minutes: string;
-  total_deal_count: string;
+  average_deal_duration_in_minutes: number | string | null;
+  total_deal_count: number | string;
+  total_deal_budget?: number;
+  closed_deal_count?: number;
   stages: {
     id: number;
     name: string;
@@ -72,7 +75,8 @@ export type DealStats = {
     order: number;
     description: string;
     deal_count: number;
-    average_time_in_stage: number;
+    average_time_in_stage: number | null;
+    stage_time_count?: number;
     total_deal_budget: number;
   }[];
 }
@@ -94,6 +98,11 @@ export type CallStat = {
   total_outgoing_duration: string;
   total_incoming_duration: string;
   total_call_duration: string;
+  // the same durations in seconds (GET /analytics/calls)
+  avg_duration_sec?: number;
+  total_outgoing_sec?: number;
+  total_incoming_sec?: number;
+  total_call_sec?: number;
 }
 
 export type ConsolidatedStats = {

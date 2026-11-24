@@ -113,7 +113,7 @@ const selectClasses = computed(() => (['treeselect-' + props.size]));
     }
 
     .vue-treeselect__icon {
-        @apply dark:border-l-muted-600 text-primary-400;
+        @apply dark:border-l-muted-600 text-primary-400 dark:text-primary-200;
     }
 
     .vue-treeselect__label {

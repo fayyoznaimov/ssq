@@ -8,6 +8,7 @@ import { Deal } from '../deal/deal.entity';
 import { Event, EventTypes } from '../events/event.entity';
 import { EventBuilder } from '../events/event.builder';
 import { File } from '../file/file.entity';
+import { FileService } from '../file/file.service';
 import { WhichFiles } from '../trigger/dto/assign.trigger.dto';
 import { TriggerService } from '../trigger/trigger.service';
 import { ApplyTriggerWhenEnum } from '../trigger/dto/assign.trigger.dto';
@@ -16,6 +17,7 @@ import { MessengerLookupService } from '../messenger/messenger-lookup.service';
 import { ClientDealsService } from '../messenger/client-deals.service';
 import { MessengerFilterService, PHONE_KEY_SQL, keyOf } from '../messenger/messenger-filter.service';
 import { normalizePhone } from '../helper/phone';
+import { ACCOUNT_SQL, CHAT_SQL, isUniqueViolation, withChatLock } from '../messenger/message-key';
 
 export interface InboxResult {
   status: 'saved' | 'duplicate' | 'ignored' | 'updated';
@@ -49,8 +51,9 @@ const STAFF = [RoleEnum.ADMIN, RoleEnum.MANAGER, RoleEnum.AGENT];
  *    manager's open deal the conversation goes on in, a live deal of another manager, after a
  *    close the just-closed deal with a task, else a new deal in the default stage — NEW_DEAL /
  *    NEW_CTR_AGENT events and the stage's triggers run); a message from the phone never opens a deal;
- *  - the same Telegram message (its id between these two people) is never saved twice, in any
- *    deal, so the service may retry after a failure; an edit (edited: true) updates the text;
+ *  - the same Telegram message (key: the manager's account, the chat, the message id — messenger/message-key.ts,
+ *    a unique index) is never saved twice, in any deal, so the service may retry after a failure, also
+ *    in parallel (the deliveries of one chat run one after another); an edit (edited: true) updates the text;
  *  - a manager who is no longer a staff user: 410 (the service keeps the message aside).
  */
 @Injectable()
@@ -89,7 +92,11 @@ export class TelegramInboxService {
       await this.userRepository.update(agent.id, { tg_id: data.agent_tg_id });
       agent.tg_id = data.agent_tg_id;
     }
+    // one chat at a time: two copies of a first message must not open two contacts or deals
+    return withChatLock(`tg:${agent.id}:${data.chat?.tg_id}`, () => this.receiveFor(agent, data, options));
+  }
 
+  private async receiveFor(agent: User, data: IncomingMessageDto, options: InboxOptions): Promise<InboxResult> {
     const empty: InboxResult = {
       status: 'ignored',
       deal_ids: [],
@@ -135,39 +142,25 @@ export class TelegramInboxService {
     const fromUser = data.outgoing ? agent : contact;
     const toUser = data.outgoing ? contact : agent;
 
-    // idempotent: the same Telegram message between these two people, in any deal (also one moved by hand)
-    const already: { id: number; deal_id: number | null }[] = await this.eventRepository.query(
-      `SELECT id, deal_id FROM event
-        WHERE type = $1 AND tg_message_id = $2 AND outgoing = $3 AND user_id = $4 AND target_user_id = $5
-        ORDER BY id`,
-      [EventTypes.NEW_TELEGRAM_MESSAGE, data.tg_message_id, data.outgoing, fromUser.id, toUser.id],
-    );
+    // idempotent: the same Telegram message of this account in this chat, in any deal (also one moved by hand)
+    const already = await this.stored(data.tg_message_id, agent.id, contact.id);
     if (data.edited) {
       return already.length ? this.applyEdit(already, data, contact) : { ...empty, contact_id: contact.id, reason: 'edit_of_unknown_message' };
     }
-    if (already.length) {
-      return {
-        status: 'duplicate',
-        contact_id: contact.id,
-        deal_ids: [...new Set(already.map((e) => e.deal_id).filter((id): id is number => Boolean(id)))],
-        event_ids: already.map((e) => e.id),
-        created_contact: createdContact,
-        created_deal: false,
-      };
-    }
+    if (already.length) return TelegramInboxService.duplicate(already, contact.id, createdContact);
 
     // ONE deal (ClientDealsService); a message from the phone never opens one
     const choice = await this.clientDeals.dealForMessage(agent, contact, {
       outgoing: data.outgoing,
       dealId: data.deal_id ?? null,
       afterCloseGrace: !data.outgoing,
+      channel: 'Telegram',
     });
     if (!choice.deal) {
       return { ...empty, contact_id: contact.id, created_contact: createdContact, reason: choice.reason ?? 'no_deal' };
     }
     const deal = choice.deal;
 
-    const files = await this.saveFiles(data, fromUser, [deal]);
     const eventFiles = [];
     for (const f of data.files ?? []) {
       eventFiles.push(
@@ -195,7 +188,15 @@ export class TelegramInboxService {
       .addCreatedAt(date && !isNaN(date.getTime()) ? date : null);
     event.outgoing = data.outgoing;
     event.tg_message_id = data.tg_message_id;
-    const saved = await this.eventRepository.save(event);
+    let saved: Event;
+    try {
+      saved = await this.eventRepository.save(event);
+    } catch (error) {
+      // stored meanwhile by another delivery (another API process): the unique key says so
+      if (!isUniqueViolation(error)) throw error;
+      return TelegramInboxService.duplicate(await this.stored(data.tg_message_id, agent.id, contact.id), contact.id, createdContact);
+    }
+    const files = await this.saveFiles(data, fromUser, [deal]);
 
     // triggers that wait for a Telegram message ("при входящем сообщении")
     await this.triggerService.onDealEvent(fromUser, deal, ApplyTriggerWhenEnum.TG_MESSAGE_RECEIVED, {
@@ -214,6 +215,27 @@ export class TelegramInboxService {
       event_ids: [saved.id],
       created_contact: createdContact,
       created_deal: choice.created,
+    };
+  }
+
+  /** The events of a Telegram message by its key (account, chat, message id): one, or none. */
+  private async stored(tgMessageId: number, agentId: number, contactId: number): Promise<{ id: number; deal_id: number | null }[]> {
+    return this.eventRepository.query(
+      `SELECT id, deal_id FROM event
+        WHERE type = ${EventTypes.NEW_TELEGRAM_MESSAGE} AND tg_message_id IS NOT NULL AND ${ACCOUNT_SQL} = $1 AND ${CHAT_SQL} = $2 AND tg_message_id = $3
+        ORDER BY id`,
+      [agentId, contactId, tgMessageId],
+    );
+  }
+
+  static duplicate(already: { id: number; deal_id: number | null }[], contactId: number, createdContact: boolean): InboxResult {
+    return {
+      status: 'duplicate',
+      contact_id: contactId,
+      deal_ids: [...new Set(already.map((e) => e.deal_id).filter((id): id is number => Boolean(id)))],
+      event_ids: already.map((e) => e.id),
+      created_contact: createdContact,
+      created_deal: false,
     };
   }
 
@@ -325,6 +347,8 @@ export class TelegramInboxService {
       file.name = TelegramInboxService.fileName(f);
       file.path = f.path;
       file.extension = extname(f.path) || extname(file.name) || null;
+      // the «Размер» of the files list (was 0 for every file of a message)
+      file.size = FileService.sizeOnDisk(f.path, (f as { size?: number | null }).size);
       file.from = WhichFiles.FROM_MESSAGES;
       file.uploaded_by = uploadedBy;
       file.deals = deals;

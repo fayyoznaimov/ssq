@@ -348,7 +348,7 @@
                         name="ph:arrows-clockwise"
                         class="me-1"
                     />
-                    Синхронизовать
+                    Синхронизировать
                 </BaseButton>
                 <NuxtLink :to="{path: '/mails/settings'}">
                     <BaseButton>
@@ -385,284 +385,190 @@
             <span v-if="syncStatus.failing.length">Не загружаются писем: {{ syncStatus.failing.length }} (попробуем ещё раз).</span>
             <span v-if="syncStatus.skipped.length">Писем загружено без содержимого: {{ syncStatus.skipped.length }} — их можно прочитать в почтовой программе.</span>
         </div>
+        <!-- «От клиентов» / «Неразобранные» (newsletters, a new client's first letter: «Привязать» in the letter) / «Все» -->
+        <div
+            v-if="filters.direction === 'incoming'"
+            class="-mt-4 flex flex-wrap items-center gap-2"
+        >
+            <BaseButton
+                v-for="tab of clientTabs"
+                :key="tab.value"
+                size="sm"
+                rounded="md"
+                :variant="clientTab === tab.value ? 'solid' : 'pastel'"
+                :color="clientTab === tab.value ? 'primary' : 'default'"
+                @click="setClientTab(tab.value)"
+            >
+                {{ tab.label }}
+                <span
+                    v-if="tab.value === 'unsorted' && unsortedUnread > 0"
+                    class="ms-1 rounded-full bg-amber-500 px-1.5 text-[11px] leading-4 text-white"
+                    :title="`Непрочитанных: ${unsortedUnread}`"
+                >{{ unsortedUnread }}</span>
+            </BaseButton>
+            <span v-if="clientTab === 'unsorted'" class="text-xs text-muted-500 dark:text-muted-400">
+                Письма без контакта и сделки: откройте письмо и нажмите «Привязать»
+            </span>
+        </div>
         <main>
-            <div class="text-sm border border-muted-200 dark:border-muted-700 overflow-x-auto rounded-md relative">
-                <ul class="text-xs bg-muted-50 dark:bg-muted-800 px-4 py-3 text-muted-700 dark:text-muted-400 items-center cols w-fit min-w-full">
-                    <li
-                        ref="fromRefHeader"
-                        class="uppercase text-left font-sans font-semibold tracking-wider flex items-center resize-x overflow-x-auto w-96 min-w-52"
-                    >
-                        <BaseCheckbox
-                            :checked="selectedEmails.length > 1"
-                            rounded="sm"
-                            :classes="{wrapper: 'peer z-10'}"
-                            @change="onSelectAll"
-                        />
-                        <div
-                            class="absolute left-0 h-11 flex items-center bg-muted-200 
-                            font-normal opacity-0 -translate-x-full peer-has-[:checked]:opacity-100 peer-has-[:checked]:translate-x-0 duration-300 
-                            gap-4 px-4 ml-0 text-muted-800 dark:text-muted-200 dark:bg-muted-700 border-l-[3px] border-l-blue-600 dark:border-l-blue-400"
-                        >
-                            <button
-                                class="ml-8"
-                                @click="addContactModal.open"
-                            >
-                                <Icon
-                                    name="ph:user-plus"
-                                    class="size-4 text-primary-600 dark:text-primary-200"
-                                />
-                                доб.контакты
-                            </button>
-                            <button @click="addDealModal.open">
-                                <Icon
-                                    name="ph:currency-circle-dollar"
-                                    class="size-4 text-blue-600 dark:text-blue-400"
-                                />
-                                доб.сделку
-                            </button>
-                            <button
-                                v-if="filters.direction !== 'deleted'"
-                                :disabled="isLoadingMap.deleteall"
-                                @click="() => deleteConfirmation.open({description: `Вы действительно хотите удалить выбранные письма?`})"
-                            >
-                                <Icon
-                                    v-if="isLoadingMap.deleteall"
-                                    name="lucide:loader-circle"
-                                    class="size-4 animate-spin"
-                                />
-                                <Icon
-                                    v-else
-                                    name="ph:trash"
-                                    class="size-4 text-rose-600 dark:text-rose-400"
-                                />
-                                удалить
-                            </button>
-                            <button
-                                v-if="filters.direction === 'deleted'"
-                                :disabled="isLoadingMap.restoreall"
-                                @click="() => restore()"
-                            >
-                                <Icon
-                                    name="ph:arrow-counter-clockwise"
-                                    class="size-4 text-primary-600 dark:text-primary-200"
-                                />
-                                восстановить
-                            </button>
-                            <button
-                                v-if="filters.direction === 'spam'"
-                                :disabled="isLoadingMap.notspamall"
-                                @click="() => markAsNotSpam()"
-                            >
-                                <Icon
-                                    name="ph:tray"
-                                    class="size-4 text-primary-600 dark:text-primary-200"
-                                />
-                                не спам
-                            </button>
-                            <button
-                                v-if="unreadCount > 0"
-                                :disabled="isLoadingMap.read"
-                                @click="markAsRead"
-                            >
-                                <Icon
-                                    v-if="isLoadingMap.read"
-                                    name="lucide:loader-circle"
-                                    class="size-4 animate-spin"
-                                />
-                                <Icon
-                                    v-else
-                                    name="ph:envelope-simple-open"
-                                    class="size-4 text-primary-600 dark:text-primary-200"
-                                />
-                                Отметить как прочитанное
-                            </button>
-                            <button
-                                v-if="filters.direction === 'incoming' || filters.direction === 'outgoing'"
-                                :disabled="isLoadingMap.spamall"
-                                @click="() => markAsSpam()"
-                            >
-                                <Icon
-                                    v-if="isLoadingMap.spamall"
-                                    name="lucide:loader-circle"
-                                    class="size-4 animate-spin"
-                                />
-                                <Icon
-                                    v-else
-                                    name="lucide:octagon-alert"
-                                    class="size-4 text-yellow-700 dark:text-yellow-200"
-                                />
-                                Спам
-                            </button>
-                        </div>
-                        <span class="ml-2">
-                            От кого
-                        </span>
-                    </li>
-                    <li
-                        ref="subjectRefHeader"
-                        class="uppercase text-left font-sans font-semibold tracking-wider resize-x overflow-x-auto min-w-60 w-[60rem]"
-                    >
-                        Сделка, тема и сообщение
-                    </li>
-                    <li class="uppercase text-left font-sans font-semibold tracking-wider min-w-8">
-                        Дата
-                    </li>
-                </ul>
+            <!-- what to do with the chosen letters -->
+            <div
+                v-if="selectedEmails.length"
+                class="mb-2 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-md border-l-[3px] border-l-primary-600 bg-muted-100 px-3 py-2 text-sm text-muted-800 dark:border-l-primary-400 dark:bg-muted-700 dark:text-muted-100"
+            >
+                <span class="font-medium">Выбрано: {{ selectedEmails.length }}</span>
+                <button type="button" class="inline-flex items-center gap-1" @click="addContactModal.open">
+                    <Icon name="ph:user-plus" class="size-4 text-primary-600 dark:text-primary-200" />
+                    Добавить контакты
+                </button>
+                <button type="button" class="inline-flex items-center gap-1" @click="addDealModal.open">
+                    <Icon name="ph:currency-circle-dollar" class="size-4 text-blue-600 dark:text-blue-400" />
+                    Создать сделку
+                </button>
+                <button
+                    v-if="unreadCount > 0"
+                    type="button"
+                    class="inline-flex items-center gap-1"
+                    :disabled="isLoadingMap.read"
+                    @click="markAsRead"
+                >
+                    <Icon :name="isLoadingMap.read ? 'lucide:loader-circle' : 'ph:envelope-simple-open'" class="size-4 text-primary-600 dark:text-primary-200" :class="isLoadingMap.read ? 'animate-spin' : ''" />
+                    Прочитано
+                </button>
+                <button
+                    v-if="filters.direction === 'incoming' || filters.direction === 'outgoing'"
+                    type="button"
+                    class="inline-flex items-center gap-1"
+                    :disabled="isLoadingMap.spamall"
+                    @click="() => markAsSpam()"
+                >
+                    <Icon :name="isLoadingMap.spamall ? 'lucide:loader-circle' : 'lucide:octagon-alert'" class="size-4 text-yellow-700 dark:text-yellow-200" :class="isLoadingMap.spamall ? 'animate-spin' : ''" />
+                    В спам
+                </button>
+                <button
+                    v-if="filters.direction === 'spam'"
+                    type="button"
+                    class="inline-flex items-center gap-1"
+                    :disabled="isLoadingMap.notspamall"
+                    @click="() => markAsNotSpam()"
+                >
+                    <Icon name="ph:tray" class="size-4 text-primary-600 dark:text-primary-200" />
+                    Не спам
+                </button>
+                <button
+                    v-if="filters.direction === 'deleted'"
+                    type="button"
+                    class="inline-flex items-center gap-1"
+                    :disabled="isLoadingMap.restoreall"
+                    @click="() => restore()"
+                >
+                    <Icon name="ph:arrow-counter-clockwise" class="size-4 text-primary-600 dark:text-primary-200" />
+                    Восстановить
+                </button>
+                <!-- letters of the shared mailbox: only an admin or a manager deletes them (an agent: the ones they sent) -->
+                <button
+                    v-if="filters.direction !== 'deleted' && selectedEmails.every(mayDelete)"
+                    type="button"
+                    class="inline-flex items-center gap-1"
+                    :disabled="isLoadingMap.deleteall"
+                    @click="() => deleteConfirmation.open({description: deleteQuestion()})"
+                >
+                    <Icon :name="isLoadingMap.deleteall ? 'lucide:loader-circle' : 'ph:trash'" class="size-4 text-rose-600 dark:text-rose-400" :class="isLoadingMap.deleteall ? 'animate-spin' : ''" />
+                    Удалить
+                </button>
+                <button type="button" class="ms-auto text-muted-500 hover:text-muted-700 dark:text-muted-300" @click="selectedEmails = []">
+                    Снять выбор
+                </button>
+            </div>
+            <div class="text-sm border border-muted-200 dark:border-muted-700 rounded-md overflow-hidden">
+                <!-- the header: columns on a computer; on a phone a letter is a card of two lines -->
+                <div class="flex items-center gap-3 bg-muted-50 dark:bg-muted-800 px-3 py-2.5 text-xs uppercase font-semibold tracking-wider text-muted-700 dark:text-muted-400">
+                    <BaseCheckbox
+                        :checked="emails.data.length > 0 && selectedEmails.length === emails.data.length"
+                        rounded="sm"
+                        :classes="{wrapper: 'shrink-0'}"
+                        title="Выбрать все на странице"
+                        @change="onSelectAll"
+                    />
+                    <div class="mail-cols min-w-0 flex-1">
+                        <span>{{ filters.direction === 'outgoing' ? 'Кому' : 'От кого' }}</span>
+                        <span class="hidden lg:block">Тема и сообщение</span>
+                        <span class="hidden lg:block text-right">Дата</span>
+                    </div>
+                </div>
                 <BasePlaceload
                     v-show="emailsLoading"
                     class="h-2 w-full"
                 />
                 <div
                     v-if="!emailsLoading && !emails.data.length"
-                    class="bg-white dark:bg-muted-800 py-4 px-3 text-center"
+                    class="bg-white dark:bg-muted-800 py-4 px-3 text-center text-muted-500 dark:text-muted-400"
                 >
-                    Писем нету
+                    {{ clientTab === 'unsorted' && filters.direction === 'incoming' ? 'Неразобранных писем нет' : 'Писем нет' }}
                 </div>
                 <ul
                     v-if="!emailsLoading && emails.data"
-                    class="bg-white dark:bg-muted-800 divide-y divide-muted-200 dark:divide-muted-700 border-t border-t-muted-200 dark:border-t-muted-700 relative w-fit min-w-full"
+                    class="bg-white dark:bg-muted-800 divide-y divide-muted-200 dark:divide-muted-700 border-t border-t-muted-200 dark:border-t-muted-700"
                 >
                     <li
                         v-for="email in emails.data"
                         :key="email.id"
-                        class="hover:bg-muted-50 dark:hover:bg-muted-900 transition-colors duration-300 px-4 py-3 cols"
+                        class="flex items-start gap-3 px-3 py-2.5 hover:bg-muted-50 dark:hover:bg-muted-900 transition-colors duration-300"
+                        :class="currentEmail?.id === email.id ? 'bg-primary-500/5' : ''"
                     >
-                        <div
-                            :ref="(el) => fromRefs.push(el as HTMLDivElement)"
-                            class="flex justify-between items-center gap-2 w-96 min-w-28 from"
-                        >
-                            <div class="flex items-center">
-                                <BaseCheckbox
-                                    v-model="selectedEmails"
-                                    :value="email"
-                                    rounded="sm"
-                                    :classes="{wrapper: 'peer z-10'}"
-                                />
-                                <div
-                                    v-if="selectedEmails.length < 2"
-                                    class="absolute left-0 h-11 flex items-center bg-muted-200 
-                                    font-normal opacity-0 -translate-x-full peer-has-[:checked]:opacity-100 peer-has-[:checked]:translate-x-0 duration-300 
-                                    gap-4 px-4 ml-0 text-muted-800 dark:text-muted-200 dark:bg-muted-700 border-l-[3px] border-l-blue-600 dark:border-l-blue-400"
-                                >
-                                    <button
-                                        class="ml-8"
-                                        @click="addDealModal.open"
-                                    >
-                                        <Icon
-                                            name="ph:currency-circle-dollar"
-                                            class="size-4 text-blue-600 dark:text-blue-400"
-                                        />
-                                        доб.сделку
-                                    </button>
-                                    <button @click="addContactModal.open">
-                                        <Icon
-                                            name="ph:user-plus"
-                                            class="size-4 text-primary-600 dark:text-primary-200"
-                                        />
-                                        доб.контакты
-                                    </button>
-                                    <button
-                                        v-if="filters.direction !== 'deleted'"
-                                        :disabled="isLoadingMap['delete' + email.id]"
-                                        @click="() => deleteConfirmation.open({description: `Вы действительно хотите удалить '${email.subject}'?`})"
-                                    >
-                                        <Icon
-                                            v-if="isLoadingMap['delete' + email.id]"
-                                            name="lucide:loader-circle"
-                                            class="size-4 animate-spin"
-                                        />
-                                        <Icon
-                                            v-else
-                                            name="ph:trash"
-                                            class="size-4 text-rose-600 dark:text-rose-400"
-                                        />
-                                        удалить
-                                    </button>
-                                    <button
-                                        v-if="filters.direction === 'deleted'"
-                                        :disabled="isLoadingMap['restore' + email.id]"
-                                        @click="() => restore(email.id)"
-                                    >
-                                        <Icon
-                                            name="ph:arrow-counter-clockwise"
-                                            class="size-4 text-primary-600 dark:text-primary-200"
-                                        />
-                                        восстановить
-                                    </button>
-                                    <button
-                                        v-if="filters.direction === 'spam'"
-                                        :disabled="isLoadingMap['notspam' + email.id]"
-                                        @click="() => markAsNotSpam(email.id)"
-                                    >
-                                        <Icon
-                                            name="ph:tray"
-                                            class="size-4 text-primary-600 dark:text-primary-200"
-                                        />
-                                        не спам
-                                    </button>
-                                    <button
-                                        v-if="filters.direction === 'incoming' || filters.direction === 'outgoing'"
-                                        :disabled="isLoadingMap['spam' + email.id]"
-                                        @click="() => markAsSpam(email.id)"
-                                    >
-                                        <Icon
-                                            v-if="isLoadingMap['spam' + email.id]"
-                                            name="lucide:loader-circle"
-                                            class="size-4 animate-spin"
-                                        />
-                                        <Icon
-                                            v-else
-                                            name="lucide:octagon-alert"
-                                            class="size-4 text-yellow-700 dark:text-yellow-200"
-                                        />
-                                        Спам
-                                    </button>
-                                </div>
-                                <div class="ml-2 flex min-w-0 flex-col">
-                                    <span class="truncate">{{ email.outgoing ? (email.to ?? []).map((r) => r.value).join(', ') : (email.from_name || email.from) }}</span>
-                                    <!-- the client of the letter: the contact and the company -->
-                                    <span
-                                        v-if="email.client?.contact || email.client?.company"
-                                        class="truncate text-xs text-muted-500 dark:text-muted-400"
-                                    >
-                                        {{ [email.client?.contact?.username, email.client?.company?.name].filter(Boolean).join(' · ') }}
-                                    </span>
-                                    <span v-else-if="!email.outgoing && email.from_name" class="truncate text-xs text-muted-400">{{ email.from }}</span>
-                                </div>
-                            </div>
-                            <span
-                                v-if="!email.read"
-                                class="shrink-0 inline-block bg-primary-600 dark:bg-primary-200 w-2.5 h-2.5 rounded-full mx-2"
-                            />
-                        </div>
+                        <BaseCheckbox
+                            v-model="selectedEmails"
+                            :value="email"
+                            rounded="sm"
+                            :classes="{wrapper: 'shrink-0 mt-0.5'}"
+                        />
                         <button
-                            :ref="(el) => subjectRefs.push(el as HTMLButtonElement)"
-                            class="flex min-w-60 w-[60rem]"
-                            :class="!email.read ? 'font-medium' : ''"
+                            type="button"
+                            class="mail-cols min-w-0 flex-1 text-left"
                             @click="() => onEmailToggle(email)"
                         >
-                            <span
-                                v-for="deal of email.deals ?? []"
-                                :key="deal.id"
-                                class="me-2 shrink-0 whitespace-nowrap rounded-md bg-muted-100 px-1.5 text-xs leading-5 text-muted-700 dark:bg-muted-700 dark:text-muted-200"
-                                :title="deal.stage ?? ''"
-                            >№{{ deal.display_id }} {{ deal.label }}</span>
-                            <span class="text-muted-900 dark:text-white whitespace-nowrap">{{ email.subject }}</span>&nbsp;&minus;&nbsp;
-                            <p class="text-muted-600 dark:text-muted-400 max-w-2xl truncate">
-                                {{ cleanup(email).snippet }}
-                            </p>
+                            <!-- who: the contact · the company, the address under it -->
+                            <div class="flex min-w-0 items-start gap-2">
+                                <span
+                                    v-if="!email.read"
+                                    class="mt-1.5 shrink-0 inline-block bg-primary-600 dark:bg-primary-200 w-2 h-2 rounded-full"
+                                    title="Не прочитано"
+                                />
+                                <div class="flex min-w-0 flex-1 flex-col">
+                                    <span class="truncate text-muted-900 dark:text-white" :class="!email.read ? 'font-semibold' : ''">{{ whoOf(email) }}</span>
+                                    <span v-if="addressLine(email)" class="truncate text-xs text-muted-500 dark:text-muted-400">{{ addressLine(email) }}</span>
+                                </div>
+                                <span class="shrink-0 text-xs text-muted-500 dark:text-muted-400 lg:hidden">{{ shortDate(email.sent_at) }}</span>
+                            </div>
+                            <!-- the deal, the subject and the beginning of the text -->
+                            <div class="flex min-w-0 items-center gap-2">
+                                <span
+                                    v-for="deal of (email.deals ?? []).slice(0, 1)"
+                                    :key="deal.id"
+                                    class="max-w-[10rem] lg:max-w-[14rem] shrink-0 truncate rounded-md px-1.5 text-xs leading-5"
+                                    :class="deal.stage_color ? 'text-white' : 'bg-muted-100 text-muted-700 dark:bg-muted-700 dark:text-muted-200'"
+                                    :style="deal.stage_color ? {backgroundColor: deal.stage_color} : undefined"
+                                    :title="[`№${deal.display_id} ${deal.label}`, deal.stage, deal.closed ? 'закрыта' : '', (email.deals?.length ?? 0) > 1 ? `и ещё сделок: ${(email.deals?.length ?? 1) - 1}` : ''].filter(Boolean).join(' · ')"
+                                >№{{ deal.display_id }} {{ deal.label }}</span>
+                                <span class="line-clamp-1 min-w-0 flex-1 break-words">
+                                    <span class="text-muted-900 dark:text-white" :class="!email.read ? 'font-semibold' : ''">{{ email.subject?.trim() || '(без темы)' }}</span>
+                                    <span v-if="snippetOf(email)" class="text-muted-500 dark:text-muted-400"> — {{ snippetOf(email) }}</span>
+                                </span>
+                                <Icon v-if="email.files?.length" name="ph:paperclip" class="size-4 shrink-0 text-muted-400" />
+                            </div>
+                            <span class="hidden lg:block text-right text-xs text-muted-500 dark:text-muted-400">{{ shortDate(email.sent_at) }}</span>
                         </button>
-                        <span class="min-w-32">{{ email.sent_at ? formatter.format(new Date(email.sent_at)) : "" }}</span>
                     </li>
                 </ul>
             </div>
         </main>
         <BasePagination
+            v-if="emails.count > perPage"
             v-model:current-page="currentPage"
             class="my-2"
             :item-per-page="perPage"
             :total-items="emails.count"
-            :max-links-displayed="10"
+            :max-links-displayed="breakpoints.lg.value ? 7 : 1"
             shape="rounded"
         />
         <Transition
@@ -677,7 +583,7 @@
                     v-click-outside="() => onEmailToggle(undefined)"
                     class="bg-white h-full w-full max-w-[85vw] md:max-w-[80vw] inner ml-auto"
                 >
-                    <Single :email="currentEmail" @changed="onLetterChanged" />
+                    <Single :email="currentEmail" @changed="onLetterChanged" @linked="() => fetchEmails()" />
                 </div>
             </div>
         </Transition>
@@ -712,7 +618,7 @@ import { useAsync } from "~/composables/useAsync";
 import type { Email, MailSyncStatus } from "~/types/mail";
 import { type User, UserRole } from "~/types/user";
 import type { Stage } from "~/types/stage";
-import { sanitizeEmail } from "~/utils/sanitize";
+import { addressesOf, letterSnippet } from "~/utils/mailView";
 
 import Single from "./index/[id].vue";
 
@@ -778,10 +684,8 @@ const addDealModal = useModal("AddDealModal");
 const deleteConfirmation = useModal("DeleteConfirmation");
 
 const isDarkMode = useDarkMode();
-const fromRefHeader = ref<HTMLLIElement>();
-const subjectRefHeader = ref<HTMLLIElement>();
-const fromRefs = ref<HTMLDivElement[]>([]);
-const subjectRefs = ref<HTMLButtonElement[]>([]);
+const router = useRouter();
+const breakpoints = useTailwindBreakpoints();
 const filters = reactive<Filters>({...initialFilters});
 const preset = ref<Preset>(Preset.All);
 const currentEmail = ref<Email>();
@@ -798,6 +702,88 @@ const seesAllMail = computed(() => currentUser.value?.role === UserRole.Admin ||
 const syncStatus = ref<MailSyncStatus | null>(null);
 const syncStatusService = useService("emails/sync-status", {auth: true});
 
+/**
+ * «От клиентов»: letters in a deal or from a contact / a company address; «Неразобранные»: the rest
+ * (newsletters, a new client's first letter). The inbox used to be mostly newsletters.
+ */
+type ClientTab = "clients" | "unsorted" | "all";
+const clientTabs: { value: ClientTab; label: string }[] = [
+    { value: "clients", label: "От клиентов" },
+    { value: "unsorted", label: "Неразобранные" },
+    { value: "all", label: "Все" },
+];
+const clientTab = ref<ClientTab>((["clients", "unsorted", "all"] as string[]).includes(String(route.query.tab)) ? route.query.tab as ClientTab : "clients");
+const unsortedUnread = ref(0);
+
+function setClientTab(tab: ClientTab) {
+    if (clientTab.value === tab) return;
+    clientTab.value = tab;
+    currentPage.value = 1;
+    selectedEmails.value = [];
+    fetchEmails();
+}
+
+/** How many unsorted letters nobody of us has read: the tab shows it, so a new client is not missed. */
+function fetchUnsortedUnread() {
+    mailsService.find({ limit: 1, skip: 0, outgoing: false, is_spam: false, of_client: false, read: false }).exec()
+        .then((page: any) => { unsortedUnread.value = Number(page?.count ?? 0); })
+        .catch(() => undefined);
+}
+
+/** The contact · the company of the letter, else the name or the address (to whom, for a letter we sent). */
+function whoOf(email: Email): string {
+    const client = [email.client?.contact?.username, email.client?.company?.name].filter(Boolean).join(" · ");
+    if (client) return client;
+    if (email.outgoing) return (email.to ?? []).map((r) => r.value).join(", ") || "(без адресата)";
+    return email.from_name || email.from || "(без отправителя)";
+}
+
+/** The address under the name, when the name is not the address itself. */
+function addressLine(email: Email): string {
+    const address = email.outgoing ? (email.to ?? []).map((r) => r.value).join(", ") : (email.from ?? "");
+    return address && address !== whoOf(email) ? address : "";
+}
+
+const snippets = new WeakMap<object, string>();
+function snippetOf(email: Email): string {
+    if (!snippets.has(email)) snippets.set(email, letterSnippet(email));
+    return snippets.get(email) ?? "";
+}
+
+const timeFormat = new Intl.DateTimeFormat("ru", { hour: "2-digit", minute: "2-digit" });
+const dayFormat = new Intl.DateTimeFormat("ru", { day: "numeric", month: "short" });
+const fullDateFormat = new Intl.DateTimeFormat("ru", { day: "2-digit", month: "2-digit", year: "numeric" });
+
+/** «14:05» today, «21 нояб.» this year, «21.11.2025» before. */
+function shortDate(value?: string | null): string {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    const now = new Date();
+    if (date.toDateString() === now.toDateString()) return timeFormat.format(date);
+    if (date.getFullYear() === now.getFullYear()) return dayFormat.format(date);
+    return fullDateFormat.format(date);
+}
+
+/**
+ * The shared mailbox is everybody's: an admin or a manager deletes its letters, an agent the ones they
+ * sent and the ones written to them alone (the server checks the same and answers 403 otherwise).
+ */
+function mayDelete(email: Email): boolean {
+    if (seesAllMail.value) return true;
+    if (email.outgoing) return email.sent_by?.id === currentUser.value?.id;
+    const own = String(currentUser.value?.email ?? "").toLowerCase();
+    const recipients = addressesOf([...(email.to ?? []), ...(email.cc ?? [])].map((r) => r.value));
+    return !!own && recipients.length === 1 && recipients[0] === own;
+}
+
+function deleteQuestion(): string {
+    const list = selectedEmails.value;
+    return list.length === 1
+        ? `Удалить письмо «${list[0].subject?.trim() || "без темы"}»? Оно попадёт в «Удалённые», его можно будет восстановить.`
+        : `Удалить выбранные письма (${list.length})? Они попадут в «Удалённые», их можно будет восстановить.`;
+}
+
 const unreadCount = computed(() => {
     let count = 0;
     for (const email of emails.value.data) {
@@ -809,12 +795,13 @@ const unreadCount = computed(() => {
 async function onEmailToggle(email?: Email) {
     if (email) {
         document.documentElement.style.overflow = "hidden";
-        // the drawer loads the whole letter, which marks it read
+        // the drawer loads the whole letter, which marks it read (for this user)
         emails.value.data = emails.value.data.map((e) => e.id === email.id ? ({...e, read: true}) : e);
+        // the address of the letter, so that it can be copied and opened again (/mails/:id)
+        if (String(route.params.id ?? "") !== String(email.id)) router.replace({ path: `/mails/${email.id}`, query: route.query });
     } else {
         document.documentElement.style.overflow = "auto";
-        // a letter opened by its address (/mails/:id, the links of the journal): back to the list
-        if (route.params.id) navigateTo("/mails");
+        if (route.params.id) router.replace({ path: "/mails", query: route.query });
     }
     currentEmail.value = email;
 }
@@ -833,7 +820,15 @@ function onDealsCreated() {
 /** /mails/:id opens the letter over the list (pages/mails/index.vue has no <NuxtPage>). */
 async function openFromRoute() {
     const id = Number(route.params.id);
-    if (!id || currentEmail.value?.id === id) return;
+    if (!id) {
+        // back in the browser from /mails/:id: the drawer closes
+        if (currentEmail.value) {
+            document.documentElement.style.overflow = "auto";
+            currentEmail.value = undefined;
+        }
+        return;
+    }
+    if (currentEmail.value?.id === id) return;
     const result = await promiseResult(mailsService.get(id).exec());
     if (!result.ok) return toast.show({message: result.error.message, type: "error", timeout: 4000});
     onEmailToggle(result.value as Email);
@@ -883,11 +878,6 @@ const presetDates = ref([
     { label: "За этот месяц", value: [moment().startOf("month"), moment().endOf("month")] },
 ]);
 
-// a letter of the list: its body cleaned for v-html and the first line as text
-function cleanup(email: Email) {
-    return sanitizeEmail(email);
-}
-
 function onSelectAll(e: Event) {
     const target = e.target as HTMLInputElement;
     if (target.checked) selectedEmails.value = emails.value.data;
@@ -924,8 +914,8 @@ function onPresetSelect(close: Function, e: Event) {
 
 
 async function onDelete() {
-    const promises = selectedEmails.value.map((email) => runWithId(mailsService.remove(email.id).exec(), "delete" + email.id));
-    const result = await promiseResult(Promise.all(promises));
+    const promises = selectedEmails.value.map((email) => mailsService.remove(email.id).exec());
+    const result = await promiseResult(runWithId(Promise.all(promises) as any, "deleteall"));
     if (!result.ok) toast.show({message: result.error.message, type: "error", timeout: 4000});
     // deleted letters go to the Trash mailbox of the server: «Удалённые» shows them and brings them back
     else toast.show({message: "Письма перенесены в «Удалённые»", type: "success", timeout: 3000});
@@ -933,10 +923,15 @@ async function onDelete() {
     selectedEmails.value = [];
 }
 
+/** «Прочитано» for this user only (a colleague in Cc keeps the letter unread for themselves). */
 async function markAsRead() {
-    const promises = selectedEmails.value.map((email) => runWithId(mailsService.get(email.id).exec(), "read"));
-    await Promise.all(promises);
-    emails.value.data = emails.value.data.map((email) => selectedEmails.value.some((se) => se.id === email.id) ? ({...email, read: true}) : email);
+    const ids = selectedEmails.value.filter((email) => !email.read).map((email) => email.id);
+    if (!ids.length) return;
+    const result = await promiseResult(runWithId(mailsService.patch("read", { ids }).exec() as any, "read"));
+    if (!result.ok) return toast.show({message: result.error.message, type: "error", timeout: 4000});
+    emails.value.data = emails.value.data.map((email) => ids.includes(email.id) ? ({...email, read: true}) : email);
+    selectedEmails.value = [];
+    fetchUnsortedUnread();
 }
 
 async function markAsSpam(emailId?: number) {
@@ -970,6 +965,12 @@ function fetchEmails(sync?: boolean) {
     // «Удалённые»: every direction; the other folders by direction
     if (filters.direction === "deleted") query.deleted = true;
     else query.outgoing = outgoing;
+
+    // «От клиентов» / «Неразобранные» of the inbox
+    if (filters.direction === "incoming" && clientTab.value !== "all") {
+        query.of_client = clientTab.value === "clients";
+    }
+    if (filters.direction === "incoming") fetchUnsortedUnread();
 
     if (filters.stages.length) {
         query.stages = filters.stages.map((s) => s.id);
@@ -1019,26 +1020,10 @@ function fetchEmails(sync?: boolean) {
     );
 }
 
-function updateWidth(els: HTMLElement[], width: number) {
-    return () => {
-        for (const el of els) el.style.width = `${width}px`;
-    };
-}
-
-const resizeObserver = new ResizeObserver((entries) => {
-    for (const entry of entries) {
-        if (entry.target !== fromRefHeader.value && entry.target !== subjectRefHeader.value) continue;
-
-        if (entry.target === fromRefHeader.value) {
-            window.requestAnimationFrame(updateWidth(fromRefs.value, fromRefHeader.value!.offsetWidth));
-        }
-        if (entry.target === subjectRefHeader.value) {
-            window.requestAnimationFrame(updateWidth(subjectRefs.value, subjectRefHeader.value!.offsetWidth));
-        }
-    }
+watch(() => [currentPage.value, perPage.value, filters.direction], () => {
+    selectedEmails.value = [];
+    fetchEmails();
 });
-
-watch(() => [currentPage.value, perPage.value, filters.direction], () => fetchEmails());
 
 
 type AgentEmail = { id: number; value: string; };
@@ -1074,12 +1059,10 @@ onMounted(() => {
     if (seesAllMail.value) fetchAgentEmails();
     openFromRoute();
     syncStatusService.find().exec().then((status: any) => { syncStatus.value = status; }).catch(() => undefined);
-    if (fromRefHeader.value) resizeObserver.observe(fromRefHeader.value);
-    if (subjectRefHeader.value) resizeObserver.observe(subjectRefHeader.value);
 });
 
 onUnmounted(() => {
-    resizeObserver.disconnect();
+    document.documentElement.style.overflow = "auto";
 });
 
 </script>
@@ -1095,10 +1078,19 @@ onUnmounted(() => {
     opacity: 0;
 }
 
-.cols {
+/* a letter: on a phone two lines (who and the date, then the subject); on a computer three columns,
+   the date always on screen (it used to be pushed past the right edge by fixed widths) */
+.mail-cols {
     display: grid;
-    grid-template-areas: "from subject date";
-    grid-template-columns: min-content minmax(min-content, auto) minmax(min-content, 1fr);
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 0.125rem;
+}
+@media (min-width: 1025px) {
+    .mail-cols {
+        grid-template-columns: minmax(12rem, 18rem) minmax(0, 1fr) 6.5rem;
+        column-gap: 1rem;
+        align-items: center;
+    }
 }
 
 </style>

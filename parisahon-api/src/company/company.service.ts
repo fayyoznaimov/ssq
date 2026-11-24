@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   HttpException,
   HttpStatus,
@@ -44,7 +45,8 @@ import { CtrAgentChanges, UserService } from 'src/user/user.service';
 import { UserFiller } from 'src/user/user.filler.entity';
 import { Access } from '../auth/access';
 import { AuthUser } from '../auth/auth.guard';
-import { normalizePhone, phoneDigits, phoneKey, phoneKeySql } from '../helper/phone';
+import { StageKind } from '../deal_stage/stage-kind';
+import { normalizeEmail, normalizePhone, phoneDigits, phoneKey, phoneKeySql } from '../helper/phone';
 
 /**
  * The deals of every company: its own (deal.company_id) and those of its contacts — the same rule as
@@ -101,7 +103,7 @@ export class CompanyService {
   /**
    * GET /companies. A deal of a company is its own or one of its contacts' (as in the card), so
    * «Кол-во сделок» and LTV agree with the card: LTV is the budget of the SUCCESSFUL deals (closed in
-   * the stage DEAL_STAGE_CLOSED), not of every deal. `q` finds the name, ИНН, phone, e-mail and the
+   * the stage of kind won), not of every deal. `q` finds the name, ИНН, phone, e-mail and the
    * names, phones and e-mails of the contacts; `name` (the pickers) the name only. `requester`: only
    * the companies the user may see (Access.companySql). The response keeps its old fields.
    */
@@ -144,7 +146,7 @@ export class CompanyService {
       inPeriod.push(`d.created_at < CAST(${bind(query.with_deals_at_period_end)} AS date) + interval '1 day'`);
     }
     const periodSql = inPeriod.length ? `(${inPeriod.join(' AND ')})` : 'TRUE';
-    const won = bind(process.env.DEAL_STAGE_CLOSED ?? '');
+    const won = bind(StageKind.WON);
     const trunc = bind(period.trunc);
     const step = bind(period.step);
 
@@ -179,7 +181,7 @@ export class CompanyService {
       stats AS (
         SELECT cd.company_id,
                COUNT(*) FILTER (WHERE ${periodSql}) AS deal_count,
-               COALESCE(SUM(d.budget) FILTER (WHERE ${periodSql} AND d.closed_at IS NOT NULL AND s.name = ${won}), 0) AS live_time_value,
+               COALESCE(SUM(d.budget) FILTER (WHERE ${periodSql} AND d.closed_at IS NOT NULL AND s.kind = ${won}), 0) AS live_time_value,
                COUNT(*) FILTER (WHERE d.created_at >= date_trunc(${trunc}, now())) AS deal_count_this_period,
                COUNT(*) FILTER (WHERE d.created_at >= date_trunc(${trunc}, now()) - CAST(${step} AS interval)
                                   AND d.created_at < date_trunc(${trunc}, now())) AS deal_count_previous_period,
@@ -377,6 +379,8 @@ export class CompanyService {
       delete company['company_fillers'];
       delete (company as any).primary_contact;
 
+      (company as any).summary = await this.cardSummary(company.id);
+
       // a company made by a channel (bot, card photo) or by a removed user has no author
       (company as any)['created_by'] = company.created_by
         ? {
@@ -388,6 +392,41 @@ export class CompanyService {
     }
 
     return company;
+  }
+
+  /**
+   * The head of the company card: who leads the client (the responsible of its latest open deal, else
+   * of its latest deal), how many deals are open and in all, when the client was last active (the
+   * latest event of its deals) and the nearest open task of the company or of its deals.
+   */
+  private async cardSummary(companyId: number): Promise<Record<string, any>> {
+    const [deals] = await this.dataSource.query(
+      `WITH cd AS (SELECT DISTINCT deal_id FROM (${COMPANY_DEAL_PAIRS}) p WHERE p.company_id = $1)
+       SELECT count(*) AS deal_count,
+              count(*) FILTER (WHERE d.closed_at IS NULL) AS open_deal_count,
+              (array_agg(a.id ORDER BY (d.closed_at IS NULL) DESC, d.created_at DESC) FILTER (WHERE a.id IS NOT NULL))[1] AS agent_id,
+              (array_agg(a.username ORDER BY (d.closed_at IS NULL) DESC, d.created_at DESC) FILTER (WHERE a.id IS NOT NULL))[1] AS agent_name,
+              (SELECT max(e.created_at) FROM event e WHERE e.deal_id IN (SELECT deal_id FROM cd)) AS last_activity_at
+         FROM cd JOIN deal d ON d.id = cd.deal_id
+         LEFT JOIN "user" a ON a.id = d.agent_id AND a.deleted_at IS NULL`,
+      [companyId],
+    );
+    const [task] = await this.dataSource.query(
+      `SELECT t.id, t.label, t.start_time
+         FROM task t
+        WHERE t.closed_at IS NULL
+          AND (t.company_id = $1 OR t.deal_id IN (SELECT deal_id FROM (${COMPANY_DEAL_PAIRS}) p WHERE p.company_id = $1))
+        ORDER BY t.start_time ASC NULLS LAST, t.id ASC
+        LIMIT 1`,
+      [companyId],
+    );
+    return {
+      deal_count: Number(deals?.deal_count ?? 0),
+      open_deal_count: Number(deals?.open_deal_count ?? 0),
+      agent: deals?.agent_id ? { id: Number(deals.agent_id), username: deals.agent_name } : null,
+      last_activity_at: deals?.last_activity_at ?? null,
+      next_task: task ? { id: Number(task.id), label: task.label, start_time: task.start_time } : null,
+    };
   }
 
   /**
@@ -580,7 +619,10 @@ export class CompanyService {
 
   // ================================================================== duplicates
 
-  /** A company that is not deleted with this name (case and spaces around do not matter). */
+  /**
+   * A company that is not deleted with this name (case and spaces around do not matter, as the unique
+   * index IDX_company_name_live): 409 with the company that has it.
+   */
   private async assertNameIsFree(name: string, exceptId?: number): Promise<void> {
     const qb = this.companyRepository
       .createQueryBuilder('c')
@@ -588,8 +630,16 @@ export class CompanyService {
     if (exceptId) qb.andWhere('c.id <> :exceptId', { exceptId });
     const same = await qb.getOne();
     if (same) {
-      throw new BadRequestException(`Компания «${same.name}» уже есть (№${same.id}): Company with name ${name} already exists`);
+      throw new ConflictException(`Компания «${same.name}» уже есть (№${same.id})`);
     }
+  }
+
+  /** 409 text of a unique index hit (23505), by the index: what is taken, in Russian. */
+  private duplicateMessage(error: unknown): string {
+    const constraint = String((error as { constraint?: string })?.constraint ?? '');
+    if (constraint.includes('inn')) return 'Компания с таким ИНН уже есть';
+    if (constraint.includes('email')) return 'Контакт с такой почтой уже есть';
+    return 'Компания с таким названием уже есть';
   }
 
   /** ИНН identifies the legal entity: one company per ИНН (9 digits and more), among those not deleted. */
@@ -602,7 +652,7 @@ export class CompanyService {
     if (exceptId) qb.andWhere('c.id <> :exceptId', { exceptId });
     const same = await qb.getOne();
     if (same) {
-      throw new BadRequestException(`Компания с ИНН ${digits} уже есть: «${same.name}» (№${same.id})`);
+      throw new ConflictException(`Компания с ИНН ${digits} уже есть: «${same.name}» (№${same.id})`);
     }
   }
 
@@ -617,14 +667,11 @@ export class CompanyService {
     const emails = new Set<string>();
     const phones = new Set<string>();
     for (const contact of contacts) {
-      const email = contact.email ? String(contact.email).trim().toLowerCase() : '';
+      const email = normalizeEmail(contact.email) ?? '';
       if (email) {
-        if (emails.has(email)) throw new BadRequestException(`ctr_agent with email ${email}: два контакта с одной почтой`);
+        if (emails.has(email)) throw new BadRequestException(`Два контакта с одной почтой: ${email}`);
         emails.add(email);
-        const taken = await this.userService.checkIfUserEmailExists(email);
-        if (taken) {
-          throw new BadRequestException(`ctr_agent with email ${taken.email} already exists! Контакт с такой почтой уже есть: ${taken.username} (№${taken.id})`);
-        }
+        await this.userService.assertEmailIsFree(email);
       }
       const key = phoneKey(contact.phone);
       if (checkPhones && key) {
@@ -649,7 +696,7 @@ export class CompanyService {
     // one format for every phone (helper/phone.ts); "" is no e-mail
     const contacts = (data.users ?? []).map((agent) => ({
       ...agent,
-      email: agent.email ? String(agent.email).trim() : null,
+      email: normalizeEmail(agent.email),
       phone: normalizePhone(agent.phone),
     }));
     await this.assertNewContactsAreFree(contacts, !!options.checkContactPhones);
@@ -696,7 +743,7 @@ export class CompanyService {
         const newCompany = new Company();
         newCompany.name = name;
         newCompany.phone = normalizePhone(data.phone);
-        newCompany.email = data.email || null;
+        newCompany.email = normalizeEmail(data.email);
         newCompany.is_old = data.is_old;
         for (const field of COMPANY_REQUISITE_FIELDS) {
           newCompany[field] = data[field] ?? null;
@@ -744,12 +791,9 @@ export class CompanyService {
       if (error instanceof HttpException) {
         throw error;
       }
+      // two requests at once got past the checks: the unique indexes answer (name, ИНН, contact e-mail)
       if ((error as { code?: string })?.code === '23505') {
-        throw new BadRequestException(
-          `Company or contact with these details already exists: ${
-            (error as { detail?: string }).detail ?? ''
-          }`.trim(),
-        );
+        throw new ConflictException(this.duplicateMessage(error));
       }
       this.logger.error(
         `company create failed: ${(error as Error)?.stack ?? error}`,
@@ -877,7 +921,7 @@ export class CompanyService {
       }
     }
     if (data.email !== undefined) {
-      const email = data.email ? String(data.email).trim() : null;
+      const email = normalizeEmail(data.email);
       if (email !== (company.email ?? null)) {
         updatedFields.push(new Field('email', email, company.email));
         changes.email = email;
@@ -955,11 +999,8 @@ export class CompanyService {
     for (const user of changed) {
       const stored = mineById.get(Number(user.id));
       if (user.email !== undefined) {
-        const email = user.email ? String(user.email).trim() : null;
-        if (email && email.toLowerCase() !== String(stored.email ?? '').toLowerCase()
-            && (await this.userService.checkIfUserEmailExists(email, stored.id))) {
-          throw new BadRequestException(`User with email ${email} already exists!`);
-        }
+        const email = normalizeEmail(user.email);
+        if (email && email !== normalizeEmail(stored.email)) await this.userService.assertEmailIsFree(email, stored.id);
       }
       if (user.phone !== undefined && phoneKey(user.phone) !== phoneKey(stored.phone)) {
         await this.userService.assertPhoneIsFree(normalizePhone(user.phone), stored.id);
@@ -967,7 +1008,7 @@ export class CompanyService {
     }
     const newContacts = created.map((user) => ({
       ...user,
-      email: user.email ? String(user.email).trim() : null,
+      email: normalizeEmail(user.email),
       phone: normalizePhone(user.phone),
     }));
     await this.assertNewContactsAreFree(newContacts, true);
@@ -1034,7 +1075,7 @@ export class CompanyService {
       await this.companyRepository.update(id, changes);
     } catch (error) {
       if ((error as { code?: string })?.code === '23505') {
-        throw new BadRequestException(`Company with name ${changes.name ?? company.name} already exists`);
+        throw new ConflictException(this.duplicateMessage(error));
       }
       throw error;
     }
@@ -1138,7 +1179,7 @@ export class CompanyService {
   /** Does the request change anything of this contact (name, e-mail, phone, a custom field)? */
   private contactChanged(stored: User, sent: ContactInput): boolean {
     if (sent.username !== undefined && String(sent.username ?? '').trim() !== stored.username) return true;
-    if (sent.email !== undefined && (sent.email ? String(sent.email).trim() : null) !== (stored.email ?? null)) return true;
+    if (sent.email !== undefined && normalizeEmail(sent.email) !== (stored.email ?? null)) return true;
     if (sent.phone !== undefined && normalizePhone(sent.phone) !== (stored.phone ?? null)) return true;
     const rows: UserFiller[] = stored.user_fillers ?? [];
     for (const item of ((sent as any).fillers ?? []) as { id?: number; filler_id?: number; value?: string }[]) {
@@ -1255,13 +1296,20 @@ export class CompanyService {
 
   /** PATCH /companies/:id/restore: the company is back in the lists, unless a live company took its name meanwhile. */
   async restore(id: number): Promise<void> {
-    const rows: { id: number; name: string }[] = await this.dataSource.query(
-      `SELECT id, name FROM company WHERE id = $1 AND deleted_at IS NOT NULL`,
+    const rows: { id: number; name: string; inn: string | null }[] = await this.dataSource.query(
+      `SELECT id, name, inn FROM company WHERE id = $1 AND deleted_at IS NOT NULL`,
       [id],
     );
     if (!rows.length) throw new NotFoundException(`Deleted company ${id} not found`);
+    // the name and the ИНН are unique among the live companies (IDX_company_name_live, IDX_company_inn_live)
     await this.assertNameIsFree(rows[0].name, id);
-    await this.companyRepository.restore(id);
+    await this.assertInnIsFree(rows[0].inn, id);
+    try {
+      await this.companyRepository.restore(id);
+    } catch (error) {
+      if ((error as { code?: string })?.code === '23505') throw new ConflictException(this.duplicateMessage(error));
+      throw error;
+    }
   }
 
   private createCompanyFillers(

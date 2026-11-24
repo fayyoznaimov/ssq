@@ -16,6 +16,7 @@ import secrets
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -206,9 +207,24 @@ def main():
         check("next time the same client is found by Telegram id alone", r[1].get("contact_id") == known_id, r)
         r = incoming(A, 3001, "себе", chat={"tg_id": A["tg"], "first_name": "Я"})
         check("a chat with the manager's own account is ignored", r[0] == 201 and r[1].get("status") == "ignored" and r[1].get("reason") == "self", r)
+        # OMNI-7: a message never goes silently into a deal the manager whose Telegram it is cannot open
         r = incoming(B, 4001, "Пишу второму менеджеру")
-        check("the same client writes to manager B -> no second deal: the client's open deal (A's) gets it", r[1].get("status") == "saved" and r[1].get("contact_id") == contact_id
-              and not r[1].get("created_deal") and r[1].get("deal_ids") == [deal_id], r)
+        b_deal = (r[1].get("deal_ids") or [None])[0]
+        check("the same client writes to manager B, who cannot open A's deal (deal view «own») -> B's own new deal, not A's",
+              r[1].get("status") == "saved" and r[1].get("contact_id") == contact_id and r[1].get("created_deal") is True
+              and b_deal not in (None, deal_id), r)
+        row = psql(f"select agent_id from deal where id = {b_deal}") if b_deal else ""
+        check("... the new deal is B's", row == str(B["id"]), row)
+        r = incoming(B, 4002, "Отвечаю с телефона", outgoing=True)
+        check("B's answer from the phone goes into B's deal too", r[1].get("deal_ids") == [b_deal] and not r[1].get("created_deal"), r)
+        # B's deal out of the way of the next steps: B is in the same group, so C («group») could open it too, and
+        # as the most recently active deal it would win; the repeat deal below points to the client's latest deal
+        if b_deal:
+            psql(f"update deal set deleted_at = now() where id = {b_deal}")
+        psql(f"update \"user\" set permissions = jsonb_set(permissions, '{{deal,view}}', '2') where id = {C['id']}")
+        r = incoming(C, 4003, "Пишу третьему менеджеру")
+        check("manager C of A's group with deal view «group» -> A's deal (C can open it), no new deal",
+              r[1].get("status") == "saved" and r[1].get("deal_ids") == [deal_id] and not r[1].get("created_deal"), r)
         psql(f"update deal set closed_at = now() where id = {deal_id}")
         r = incoming(A, 1005, "Спасибо, получили")
         check("a client's message right after the deal was closed goes into that deal, no new deal (TG-9)",
@@ -239,7 +255,7 @@ def main():
         status, events = api("GET", f"/deals/{deal_id}/events?page=1&limit=50", token=admin)
         items = events.get("data", events) if isinstance(events, dict) else events
         tg = [e for e in (items or []) if e.get("type") == 12] if isinstance(items, list) else []
-        check("GET /deals/:id/events lists the Telegram messages (6 of A, 1 that the client wrote to B)", status == 200 and len(tg) == 7, (status, len(tg)))
+        check("GET /deals/:id/events lists the Telegram messages (6 of A, 1 that the client wrote to C)", status == 200 and len(tg) == 7, (status, len(tg)))
         first = next((e for e in tg if e.get("tg_message_id") in (1001, "1001")), None) or (tg[-1] if tg else {})
         check("an incoming message shows the contact as its author and the manager as the target",
               first.get("originated_by", {}).get("id") == contact_id and (first.get("target_user") or {}).get("id") == A["id"], first)
@@ -293,6 +309,23 @@ def main():
               r[0] == 201 and r[1].get("status") == "saved" and row == "Видео|.mp4", (r, row))
         r = incoming(B, 1001, "Здравствуйте, нужен текстиль")
         check("the same Telegram message id in another manager's chat is another message (not a duplicate)", r[1].get("status") == "saved", r)
+
+        print("== one message = one row: key (account, chat, message id), unique (DB-6)")
+        n = psql("select count(*) from pg_indexes where tablename = 'event' and indexname in ('IDX_event_tg_message_key', 'IDX_event_wa_message_key') and indexdef like 'CREATE UNIQUE%'")
+        check("the unique keys of Telegram and WhatsApp messages exist", n == "2", n)
+        answers = []
+        threads = [threading.Thread(target=lambda: answers.append(incoming(A, 8100, "Дважды сразу"))) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        n = psql(f"select count(*) from event where type = 12 and tg_message_id = 8100 and target_user_id = {A['id']}")
+        statuses = sorted(a[1].get("status") for a in answers)
+        check("the same message delivered four times at once is stored once (the others: duplicate)",
+              n == "1" and statuses == ["duplicate", "duplicate", "duplicate", "saved"], (n, statuses))
+        r = incoming(A, 8100, "Дважды сразу", outgoing=True)
+        check("the same id in the other direction of the same chat is the same message (one key per account and chat)",
+              r[1].get("status") == "duplicate", r)
 
         print("== not for the CRM: colleagues, «Не клиент», messages from the phone, known contacts only (TG-4)")
         r = incoming(A, 7001, "Привет, коллега", chat={"tg_id": B["tg"], "first_name": "Коллега"})

@@ -1,13 +1,19 @@
 <template>
-    <BaseCard class="flex items-center justify-between p-4 gap-2 overflow-auto">
-        <div class="flex items-center gap-2">
+    <!-- full words (the old «см. отв.», «изм. этап» were not understood); wraps on a phone -->
+    <BaseCard shadow="flat" class="flex flex-wrap items-center justify-between p-3 gap-2 shadow-lg">
+        <div class="flex flex-wrap items-center gap-2">
             <BaseButton
                 :disabled="!props.selected.length"
                 class="!px-2 !py-1"
                 @click="agentModal.open"
                 :loading="isLoadingMap.updatingAgent"
             >
-                см. отв.
+                <Icon
+                    name="ph:user-switch"
+                    class="me-2 text-primary-600"
+                    size="18"
+                />
+                Сменить ответственного
             </BaseButton>
             <BaseButton
                 :disabled="!props.selected.length"
@@ -19,7 +25,7 @@
                     class="me-2 text-blue-600"
                     size="18"
                 />
-                доб. задачу
+                Поставить задачу
             </BaseButton>
             <BaseButton
                 :disabled="!props.selected.length"
@@ -32,7 +38,7 @@
                     class="me-2 text-yellow-600"
                     size="18"
                 />
-                изм. этап
+                Сменить этап
             </BaseButton>
             <Can I="delete" a="Deal">
                 <BaseButton
@@ -47,13 +53,13 @@
                         class="me-2 text-red-600"
                         size="18"
                     />
-                    удалить
+                    В корзину
                 </BaseButton>
             </Can>
         </div>
-        <p class="text-sm text-center text-gray-400">
-            Выбрано {{ props.selected.length }} на:
-            <Money :value="props.totalAmount" />
+        <p class="text-sm text-muted-500 dark:text-muted-400">
+            Выбрано {{ props.selected.length }} {{ plural(props.selected.length, 'сделка', 'сделки', 'сделок') }} на
+            <Money :value="props.totalAmount" class="font-medium text-muted-800 dark:text-muted-100" />
         </p>
     </BaseCard>
     <StageModal
@@ -76,6 +82,7 @@ import TaskModal from '~/components/task/TaskModal.vue';
 import {useAsync} from '~/composables/useAsync';
 import type { Deal, Stage, Task } from '~/types/deal';
 import type { User } from '~/types/user';
+import { plural } from '~/utils/format';
 import {promiseResult} from '~/utils/result';
 
 const props = withDefaults(defineProps<{selected: Deal[], totalAmount: number}>(), {selected: () => [], totalAmount: 0});

@@ -21,7 +21,8 @@ const { isLoading: typesLoading, run: runTaskTypes, data: taskTypes } = useAsync
 // the end of today's working day, «через N дней» the end of the working day N days later.
 type EndTime = { key: string; label: string; endTimeInMinutes: number; allDay: boolean; deadline?: 'end_of_working_day' };
 const endTimes = ref<EndTime[]>([
-    { key: 'now', endTimeInMinutes: 0, label: 'В момент события', allDay: false },
+    // the API gives such a task 30 minutes (TRIGGER_TASK_MIN_MINUTES): it is never overdue as soon as it appears
+    { key: 'now', endTimeInMinutes: 0, label: 'Сразу (срок — через 30 минут)', allDay: false },
     { key: 'eod', endTimeInMinutes: 0, label: 'Конец рабочего дня', allDay: false, deadline: 'end_of_working_day' },
     { key: '1440', endTimeInMinutes: 1440, label: 'Через день (до конца рабочего дня)', allDay: false },
     { key: '4320', endTimeInMinutes: 4320, label: 'Через 3 дня (до конца рабочего дня)', allDay: false },

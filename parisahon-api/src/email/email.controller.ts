@@ -34,7 +34,7 @@ import { FetchEmailToDto } from './dto/fetch.email.to.dto';
 import { MailAccessGuard } from './mail-access.guard';
 import { MailAssistService } from './mail-assist.service';
 import { AssistEmailDto } from './dto/assist.email.dto';
-import { CreateDealsFromLettersDto, LinkLetterContactsDto } from './dto/create.deals.dto';
+import { CreateDealsFromLettersDto, LinkLetterContactsDto, LinkLetterDto, MarkReadDto } from './dto/create.deals.dto';
 
 @UseGuards(AuthGuard, MailAccessGuard)
 @Controller('emails')
@@ -187,6 +187,18 @@ export class EmailController {
     );
   }
 
+  /** «Прочитано» for the user: the letters chosen in Mail, a letter opened in a deal. */
+  @Patch('read')
+  async markRead(
+    @Body() data: MarkReadDto,
+    @Req() request: Request,
+  ): Promise<{ read: number }> {
+    return this.emailService.markRead(
+      data.ids,
+      await this.helperService.extractUserFromRequest(request),
+    );
+  }
+
   @Get(':id')
   async fetchOne(
     @Param('id', ParseIntPipe) id: number,
@@ -234,6 +246,22 @@ export class EmailController {
     );
   }
 
+  /** «Привязать»: a letter of no deal into a deal and / or to a contact. */
+  @Post(':id/link')
+  @HttpCode(200)
+  async linkLetter(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() data: LinkLetterDto,
+    @Req() request: Request,
+  ): Promise<Record<string, any>> {
+    return this.emailService.linkLetter(
+      id,
+      data,
+      await this.helperService.extractUserFromRequest(request),
+      request['user'],
+    );
+  }
+
   /** Moves the letter to the Trash mailbox (it is no longer erased on the server for good). */
   @Delete(':id')
   async deleteEmail(
@@ -259,6 +287,7 @@ export class EmailController {
       data,
       await this.helperService.extractUserFromRequest(request),
       files,
+      request['user'],
     );
   }
 

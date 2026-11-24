@@ -4,6 +4,9 @@ import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import { BotAccess, loadStaffUser } from './bot-access';
 import { BotCrmService, PendingAction } from './bot-crm.service';
+import { AiDealService } from '../ai/ai-deal.service';
+import { AI } from '../ai/ai.config';
+import { AuditContext } from '../audit/audit-context';
 
 /**
  * The CRM tools Claude gets in the bot, served over MCP (bot-mcp.controller.ts).
@@ -39,6 +42,7 @@ export class BotToolsService {
   constructor(
     private dataSource: DataSource,
     private crm: BotCrmService,
+    private ai: AiDealService,
   ) {
     const tools: Record<string, ToolDef<any>> = {
       find_clients: {
@@ -75,7 +79,9 @@ export class BotToolsService {
         run: (access, _s, a) => this.crm.clientHistory(access, a),
       },
       list_tasks: {
-        description: "The manager's open tasks (assigned to them or to their group).",
+        description:
+          "The manager's open tasks: assigned to them, or to their group when they may close those. Each task has its id, " +
+          'time ("when", with the weekday), client, deal and can_close.',
         schema: z.object({
           period: z.enum(['today', 'overdue', 'week', 'open']).optional().describe('Default: today'),
           company_id: id().optional(),
@@ -83,11 +89,18 @@ export class BotToolsService {
         }),
         run: (access, _s, a) => this.crm.listTasks(access, a),
       },
+      list_staff: {
+        description: 'Colleagues (staff users) and groups of the CRM with their ids and can_assign: to give a task to a colleague or a group (only where can_assign is true).',
+        schema: z.object({}),
+        run: (access) => this.crm.listStaff(access),
+      },
       prepare_task: {
         description:
-          'Prepare a new task for the manager, linked to a deal or a company. Given a company_id, the task goes to the ' +
-          "client's only open deal; with several open deals it returns status choose_deal and the deals: ask the manager " +
-          'which one and call again with its deal_id (company_only: true links the task to the company itself). ' +
+          'Prepare a new task, linked to a deal, a company, a contact person, or to nothing (a personal task, e.g. "подготовить отчёт"). ' +
+          "Given a company_id, the task goes to the client's only open deal; with several open deals it returns status choose_deal " +
+          'and the deals: ask the manager which one and call again with its deal_id (company_only: true links the task to the company itself). ' +
+          'By default the manager does it; to give it to a colleague or a group pass assignee_user_id / assignee_group_id from list_staff. ' +
+          'The result has warnings (a time already past, another task at the same time): tell the manager. ' +
           'Nothing is saved until the manager presses the confirm button that the bot shows.',
         schema: z.object({
           title: z.string().min(3).max(255).describe('What to do, e.g. "Позвонить по образцам"'),
@@ -97,14 +110,38 @@ export class BotToolsService {
           type: z.string().optional().describe('Task type name, e.g. "Встреча" or "Связаться"'),
           company_id: id().optional(),
           deal_id: id().optional().describe('The deal (order) the task is about; preferred over company_id'),
+          contact_id: id().optional().describe("A client's contact person (matched_contacts of find_clients, contacts of get_client)"),
           company_only: z.boolean().optional().describe('Link to the company itself, not to one of its open deals'),
+          assignee_user_id: id().optional().describe('A colleague who does the task (list_staff); default: the manager'),
+          assignee_group_id: id().optional().describe('A group that does the task (list_staff)'),
         }),
         run: async (access, s, a) => this.track(s, await this.crm.prepareTask(access, s.chatId, a)),
+      },
+      prepare_update_task: {
+        description:
+          'Prepare a change of an open task (id from list_tasks): new text, date and/or time (moving it keeps its duration), ' +
+          'duration, or another assignee. Saved only after the manager confirms with a button.',
+        schema: z.object({
+          task_id: id(),
+          title: z.string().min(3).max(255).optional(),
+          date: z.string().optional().describe('YYYY-MM-DD, local date; alone it keeps the time of day'),
+          time: z.string().optional().describe('HH:MM local time; alone it keeps the day'),
+          duration_minutes: z.number().int().min(5).max(600).optional(),
+          assignee_user_id: id().optional(),
+          assignee_group_id: id().optional(),
+        }),
+        run: async (access, s, a) => this.track(s, await this.crm.prepareUpdateTask(access, s.chatId, a)),
       },
       prepare_close_task: {
         description: 'Prepare closing (completing) a task with a result. Saved only after the manager confirms with a button.',
         schema: z.object({ task_id: id(), result: z.string().min(1).max(2000) }),
         run: async (access, s, a) => this.track(s, await this.crm.prepareCloseTask(access, s.chatId, a)),
+      },
+      prepare_delete_task: {
+        description:
+          'Prepare deleting a task that was set by mistake (a done task is closed, not deleted). Deleted only after the manager confirms with a button.',
+        schema: z.object({ task_id: id() }),
+        run: async (access, s, a) => this.track(s, await this.crm.prepareDeleteTask(access, s.chatId, a)),
       },
       prepare_company: {
         description:
@@ -135,6 +172,17 @@ export class BotToolsService {
         run: async (access, s, a) => this.track(s, await this.crm.prepareCompany(access, s.chatId, a)),
       },
     };
+    // «Сводка сделки» (src/ai): only while the AI and its summary are on (AI_FEATURES, AI_SUMMARY)
+    if (AI.summary) {
+      tools.deal_summary = {
+        description:
+          "AI summary of a deal (order): what the client wants, what was promised, the client's open questions, the next step, " +
+          'and the order parameters found in the conversation. May take up to a minute. When summary_status is not "done", ' +
+          'tell the manager that the fresh summary is still being prepared (the previous one may be given).',
+        schema: z.object({ deal_id: id().describe('The deal (order) id, e.g. from list_deals') }),
+        run: (access, _s, a) => this.ai.forBot(access.user, a.deal_id),
+      };
+    }
     this.tools = tools;
   }
 
@@ -192,6 +240,9 @@ export class BotToolsService {
     }
     const user = await loadStaffUser(this.dataSource, session.userId);
     if (!user) return this.errorResult('Пользователь CRM удалён или заблокирован');
+    // the journal (src/audit): the assistant's tool acts for this user, source «бот»
+    AuditContext.setSource('bot', session.chatId ? `chat:${session.chatId}` : 'assistant');
+    AuditContext.setActor(user.sub, user.username ?? null);
     try {
       const result = await tool.run(new BotAccess(user), session, parsed.data);
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };

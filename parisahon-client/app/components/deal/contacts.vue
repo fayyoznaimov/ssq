@@ -157,7 +157,8 @@ watchEffect(() => {
 </script>
 <template>
     <section>
-        <span class="text-medium text-muted-900">Контакты</span>
+        <!-- the section headings were black on the dark page -->
+        <h3 class="block text-sm font-medium text-muted-900 dark:text-muted-100 mb-2">Контакты <span class="text-muted-400">({{ props.deal.ctr_agents?.length ?? 0 }})</span></h3>
         <div class="flex flex-col space-y-4 mt-2">
             <ul class="flex flex-col gap-1">
                 <li v-for="(contact, index) in deal.ctr_agents" :key="index">
@@ -171,7 +172,7 @@ watchEffect(() => {
                                     :text="contact.username.slice(0, 2)"
                                     :src="(contact as any).avatar ? uploadUrl((contact as any).avatar) : undefined"
                                     size="sm"
-                                    class="bg-primary-400 text-white dark:bg-primary-300"
+                                    class="bg-primary-400 text-white"
                                 />
                                 <span>{{ contact?.username }}</span>
                                 <!-- where this client can be written to -->

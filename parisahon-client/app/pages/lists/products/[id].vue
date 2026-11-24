@@ -1,5 +1,5 @@
 <template>
-    <div class="flex flex-col gap-4 px-10">
+    <div class="flex flex-col gap-4 lg:px-10">
         <BaseTabs 
             v-model="activeTab"
             :tabs="[
@@ -13,8 +13,8 @@
                         v-model="product.name"
                         label="Название товара*"
                         name="name"
-                        placeholder="пр.: Parisa"
-                        icon="ph:buildings"
+                        placeholder="пр.: Полотенце махровое 70×140"
+                        icon="ph:package"
                         :loading="productLoading"
                         required
                         :error="errors.name"
@@ -78,16 +78,19 @@
                             </BaseInput>
                         </li>
                     </ul>
-                    <div class="flex flex-col gap-2 mt-4">
-                        <Can I="delete" a="Product">
-                            <BaseButton color="danger" v-if="product.id" @click="onDelete" :loading="isLoadingMap.delete" :disabled="isLoadingMap.delete">
-                                Удалить
+                    <!--  ACTIONS: «Сохранить» first; «Удалить» apart, small, and it asks  -->
+                    <div class="flex flex-col gap-2 mt-4 mb-4">
+                        <Can v-if="!productLoading" :I="product.id ? 'update' : 'create'" a="Product">
+                            <BaseButton color="primary" variant="solid" type="submit" :disabled="isLoadingMap.save" :loading="isLoadingMap.save">
+                                {{ product.id ? 'Сохранить' : 'Добавить товар' }}
                             </BaseButton>
                         </Can>
-                        <Can v-if="!productLoading" :I="product.id ? 'update' : 'create'" a="Product">
-                            <BaseButton color="primary" type="submit" :disabled="isLoadingMap.save" :loading="isLoadingMap.save">
-                                Сохранить
-                            </BaseButton>
+                        <Can I="delete" a="Product">
+                            <div v-if="product.id" class="mt-6 flex justify-end border-t border-muted-200 pt-4 dark:border-muted-700">
+                                <BaseButton size="sm" variant="pastel" color="danger" @click="onDelete" :loading="isLoadingMap.delete" :disabled="isLoadingMap.delete">
+                                    <Icon name="ph:trash" class="size-4 me-1" /> Удалить товар
+                                </BaseButton>
+                            </div>
                         </Can>
                     </div>
                 </form>
@@ -145,6 +148,12 @@
                 </div>
             </template>
         </BaseTabs>
+        <Confirmation
+            id="DeleteProductConfirmation"
+            title="Удалить товар?"
+            description=""
+            :on-confirm="removeProduct"
+        />
     </div>
 </template>
 
@@ -158,16 +167,15 @@ import type { Filler, FillerValue } from '~/types/filler';
 import type { Product } from '~/types/product';
 import { type User, UserRole } from '~/types/user';
 import { confirmFillerDelete } from '~/components/company/fillerDelete';
+import { useRecordTitle } from '~/components/company/recordTitle';
+import Confirmation from '~/components/common/Confirmation.vue';
 import { optional, required, type Schema, validPattern } from '~/utils/validation';
 
 definePageMeta({
     authRoute: true,
     layout: 'account',
-    verbose: 'Новый товар'
-});
-
-useHead({
-    title: 'Новый товар'
+    verbose: 'Товар',
+    verboseNew: 'Новый товар'
 });
 
 let fakeId = -1;
@@ -292,16 +300,34 @@ async function onSubmit(e: Event) {
 
     const result = await promiseResult(runWithId(promise, 'save'));
     if (!result.ok) return toast.show({ message: result.error.message, type: 'error', timeout: 3000 });
+    // stay in the card: a new product opens as itself, a saved one is read again
+    toast.show({ message: id ? 'Сохранено' : 'Товар добавлен', type: 'success', timeout: 2500 });
+    if (!id) {
+        const created = result.value as Product;
+        return navigateTo(created?.id ? `/lists/products/${created.id}` : '/lists/products', { replace: true });
+    }
+    await runProduct(productService.get(String(id)).exec());
+}
+
+const deleteConfirmation = useModal('DeleteProductConfirmation');
+
+async function onDelete() {
+    // one click used to delete the product: ask in the dialog of the CRM
+    deleteConfirmation.open({
+        description: `Товар «${product.value.name}» пропадёт из каталога и из выбора товара в сделках; в старых сделках он останется.`,
+    });
+}
+
+async function removeProduct() {
+    await runWithId(productService.remove(product.value.id).exec(), 'delete');
+    toast.show({ message: 'Товар удалён', type: 'success', timeout: 2500 });
     navigateTo('/lists/products');
 }
 
-async function onDelete() {
-    // one click used to delete the product
-    if (!confirm(`Удалить товар «${product.value.name}»? Он пропадёт из каталога и из выбора товара в сделках.`)) return;
-    const result = await promiseResult(runWithId(productService.remove(product.value.id).exec(), 'delete'));
-    if (!result.ok) return toast.show({ message: result.error.message, type: 'error', timeout: 3000 });
-    navigateTo('/lists/products');
-}
+useRecordTitle(
+    computed(() => (route.params.id === 'new' ? null : product.value?.name)),
+    route.params.id === 'new' ? 'Новый товар' : 'Товар',
+);
 
 watch([fillers, product], () => {
     for (const filler of fillers.value.product || []) {

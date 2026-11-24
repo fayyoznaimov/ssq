@@ -6,6 +6,7 @@ Every row it creates is named AUDIT-wa-<run> (contacts, users, deals by its agen
 import json
 import os
 import random
+import re
 import secrets
 import shlex
 import subprocess
@@ -186,7 +187,10 @@ def main():
         check("photo null = no news: the avatar stays", row == f"wa_{RUN}_photo.jpg", (r, row))
         st, ev = api("GET", f"/deals/{deal_id}/events?limit=5", token=A["token"])
         items = ev.get("data", []) if isinstance(ev, dict) else []
-        check("the history shows the author's avatar", any((e.get("originated_by") or {}).get("avatar") == f"wa_{RUN}_photo.jpg" for e in items), st)
+        # the API gives every file name (also `avatar`) as a signed, expiring link: <name>?e=<expiry>&s=<hmac> (FileLink)
+        avatars = [str((e.get("originated_by") or {}).get("avatar") or "") for e in items]
+        check("the history shows the author's avatar (a signed link to the photo)",
+              any(re.fullmatch(rf"wa_{RUN}_photo\.jpg\?e=\d{{1,12}}&s=[0-9a-f]{{64}}", a) for a in avatars), (st, avatars))
 
         print("== receiver: more messages")
         r = incoming(A, f"WA{RUN}1", "Assalomu alaykum, narx qancha?")
@@ -225,11 +229,22 @@ def main():
         check("the file moved with it", row == str(other_deal), row)
 
         print("== another manager gets the same client")
+        # OMNI-7: B's deal view is «own»: A's deal is not B's to open, so the message never goes there silently
         r = incoming(B, f"WA{RUN}b1", "B ga yozdim", chat={"wa_id": f"{digits}@s.whatsapp.net", "phone": "+" + digits, "name": "x"})
-        check("the client's open deal (A's) gets the message, no second deal", r[1].get("deal_ids") == [deal_id] and not r[1].get("created_deal"), r)
-        st, b = multipart("/whatsapp/send-message", {"to_user": str(contact_id), "message": "Salom"}, [], B["token"])
+        b_deal = (r[1].get("deal_ids") or [None])[0]
+        check("B cannot open A's deal -> B's own new deal gets the message, not A's", r[1].get("created_deal") is True and b_deal not in (None, deal_id), r)
+        row = psql(f"select agent_id from deal where id = {b_deal}") if b_deal else ""
+        check("... the new deal is B's", row == str(B["id"]), row)
+        st, b = multipart("/whatsapp/send-message", {"to_user": str(contact_id), "message": "Salom", "deal_id": str(b_deal)}, [], B["token"])
         check("B, whose WhatsApp the client wrote to, may answer from that deal (reaches the service: not connected / 503)",
               (st == 400 and "подключ" in message_of((st, b))) or st == 503, (st, b))
+        # B's deal out of the way: B is in the same group, so C («group») could open it too, and as the most
+        # recently active deal it would win; the step is about A's deal (cleanup removes it by agent_id)
+        if b_deal:
+            psql(f"update deal set deleted_at = now() where id = {b_deal}")
+        psql(f"update \"user\" set permissions = jsonb_set(permissions, '{{deal,view}}', '2') where id = {C['id']}")
+        r = incoming(C, f"WA{RUN}c0", "C ga yozdim", chat={"wa_id": f"{digits}@s.whatsapp.net", "phone": "+" + digits, "name": "x"})
+        check("manager C of A's group with deal view «group» -> A's deal, no new deal", r[1].get("deal_ids") == [deal_id] and not r[1].get("created_deal"), r)
         r = incoming(B, f"WA{RUN}1", "Assalomu alaykum, narx qancha?")
         check("the same WhatsApp message id in another manager's chat is another message (not a duplicate)", r[1].get("status") == "saved", r)
 

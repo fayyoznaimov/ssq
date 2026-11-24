@@ -35,14 +35,18 @@ const endTime = ref(saved.with_task_end_times?.length
     : [endTimes.value[0]]);
 const taskType = ref<TaskType>();
 
+// «Любой тип» (0): the trigger closes the open tasks of every type
+const ANY_TYPE = { id: 0, name: 'Любой тип' } as TaskType;
+const typeItems = computed(() => [ANY_TYPE, ...taskTypes.value]);
+
 watch([endTime, taskType], () => {
     props.trigger.close_tasks_data.with_task_end_times = endTime.value.map((t) => t.value);
     if (taskType.value) props.trigger.close_tasks_data.type_id = taskType.value.id;
-});
+}, { immediate: true });
 
 watchEffect(() => {
     if (!taskType.value && taskTypes.value.length) {
-        taskType.value = taskTypes.value.find((t) => t.id === saved.type_id) ?? taskTypes.value[0];
+        taskType.value = taskTypes.value.find((t) => t.id === saved.type_id) ?? ANY_TYPE;
     }
 });
 
@@ -56,7 +60,7 @@ onMounted(() => {
             placeholder="Тип задачи" 
             name="type" 
             v-model="taskType"
-            :items="taskTypes" 
+            :items="typeItems" 
             :loading="typesLoading" 
             :properties="{ value: 'id', label: 'name' }" 
         />

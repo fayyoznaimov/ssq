@@ -37,6 +37,8 @@ export interface SendEmailOptions {
   repliedTo?: Email | null;
   /** extra headers (triggers: Auto-Submitted, so that the client's answering machine does not reply) */
   headers?: Record<string, string>;
+  /** the deal of `deal_id`, already checked for the user (EmailService.sendFromForm): the letter goes only there */
+  deal?: Deal | null;
 }
 
 /**
@@ -99,11 +101,11 @@ export class MailSendingService {
     const cc = data.cc ?? [];
     assertAttachmentsFit(files);
 
-    // The deal the email is written from, even when the recipient is not its contact, even when it
-    // is closed (unknown: 404 before anything is sent)
-    const fromDeal = data.deal_id
+    // The deal the email is written from, even when the recipient is not its contact (unknown: 404
+    // before anything is sent). The web form's deal comes checked (rights, not closed); a trigger's as it is.
+    const fromDeal = options.deal ?? (data.deal_id
       ? await this.helperService.getById(Deal, +data.deal_id, ['stage'])
-      : null;
+      : null);
 
     const repliedTo = options.repliedTo ?? null;
     const signature = options.signature ? await this.signatureOf(originatedBy) : '';
@@ -133,8 +135,25 @@ export class MailSendingService {
       ...(options.headers ? { headers: options.headers } : {}),
     };
 
+    // The letter is built once: the same bytes (Message-ID, Date) go to the client and into Sent, and
+    // the same Message-ID is stored, so that the client's reply finds its thread. It used to be built
+    // twice, and the copy in Sent and the database had another Message-ID than the letter sent.
+    let raw: Buffer;
+    let envelope: { from: string | false; to: string[] };
     try {
-      await transporter.sendMail(mailOptions);
+      const composed = new MailComposer(mailOptions).compile();
+      raw = await composed.build();
+      envelope = composed.getEnvelope() as { from: string | false; to: string[] };
+    } catch (error) {
+      this.loggerService.error(`Mail: the letter "${data.subject}" could not be built: ${(error as Error)?.message}`, (error as Error)?.stack);
+      throw new BadRequestException('Письмо не удалось собрать: проверьте вложения и адреса');
+    }
+    if (!envelope?.to?.length) {
+      throw new BadRequestException('Укажите адрес получателя');
+    }
+
+    try {
+      await transporter.sendMail({ envelope: { from: envelope.from || from, to: envelope.to }, raw });
     } catch (error) {
       this.loggerService.error(`SMTP: the letter "${data.subject}" from ${from} was not sent: ${(error as Error)?.message}`, (error as Error)?.stack);
       throw smtpError(error);
@@ -146,6 +165,8 @@ export class MailSendingService {
     email.from_name = name.slice(0, 255);
     email.subject = data.subject;
     email.body = html;
+    // the body is the HTML already ('' = nothing to load from the server, see MailSyncService)
+    email.html = '';
     email.outgoing = true;
     email.sent_by = originatedBy;
     email.in_reply_to = repliedTo?.message_id ?? null;
@@ -157,10 +178,8 @@ export class MailSendingService {
     // Since we are the ones sending the email, it will be considered already read for us.
     email.read = true;
 
-    // the deal it is written from, the open deals of the recipients (contacts, company addresses)
-    // and of the thread
-    const deals = await this.mailDeals.forSent(email);
-    if (fromDeal && !deals.some((deal) => deal.id === fromDeal.id)) deals.unshift(fromDeal);
+    // one deal: the one it is written from, else the thread's, else the newest open deal of the recipients
+    const deals = await this.mailDeals.forSent(email, fromDeal);
 
     // The email is already sent at this point: a failure below must not make the user send it again.
     try {
@@ -171,7 +190,7 @@ export class MailSendingService {
     }
 
     try {
-      await this.copyToSent(mailOptions, email);
+      await this.copyToSent(raw, email);
     } catch (error) {
       this.loggerService.error(
         'Email was sent, but could not be copied to the Sent mailbox',
@@ -188,14 +207,11 @@ export class MailSendingService {
    * Appends the sent message to the Sent mailbox and records where it lies
    * (uid, mailbox, UIDVALIDITY), so that sync knows the copy.
    */
-  private async copyToSent(content: Mail.Options, email: Email): Promise<void> {
+  private async copyToSent(raw: Buffer, email: Email): Promise<void> {
     const sent = this.connection.mailboxes.sent;
 
     await this.connection.withMailbox(sent, async (imap) => {
-      const compiled = new MailComposer(content).compile();
-      email.message_id = compiled.messageId()?.slice(0, 998) ?? email.message_id;
-
-      const result = await imap.append(sent, await compiled.build(), ['Seen']);
+      const result = await imap.append(sent, raw, ['Seen']);
 
       // The uid belongs to the Sent mailbox. Without recording that, the entity
       // defaults to INBOX: sync then skips the INBOX email with the same uid

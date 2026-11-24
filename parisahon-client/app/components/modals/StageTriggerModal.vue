@@ -8,7 +8,7 @@
             </div>
         </template>
         <form class="flex flex-col space-y-6" id="stage-trigger-modal" @submit.prevent="onSubmit">
-            <ul class="grid grid-cols-3 gap-3">
+            <ul class="grid grid-cols-3 xs:grid-cols-2 gap-3">
                 <li class="bg-muted-100 p-3 rounded-md flex flex-col gap-3 dark:bg-muted-700">
                     <div class="bg-muted-200 w-14 h-14 rounded-full flex items-center justify-center text-muted-900 dark:bg-muted-800 dark:text-white">
                         <Icon name="ph:plus-circle" class="size-7"/>
@@ -72,6 +72,24 @@
                         Удалить файлы
                     </BaseButton>
                 </li>
+                <li class="bg-muted-100 p-3 rounded-md flex flex-col gap-3 dark:bg-muted-700">
+                    <div class="bg-muted-200 w-14 h-14 rounded-full flex items-center justify-center text-muted-900 dark:bg-muted-800 dark:text-white">
+                        <Icon name="ph:arrow-fat-right" class="size-7"/>
+                    </div>
+                    <BaseButton class="!px-0" name="_action" :value="TriggerType.MoveStage" type="submit">
+                        <Icon name="ph:plus" class="me-2"/>
+                        Перевести в этап
+                    </BaseButton>
+                </li>
+                <li class="bg-muted-100 p-3 rounded-md flex flex-col gap-3 dark:bg-muted-700">
+                    <div class="bg-muted-200 w-14 h-14 rounded-full flex items-center justify-center text-muted-900 dark:bg-muted-800 dark:text-white">
+                        <Icon name="ph:bell-ringing" class="size-7"/>
+                    </div>
+                    <BaseButton class="!px-0" name="_action" :value="TriggerType.Notify" type="submit">
+                        <Icon name="ph:plus" class="me-2"/>
+                        Уведомить
+                    </BaseButton>
+                </li>
             </ul>
         </form>
     </Modal>
@@ -113,6 +131,8 @@ function onSubmit(e: Event) {
                 type: TriggerType.ChangeAgent,
                 change_agent_data: {
                     agent_id: 0,
+                    rotate_user_ids: [],
+                    transfer_tasks: true,
                 }
             };
         } break;
@@ -170,7 +190,19 @@ function onSubmit(e: Event) {
         case TriggerType.CreateDeal: {
             triggers = {
                 type: TriggerType.CreateDeal,
-                create_deal_data: { stage_id: undefined, label: '' }
+                create_deal_data: { stage_id: undefined, label: '', copy_fields: true, copy_products: true }
+            };
+        } break;
+        case TriggerType.MoveStage: {
+            triggers = {
+                type: TriggerType.MoveStage,
+                move_stage_data: { stage_id: undefined }
+            };
+        } break;
+        case TriggerType.Notify: {
+            triggers = {
+                type: TriggerType.Notify,
+                notify_data: { text: '', to: 'responsible', user_id: null }
             };
         } break;
         default:

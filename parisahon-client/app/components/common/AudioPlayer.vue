@@ -57,6 +57,8 @@ import { onMounted, ref } from "vue";
 
 interface Props {
     src: string;
+    // the length known before the file is loaded (a call recording: milliseconds); the player showed 0:00 until play
+    durationMs?: number | null;
 }
 const props = defineProps<Props>();
 
@@ -74,7 +76,7 @@ const sliderValue = ref(0);
 
 // Current playback time and total duration (in seconds)
 const currentTime = ref(0);
-const duration = ref(0);
+const duration = ref(props.durationMs ? props.durationMs / 1000 : 0);
 
 // Format time in M:SS
 function formatTime(seconds: number) {
@@ -116,7 +118,7 @@ function onEnded() {
 
 // Load total duration
 function onLoadedMetadata() {
-    if (audioPlayer.value) {
+    if (audioPlayer.value && Number.isFinite(audioPlayer.value.duration) && audioPlayer.value.duration > 0) {
         duration.value = audioPlayer.value.duration;
     }
 }

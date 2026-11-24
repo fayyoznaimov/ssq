@@ -1,4 +1,6 @@
-import { Controller, Get, Query } from '@nestjs/common';
+import { Controller, Get, Query, Req } from '@nestjs/common';
+import { Request } from 'express';
+import { Access } from '../auth/access';
 import { TrackingService } from './tracking.service';
 import { SearchTrackingDto } from './dto/search.tracking.dto';
 import { instanceToPlain } from 'class-transformer';
@@ -13,7 +15,8 @@ export class TrackingController {
   @Get()
   async fetchLogs(
     @Query() query: SearchTrackingDto,
+    @Req() request: Request,
   ): Promise<Record<string, any>> {
-    return instanceToPlain(this.trackingService.fetchLogs(query));
+    return instanceToPlain(this.trackingService.fetchLogs(query, new Access(request['user']).canReadMail));
   }
 }

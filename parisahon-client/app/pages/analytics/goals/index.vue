@@ -1,7 +1,7 @@
 <script lang="ts" setup>
 import moment from 'moment';
 import BaseButton from '~/components/base/BaseButton.vue';
-import Money from '~/components/common/Money.vue';
+import { formatDay, formatSum } from '~/utils/format';
 import type { ObjectiveResultStat } from '~/types/stats';
 
 definePageMeta({
@@ -30,7 +30,6 @@ const UNIT: Record<Period, moment.unitOfTime.StartOf> = {
 
 type GoalUser = ObjectiveResultStat['users'][number] & { deleted?: boolean };
 
-const progressEls = ref<Record<string, HTMLProgressElement>>({});
 const route = useRoute();
 const period = computed<Period>(() => Object.values(Period).includes(route.query.period as Period) ? route.query.period as Period : Period.Monthly);
 // any day of the month / quarter / year shown; today by default
@@ -88,33 +87,25 @@ const total = computed(() => {
     return {budget, goal}
 });
 
-function measureText(text: string) {
-    let width = 0;
-    const span = document.createElement('span');
-    span.style.padding = '0 0.4rem';
-    span.textContent = text;
-    document.body.appendChild(span);
-    width = span.offsetWidth;
-    document.body.removeChild(span);
-
-    return width;
-}
-
-function calculateColor(budget: number, goal: number) {
-    const progress = budget / goal * 100;
-    const formatted = formatMoney(budget, 0, {spaceBetweenAmountAndSymbol: ' ', symbolOnLeft: false})
-
-    return JSON.stringify({progress, formatted, formattedMeasured: measureText(formatted)});
+/** «4 200 000 ₽ из 6 000 000 ₽ · 70 %»: the fact, the plan and how much of it is done (null — no plan) */
+function progressOf(budget: number, goal: number) {
+    const fact = Number(budget) || 0;
+    const plan = Number(goal) || 0;
+    const percent = plan > 0 ? Math.round((fact / plan) * 100) : null;
+    // the bar: red below half, amber below the plan, green at the plan and above
+    const color = percent === null ? 'bg-muted-300 dark:bg-muted-600'
+        : percent >= 100 ? 'bg-success-500' : percent >= 50 ? 'bg-amber-400' : 'bg-rose-400';
+    return { fact, plan, percent, width: percent === null ? 0 : Math.min(100, percent), color };
 }
 
 watch(range, fetchStats);
 onMounted(fetchStats);
 </script>
 <template>
-    <div class="flex flex-col gap-8">
-        <div class="flex flex-wrap items-center justify-between gap-4">
-            <div class="flex flex-wrap items-center gap-4">
-                <h1 class="text-xl whitespace-nowrap">Цели по сделкам</h1>
+    <div class="flex flex-col gap-6">
+        <div class="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:gap-4">
+            <div class="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-4">
+                <h1 class="text-xl">Цели по сделкам</h1>
                 <div class="flex items-center gap-2">
                     <BaseButtonIcon size="sm" rounded="md" aria-label="Раньше" @click="shift(-1)">
                         <Icon name="ph:caret-left" class="size-4" />
@@ -126,104 +117,94 @@ onMounted(fetchStats);
                     <BaseButton v-if="!isCurrent" size="sm" @click="toToday">Сейчас</BaseButton>
                 </div>
             </div>
-            <BaseButton to="/analytics/goals/settings">
+            <BaseButton to="/analytics/goals/settings" class="self-start whitespace-nowrap">
                 <Icon name="ph:gear" class="size-5 me-2"/>
                 Настройка целей
             </BaseButton>
         </div>
-        <BaseButtonGroup>
-            <BaseButton color="default" :to="{path: '/analytics/goals', query: {...route.query, period: Period.Monthly}}"
-                :class="period === Period.Monthly ? '!bg-muted-200 dark:!bg-muted-600' : ''">
-                <span>По месяцам</span>
-            </BaseButton>
-            <BaseButton color="default" :to="{path: '/analytics/goals', query: {...route.query, period: Period.Quarterly}}"
-                :class="period === Period.Quarterly ? '!bg-muted-200 dark:!bg-muted-600' : ''">
-                <span>По кварталам</span>
-            </BaseButton>
-            <BaseButton color="default" :to="{path: '/analytics/goals', query: {...route.query, period: Period.Yearly}}"
-                :class="period === Period.Yearly ? '!bg-muted-200 dark:!bg-muted-600' : ''">
-                <span>По годам</span>
-            </BaseButton>
-        </BaseButtonGroup>
-        <p class="text-sm text-muted-500 -mt-4">
-            Факт — бюджет сделок на этапе успеха, закрытых в этом периоде ({{ range[0] }} — {{ range[1] }}); план — {{ period === Period.Monthly ? 'месячный' : period === Period.Quarterly ? 'квартальный' : 'годовой' }}.
+        <div class="overflow-x-auto max-w-full">
+            <BaseButtonGroup class="whitespace-nowrap">
+                <BaseButton color="default" :to="{path: '/analytics/goals', query: {...route.query, period: Period.Monthly}}"
+                    :class="period === Period.Monthly ? 'toggle-selected' : ''">
+                    <span>По месяцам</span>
+                </BaseButton>
+                <BaseButton color="default" :to="{path: '/analytics/goals', query: {...route.query, period: Period.Quarterly}}"
+                    :class="period === Period.Quarterly ? 'toggle-selected' : ''">
+                    <span>По кварталам</span>
+                </BaseButton>
+                <BaseButton color="default" :to="{path: '/analytics/goals', query: {...route.query, period: Period.Yearly}}"
+                    :class="period === Period.Yearly ? 'toggle-selected' : ''">
+                    <span>По годам</span>
+                </BaseButton>
+            </BaseButtonGroup>
+        </div>
+        <p class="text-sm text-muted-500 -mt-2">
+            Факт — бюджет сделок на этапе успеха, закрытых в этом периоде ({{ formatDay(range[0]) }} — {{ formatDay(range[1]) }});
+            план — {{ period === Period.Monthly ? 'месячный' : period === Period.Quarterly ? 'квартальный' : 'годовой' }}.
         </p>
-        <div class="max-w-5xl">
-            <div class="text-muted-700 flex gap-3 items-center dark:text-muted-200">
-                <span class="max-w-40 w-full">Всего</span>
-                <progress
-                    class="max-w-2xl w-full progress"
-                    :value="total.budget"
-                    :max="total.goal"
-                    :data-budget="formatMoney(total.budget, 0, {spaceBetweenAmountAndSymbol: ' ', symbolOnLeft: false})"
-                >
-                </progress>
-                <Money :value="total.goal" />
+        <div class="max-w-4xl flex flex-col gap-6">
+            <!-- the total -->
+            <div class="flex flex-col gap-1.5">
+                <div class="flex flex-wrap items-baseline justify-between gap-x-3">
+                    <span class="font-semibold text-lg text-muted-800 dark:text-white">Всего</span>
+                    <span class="text-sm text-muted-700 dark:text-muted-200">
+                        <template v-if="progressOf(total.budget, total.goal).plan">
+                            <b>{{ formatSum(total.budget) }}</b> из {{ formatSum(total.goal) }} · {{ progressOf(total.budget, total.goal).percent }}%
+                        </template>
+                        <template v-else><b>{{ formatSum(total.budget) }}</b> · цель не задана</template>
+                    </span>
+                </div>
+                <div class="h-3 rounded-full bg-muted-200 dark:bg-muted-800 overflow-hidden">
+                    <div class="h-full rounded-full transition-[width] duration-500" :class="progressOf(total.budget, total.goal).color" :style="{ width: progressOf(total.budget, total.goal).width + '%' }"></div>
+                </div>
             </div>
-            <ul v-if="results.groups.length" class="flex flex-col gap-8 mt-6">
-                <li v-for="group in results.groups" :key="group.id ?? 'outside'">
-                    <div class="text-muted-700 flex gap-3 items-center dark:text-muted-200">
-                        <span class="font-semibold text-lg max-w-40 w-full">{{ group.name }}</span>
-                        <progress
-                            class="max-w-2xl w-full progress"
-                            :data-budget="formatMoney(group.total_budget, 0, {spaceBetweenAmountAndSymbol: ' ', symbolOnLeft: false})"
-                            :value="group.total_budget"
-                            :max="goalOf(group.objectives)"
-                            :ref="(el) => progressEls[group.id] = el as HTMLProgressElement"
-                        >
-                        </progress>
-                        <Money :value="goalOf(group.objectives)" />
-                    </div>
-                    <ul class="flex flex-col gap-4 mt-4">
-                        <li v-for="user in (group.users as GoalUser[])" :key="user.id" class="text-muted-700 flex gap-3 items-center dark:text-muted-200">
-                            <span class="max-w-40 w-full">
-                                {{ user.username }}
-                                <span v-if="user.deleted" class="text-muted-400 text-xs">(удалён)</span>
+            <p v-if="!total.goal" class="text-sm text-amber-600">
+                <Icon name="ph:info" class="me-1" />
+                Цели на этот период не заданы —
+                <NuxtLink to="/analytics/goals/settings" class="underline">задать в «Настройке целей»</NuxtLink>.
+            </p>
+
+            <ul v-if="results.groups.length" class="flex flex-col gap-8">
+                <li v-for="group in results.groups" :key="group.id ?? 'outside'" class="flex flex-col gap-3">
+                    <div class="flex flex-col gap-1.5">
+                        <div class="flex flex-wrap items-baseline justify-between gap-x-3">
+                            <span class="font-semibold text-muted-800 dark:text-white">{{ group.name }}</span>
+                            <span class="text-sm text-muted-700 dark:text-muted-200">
+                                <template v-if="progressOf(group.total_budget, goalOf(group.objectives)).plan">
+                                    <b>{{ formatSum(group.total_budget) }}</b> из {{ formatSum(goalOf(group.objectives)) }} · {{ progressOf(group.total_budget, goalOf(group.objectives)).percent }}%
+                                </template>
+                                <template v-else><b>{{ formatSum(group.total_budget) }}</b> · цель не задана</template>
                             </span>
-                            <progress
-                                class="max-w-2xl w-full progress"
-                                :value="user.total_budget"
-                                :max="goalOf(user.objectives)"
-                                :data-budget="formatMoney(user.total_budget, 0, {spaceBetweenAmountAndSymbol: ' ', symbolOnLeft: false})"
-                                :ref="(el) => progressEls[group.id] = el as HTMLProgressElement"
-                            >
-                            </progress>
-                            <Money :value="goalOf(user.objectives)" />
+                        </div>
+                        <div class="h-3 rounded-full bg-muted-200 dark:bg-muted-800 overflow-hidden">
+                            <div class="h-full rounded-full transition-[width] duration-500" :class="progressOf(group.total_budget, goalOf(group.objectives)).color" :style="{ width: progressOf(group.total_budget, goalOf(group.objectives)).width + '%' }"></div>
+                        </div>
+                    </div>
+                    <ul class="flex flex-col gap-3 ps-3 border-s-2 border-muted-200 dark:border-muted-700">
+                        <li v-for="user in (group.users as GoalUser[])" :key="user.id" class="flex flex-col gap-1">
+                            <div class="flex flex-wrap items-baseline justify-between gap-x-3 text-sm">
+                                <span class="text-muted-700 dark:text-muted-200">
+                                    {{ user.username }}
+                                    <span v-if="user.deleted" class="text-muted-400 text-xs">(удалён)</span>
+                                </span>
+                                <span class="text-muted-600 dark:text-muted-300">
+                                    <template v-if="progressOf(user.total_budget, goalOf(user.objectives)).plan">
+                                        {{ formatSum(user.total_budget) }} из {{ formatSum(goalOf(user.objectives)) }} · {{ progressOf(user.total_budget, goalOf(user.objectives)).percent }}%
+                                    </template>
+                                    <template v-else>{{ formatSum(user.total_budget) }} · цель не задана</template>
+                                </span>
+                            </div>
+                            <div class="h-2 rounded-full bg-muted-200 dark:bg-muted-800 overflow-hidden">
+                                <div class="h-full rounded-full transition-[width] duration-500" :class="progressOf(user.total_budget, goalOf(user.objectives)).color" :style="{ width: progressOf(user.total_budget, goalOf(user.objectives)).width + '%' }"></div>
+                            </div>
                         </li>
                     </ul>
                 </li>
             </ul>
-            <p v-else class="text-amber-500 text-sm mt-2">
+            <p v-else class="text-amber-500 text-sm">
                 <Icon name="ph:warning" />
                 Недостаточно данных для отображения
             </p>
         </div>
     </div>
 </template>
-
-<style scoped>
-
-.progress {
-    --color: white;
-    @apply relative;
-}
-
-.progress[value]::-webkit-progress-bar {
-    @apply bg-muted-200 rounded-sm h-6 dark:bg-muted-800;
-}
-
-.progress[value]::-webkit-progress-value {
-    @apply bg-primary-300 rounded-sm h-6;
-}
-
-.progress:before {
-    content: attr(data-budget);
-    position: absolute;
-    padding: 0 0.4rem;
-    top: 50%;
-    transform: translateY(-30%);
-    font-size: 0.875rem;
-    color: var(--color);
-}
-
-</style>

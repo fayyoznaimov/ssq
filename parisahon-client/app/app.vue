@@ -21,6 +21,20 @@ useHead({
 
 <style>
 :root {
+    /* The primary tones of Tailwind (nuxt.config.ts): "r g b". The light theme is the brand teal */
+    --color-primary-50: 236 253 249;
+    --color-primary-100: 204 245 236;
+    --color-primary-200: 8 176 156;
+    --color-primary-300: 6 132 116;
+    --color-primary-400: 4 87 77;
+    --color-primary-500: 2 43 38;
+    --color-primary-600: 2 39 34;
+    --color-primary-700: 2 34 30;
+    --color-primary-800: 1 30 27;
+    --color-primary-900: 1 26 23;
+    --color-primary-950: 1 17 15;
+    --color-primary-invert: 255 255 255;
+
     --primary-200: 8, 176, 156;
     --primary-300: 6, 132, 116;
     --primary-400: 4, 87, 77;
@@ -81,7 +95,7 @@ useHead({
     --dp-hover-text-color: var(--slate-900);
     --dp-hover-icon-color: var(--slate-700);
     --dp-primary-color: rgb(var(--primary-400));
-    --dp-primary-disabled-color: rgba(var(--primary-600), 0.6)
+    --dp-primary-disabled-color: rgba(var(--primary-600), 0.6);
     --dp-primary-text-color: white;
     --dp-secondary-color: var(--slate-300);
     --dp-border-color: var(--slate-100);
@@ -107,8 +121,8 @@ useHead({
     --dp-hover-color: rgb(var(--primary-300));
     --dp-hover-text-color: white;
     --dp-hover-icon-color: white;
-    --dp-primary-color: rgb(var(--primary-400));
-    --dp-primary-disabled-color: rgba(var(--primary-600), 0.6)
+    --dp-primary-color: rgb(var(--primary-300));
+    --dp-primary-disabled-color: rgba(var(--primary-600), 0.6);
     --dp-primary-text-color: white;
     --dp-secondary-color: var(--slate-300);
     --dp-border-color: var(--slate-700);
@@ -116,6 +130,18 @@ useHead({
 }
 
 :root.dark {
+    /*
+     * The dark theme: the dark teal (#022b26) was almost the colour of the page (1.2:1).
+     * 500 — a solid button with dark text (5.6:1), 6.5:1 to the page; 600 — links (5.9:1 on a card);
+     * 200 / 300 — light text and links (9.9:1 / 7.9:1); 400 — bars, avatars and badges with white text (4.8:1)
+     */
+    --color-primary-200: 94 234 212;
+    --color-primary-300: 45 212 191;
+    --color-primary-400: 17 128 111;
+    --color-primary-500: 8 176 156;
+    --color-primary-600: 20 184 166;
+    --color-primary-invert: 2 43 38;
+
     /* FullCalendar */
     --fc-harness-bg-color: var(--slate-800);
     --fc-border-color: var(--slate-700);
@@ -236,6 +262,14 @@ useHead({
 }
 
 .fc-event-future {
-    @apply bg-primary-400 hover:bg-primary-500 text-white hover:dark:bg-primary-300;
+    @apply bg-primary-400 hover:bg-primary-500 text-white dark:hover:bg-primary-400 dark:hover:brightness-110;
+}
+
+/*
+ * The chosen button of a group of toggles («Все | Активные | Закрытые», «По неделям», periods):
+ * the primary colour and bold text, the others stay neutral (it used to be a slightly lighter grey)
+ */
+.toggle-selected {
+    @apply !bg-primary-500 !border-primary-500 !text-primary-invert font-semibold;
 }
 </style>

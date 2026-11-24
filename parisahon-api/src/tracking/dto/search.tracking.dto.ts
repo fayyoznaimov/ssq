@@ -33,4 +33,13 @@ export class SearchTrackingDto extends PaginationRequestDto {
   @IsOptional()
   @IsNumberString()
   deal_id: number;
+
+  // what is about one client: a company, a contact (event.company_id / contact_id, DB-9)
+  @IsOptional()
+  @IsNumberString()
+  company_id: number;
+
+  @IsOptional()
+  @IsNumberString()
+  contact_id: number;
 }

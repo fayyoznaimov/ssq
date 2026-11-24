@@ -17,7 +17,7 @@ test('token: everything but /health needs X-WhatsApp-Service-Token', async (t) =
   const h = await harness(t)
   assert.deepEqual(await h.api('GET', '/health', undefined, null), {
     status: 200,
-    body: { ok: true, sessions: 0, connected: 0, states: {}, problems: [], inbox: 0, outbox: 0, outbox_oldest_sec: 0, rejected: 0 },
+    body: { ok: true, sessions: 0, connected: 0, states: {}, problems: [], inbox: 0, ffmpeg: null, outbox: 0, outbox_oldest_sec: 0, rejected: 0 },
   })
   for (const [m, u] of [['GET', '/sessions'], ['GET', '/sessions/1'], ['POST', '/sessions/1/start'], ['DELETE', '/sessions/1'], ['POST', '/send'], ['GET', '/nope']]) {
     assert.equal((await h.api(m, u, undefined, null)).status, 401, `${m} ${u} without token`)
@@ -128,7 +128,7 @@ test('stored sessions are restored at start', async (t) => {
 test('POST /send: errors', async (t) => {
   const h = await harness(t)
   let r = await h.api('POST', '/send', { user_id: 5, to_phone: '+998907654321', text: 'hi' })
-  assert.deepEqual(r, { status: 400, body: { error: 'not connected', message: 'Ваш WhatsApp не подключён (Профиль → WhatsApp)' } })
+  assert.deepEqual(r, { status: 400, body: { error: 'not connected', message: 'Ваш WhatsApp не подключён к CRM: подключите его в разделе «WhatsApp» и отправьте ещё раз' } })
   await connected(h)
   r = await h.api('POST', '/send', { user_id: 5, text: 'hi' })
   assert.deepEqual([r.status, r.body.error], [400, 'no recipient'])

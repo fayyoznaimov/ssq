@@ -5,11 +5,11 @@
                 <h2 class="uppercase text-xs font-semibold">{{ props.stageName }}</h2>
                 <!-- the totals of the whole column (the server counts them), not of the cards loaded -->
                 <span class="text-sm text-muted-700 dark:text-muted-400">
-                    {{ count }} сделок:
+                    {{ countOf(count, 'сделка', 'сделки', 'сделок') }}:
                     <Money :value="columnBudget" />
                 </span>
                 <span v-if="props.closedSince" class="text-xs text-muted-500 dark:text-muted-400">
-                    закрытые с {{ moment(props.closedSince).format('DD.MM.YYYY') }}
+                    закрытые с {{ formatDay(props.closedSince) }}
                 </span>
             </div>
             <hr class="border-2" :style="{borderColor: props.stage.color }">
@@ -49,17 +49,18 @@ const dragOptions = {
     ghostClass: 'ghost',
 };
 
-import moment from 'moment';
 import Draggable from 'vuedraggable';
 
 import AddDealCard from '~/components/common/AddDealCard.vue';
 import CardDeal from '~/components/common/CardDeal.vue';
 import Money from '~/components/common/Money.vue';
+import { countOf, formatDay } from '~/utils/format';
 import { useAsync } from '~/composables/useAsync';
 import {useService} from '~/composables/useService';
 import type { Deal } from '~/types/deal';
 import type { Stage } from '~/types/stage';
 import { promiseResult } from '~/utils/result';
+import { askLostReason, isLostStage } from '~/components/history/lostReason';
 
 const { runAsync: patchAsync } = useAsync();
 const props = withDefaults(defineProps<{
@@ -106,6 +107,11 @@ async function changeStage(event: Record<string, any>) {
             return toast.show({message: result.error.message, timeout: 3000, type: 'error'});
         }
         emits('stage:patched', { id, stage: props.stage });
+        // dropped into «Закрыто и не реализовано»: why (DEAL-11), saved by the modal of the board page
+        if (isLostStage(props.stage)) {
+            const card = event.added.element as Deal;
+            askLostReason({ deal: { id, display_id: card.display_id, label: card.label } });
+        }
     }
 }
 

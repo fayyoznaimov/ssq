@@ -1,15 +1,75 @@
 <template>
-    <!-- no column gaps below lg: 11 gaps of 2rem were wider than a phone and pushed the card off the right edge -->
-    <div class="grid grid-cols-12 gap-x-0 gap-y-6 lg:gap-8 px-4 lg:px-10 lg:h-[calc(100vh-6.4rem)]">
-        <!-- novalidate: the form checks itself (validate() in onSubmit: the toast names the fields, the
-             first wrong one gets the cursor); the browser's own check of `required` stopped the submit
-             before it and showed only its bubble -->
-        <form
-            ref="formRef"
-            class="col-span-12 lg:col-span-4 rounded-md"
-            novalidate
-            @submit.prevent="onSubmit"
+    <div class="flex flex-col gap-4 px-4 lg:px-10 lg:h-[calc(100vh-6.4rem)]">
+        <!-- the head of a saved company: who it is, who leads it, how to reach it, what is next -->
+        <BaseCard
+            v-if="!isAdd && company.id"
+            class="shrink-0 flex flex-col gap-2 p-4 lg:flex-row lg:items-center lg:justify-between"
         >
+            <div class="flex items-start gap-3 min-w-0">
+                <NuxtLink
+                    to="/lists/companies"
+                    class="lg:hidden mt-0.5 shrink-0 text-muted-500 hover:text-primary-500"
+                    title="К списку компаний"
+                >
+                    <Icon
+                        name="ph:arrow-left"
+                        class="size-5"
+                    />
+                </NuxtLink>
+                <div class="min-w-0">
+                    <h1 class="text-lg font-semibold text-muted-800 dark:text-white break-words">
+                        {{ company.name }}
+                    </h1>
+                    <p class="text-xs text-muted-500 dark:text-muted-400">
+                        {{ headline }}
+                    </p>
+                </div>
+            </div>
+            <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+                <a
+                    v-if="company.phone"
+                    :href="`tel:${telOf(company.phone)}`"
+                    class="inline-flex items-center gap-1 text-primary-600 hover:underline dark:text-primary-300"
+                >
+                    <Icon
+                        name="ph:phone"
+                        class="size-4"
+                    />{{ company.phone }}
+                </a>
+                <a
+                    v-if="company.email"
+                    :href="`mailto:${company.email}`"
+                    class="inline-flex items-center gap-1 text-primary-600 hover:underline dark:text-primary-300 break-all"
+                >
+                    <Icon
+                        name="ph:envelope"
+                        class="size-4"
+                    />{{ company.email }}
+                </a>
+                <span
+                    v-if="summary?.next_task"
+                    class="inline-flex items-center gap-1 text-muted-600 dark:text-muted-300"
+                >
+                    <Icon
+                        name="ph:calendar-check"
+                        class="size-4"
+                    />{{ nextTaskText }}
+                </span>
+            </div>
+        </BaseCard>
+        <!-- no column gaps below lg: 11 gaps of 2rem were wider than a phone and pushed the card off the right edge -->
+        <div class="grid grid-cols-12 gap-x-0 gap-y-6 lg:gap-8 lg:flex-1 lg:min-h-0">
+            <!-- novalidate: the form checks itself (validate() in onSubmit: the toast names the fields, the
+                 first wrong one gets the cursor); the browser's own check of `required` stopped the submit
+                 before it and showed only its bubble. It scrolls by itself on a computer, so «Сохранить» is in
+                 reach; on a phone a saved company shows the feed first (history and reply), the form below. -->
+            <form
+                ref="formRef"
+                class="company-card col-span-12 lg:col-span-4 rounded-md lg:h-full lg:overflow-y-auto lg:pe-2"
+                :class="isAdd ? '' : 'order-2 lg:order-none'"
+                novalidate
+                @submit.prevent="onSubmit"
+            >
             <BaseTabs
                 v-model="activeTab"
                 :tabs
@@ -20,10 +80,23 @@
                         v-if="activeValue === 'general'"
                         class="max-w-sm flex flex-col gap-3"
                     >
+                        <!-- a new company starts from a photo; a saved one has it a click away -->
                         <CardRecognition
+                            v-if="isAdd || showRecognition"
                             :company-id="company.id"
                             @recognized="onRecognized"
                         />
+                        <button
+                            v-else
+                            type="button"
+                            class="self-start inline-flex items-center gap-1 text-xs text-muted-500 underline underline-offset-2 hover:text-primary-500 dark:text-muted-400"
+                            @click="showRecognition = true"
+                        >
+                            <Icon
+                                name="ph:camera"
+                                class="size-4"
+                            /> Обновить по фото карточки или визитки
+                        </button>
                         <BaseInput
                             v-model="company.name"
                             type="text"
@@ -60,7 +133,9 @@
                             @input="(e: Event) => onChange('email', (e.target as HTMLInputElement).value)"
                         />
                         <p v-if="company.email_from_contact" class="-mt-2 text-xs text-muted-500">Почта основного контакта ({{ company.email_from_contact }}); сохранится как почта компании.</p>
+                        <!-- mounted with the loaded company: it asks only when a field is changed -->
                         <SimilarClients
+                            v-if="isAdd || company.id"
                             :name="company.name"
                             :phone="company.phone"
                             :email="company.email"
@@ -142,6 +217,12 @@
                         v-if="activeValue === 'deals'"
                         :company-id="company.id"
                     />
+                    <!--  HISTORY: who changed what in the company and its deals (the journal of changes)  -->
+                    <CardHistory
+                        v-if="activeValue === 'history' && company.id"
+                        scope="company"
+                        :id="company.id"
+                    />
                     <!--  SETTINGS  -->
                     <!--  kept alive, so the open field and the ids of new fields survive a tab switch  -->
                     <KeepAlive>
@@ -156,22 +237,8 @@
                 </template>
             </BaseTabs>
 
-            <!--  ACTIONS  -->
-            <div class="flex flex-col gap-2 mt-10">
-                <Can
-                    I="delete"
-                    a="Company"
-                >
-                    <BaseButton
-                        v-if="company.id"
-                        color="danger"
-                        :loading="isLoadingMap.delete"
-                        :disabled="isLoadingMap.delete"
-                        @click="onDelete"
-                    >
-                        Удалить компанию
-                    </BaseButton>
-                </Can>
+            <!--  ACTIONS: «Сохранить» first; «Удалить» apart, small, and it asks  -->
+            <div class="flex flex-col gap-2 mt-10 mb-4">
                 <Can
                     v-if="!companyLoading"
                     :I="company.id ? 'update' : 'create'"
@@ -179,6 +246,7 @@
                 >
                     <BaseButton
                         color="primary"
+                        variant="solid"
                         type="submit"
                         :disabled="isLoadingMap.save"
                         :loading="isLoadingMap.save"
@@ -186,9 +254,42 @@
                         {{ isAdd ? "Добавить компанию" : "Сохранить компанию" }}
                     </BaseButton>
                 </Can>
+                <Can
+                    I="delete"
+                    a="Company"
+                >
+                    <div
+                        v-if="company.id"
+                        class="mt-6 flex justify-end border-t border-muted-200 pt-4 dark:border-muted-700"
+                    >
+                        <BaseButton
+                            size="sm"
+                            variant="pastel"
+                            color="danger"
+                            :loading="isLoadingMap.delete"
+                            :disabled="isLoadingMap.delete"
+                            @click="onDelete"
+                        >
+                            <Icon
+                                name="ph:trash"
+                                class="size-4 me-1"
+                            /> Удалить компанию
+                        </BaseButton>
+                    </div>
+                </Can>
             </div>
-        </form>
-        <CompanyFeed :company="company" />
+            </form>
+            <CompanyFeed
+                :company="company"
+                :class="isAdd ? '' : 'order-1 lg:order-none'"
+            />
+        </div>
+        <Confirmation
+            id="DeleteCompanyConfirmation"
+            title="Удалить компанию?"
+            description=""
+            :on-confirm="removeCompany"
+        />
     </div>
 </template>
 
@@ -196,9 +297,13 @@
 import SimilarClients from '~/components/company/SimilarClients.vue';
 import { Can } from "@casl/vue";
 
+import Confirmation from "~/components/common/Confirmation.vue";
+import { useRecordTitle } from "~/components/company/recordTitle";
+
 import CardRecognition, { type RecognitionResult } from "~/components/company/CardRecognition.vue";
 import CompanyDeals from "~/components/company/CompanyDeals.vue";
 import CompanyFeed from "~/components/company/CompanyFeed.vue";
+import CardHistory from "~/components/audit/CardHistory.vue";
 import CompanyFillersSettings from "~/components/company/CompanyFillersSettings.vue";
 import CompanySources from "~/components/company/CompanySources.vue";
 import CtrAgentForm from "~/components/company/CtrAgentForm.vue";
@@ -236,6 +341,8 @@ const userService = useService("users", { auth: true });
 const fillersService = useService("fillers", { auth: true });
 
 const activeTab = ref("general");
+const showRecognition = ref(false);
+const deleteConfirmation = useModal("DeleteCompanyConfirmation");
 
 const {
     data: company,
@@ -447,11 +554,17 @@ async function onSubmit() {
             timeout: 3000,
         });
     }
-    navigateTo("/lists/companies");
+    // stay in the card: a new company opens as itself, a saved one is read again (new contacts get ids)
+    toast.show({ message: isAdd ? "Компания добавлена" : "Сохранено", type: "success", timeout: 2500 });
+    if (isAdd) {
+        const created = result.value as Company;
+        return navigateTo(created?.id ? `/lists/companies/${created.id}` : "/lists/companies", { replace: true });
+    }
+    await loadCompany();
 }
 
 async function onDelete() {
-    // one click used to delete the client: say what goes with it, and ask
+    // one click used to delete the client: say what goes with it, and ask (the dialog of the CRM)
     const deals = await promiseResult(companiesService.get(`${company.value.id}/deals`).exec());
     const dealCount = deals.ok && Array.isArray(deals.value) ? deals.value.length : null;
     const contactCount = company.value.users?.length ?? 0;
@@ -459,18 +572,52 @@ async function onDelete() {
         `контактов: ${contactCount}`,
         dealCount === null ? null : `сделок: ${dealCount}`,
     ].filter(Boolean).join(", ");
-    if (!confirm(`Удалить компанию «${company.value.name}»? У неё ${parts}. Компания пропадёт из списков, её сделки останутся без компании. Вернуть её сможет администратор или руководитель (Компании → Удалённые).`)) return;
+    deleteConfirmation.open({
+        description: `Компания «${company.value.name}» (${parts}) пропадёт из списков; её сделки и история останутся. Вернуть её сможет администратор или руководитель: Компании → Удалённые.`,
+    });
+}
 
-    const result = await promiseResult(
-        runWithId(companiesService.remove(company.value.id).exec(), "delete")
-    );
-    if (!result.ok)
-        return toast.show({
-            message: result.error.message,
-            type: "error",
-            timeout: 3000,
-        });
+async function removeCompany() {
+    await runWithId(companiesService.remove(company.value.id).exec(), "delete");
+    toast.show({ message: "Компания удалена", type: "success", timeout: 2500 });
     navigateTo("/lists/companies");
+}
+
+// ---------------------------------------------------------------- the head of the card
+type CardSummary = {
+    deal_count: number;
+    open_deal_count: number;
+    agent: { id: number; username: string } | null;
+    last_activity_at: string | null;
+    next_task: { id: number; label: string; start_time: string | null } | null;
+};
+const summary = computed(() => (company.value as any).summary as CardSummary | undefined);
+const shortDate = (value: string | null | undefined) => value
+    ? new Date(value).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })
+    : "";
+const headline = computed(() => {
+    const s = summary.value;
+    const parts = [company.value.is_old ? "Старый клиент" : "Новый клиент"];
+    if (s?.agent) parts.push(`ведёт ${s.agent.username}`);
+    if (s) parts.push(s.deal_count ? `сделок открыто ${s.open_deal_count} из ${s.deal_count}` : "сделок нет");
+    if (s?.last_activity_at) parts.push(`последняя активность ${shortDate(s.last_activity_at)}`);
+    return parts.join(" · ");
+});
+const nextTaskText = computed(() => {
+    const task = summary.value?.next_task;
+    if (!task) return "";
+    return `${task.start_time ? shortDate(task.start_time) + " — " : ""}${task.label}`;
+});
+// tel: takes the digits and «+» only
+const telOf = (phone: string) => String(phone).replace(/[^\d+]/g, "");
+
+useRecordTitle(computed(() => (isAdd ? null : company.value.name)), isAdd ? "Новая компания" : "Компания");
+
+async function loadCompany() {
+    await runCompany(companiesService.get(route.params.id as string).exec());
+    applyCtrAgents(company.value.users);
+    ctrAgentsStore.primaryContactId = (company.value as any).primary_contact_id ?? null;
+    applyCompanyFillers();
 }
 
 // TODO: fix validation
@@ -536,6 +683,7 @@ const tabs = computed(() => {
         generalTabs.push({ label: "Сделки", value: "deals", order: 2.7 });
         generalTabs.push({ label: "Файлы", value: "files", order: 3 });
         generalTabs.push({ label: "Звонки", value: "recordings", order: 4 });
+        generalTabs.push({ label: "История", value: "history", order: 4.5 });
     }
 
     return generalTabs.sort((a, b) => a.order - b.order);
@@ -584,11 +732,20 @@ onMounted(async () => {
 definePageMeta({
     authRoute: true,
     layout: "no-min-height",
-    verbose: "Редактировать компанию",
+    verbose: "Компания",
     verboseNew: "Новая компания",
 });
-
-useHead({
-    title: isAdd ? "Новая компания" : "Редактировать компанию",
-});
 </script>
+
+<style scoped>
+/* the tabs in one row that scrolls sideways (7 tabs wrapped into 3 rows in the narrow column) */
+.company-card :deep(.nui-tabs-inner) {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: thin;
+}
+.company-card :deep(.nui-tabs-inner > a) {
+    flex-shrink: 0;
+    white-space: nowrap;
+}
+</style>

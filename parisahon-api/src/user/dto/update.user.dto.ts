@@ -34,8 +34,8 @@ export class UpdateUserDto extends LoginUserDto {
   role: RoleEnum;
 
   @Trim()
-  @IsString()
-  @Length(2, 255)
+  @IsString({ message: 'Имя: текст' })
+  @Length(2, 255, { message: 'Имя: от 2 до 255 символов' })
   username: string;
 
   // a contact's e-mail can be cleared ("" = none); staff accounts still need one (LoginUserDto)
@@ -115,4 +115,10 @@ export class UpdateOwnProfileDto {
   @IsString()
   @IsPhoneLike()
   phone?: string | null;
+}
+
+/** Body of POST /users/:id/merge: the contact merged into :id (it is deleted after the merge). */
+export class MergeContactsDto {
+  @IsInt({ message: 'from_id: номер контакта, который присоединить' })
+  from_id: number;
 }

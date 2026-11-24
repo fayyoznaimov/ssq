@@ -99,6 +99,16 @@ export class CreateTaskDto {
 
   @IsBoolean()
   allDay: boolean;
+
+  /** The deadline is in the past on purpose (the task is already done, or a backdated one): see TASK_IN_PAST. */
+  @IsOptional()
+  @IsBoolean()
+  allow_past?: boolean;
+
+  /** Create it although the deal has an open task within ±15 minutes: see TASK_DUPLICATE. */
+  @IsOptional()
+  @IsBoolean()
+  allow_duplicate?: boolean;
 }
 
 /**
@@ -140,4 +150,14 @@ export class UpdateTaskDto {
   @IsOptional()
   @IsBoolean()
   allDay?: boolean;
+
+  /** A new time in the past on purpose (TASK_IN_PAST). */
+  @IsOptional()
+  @IsBoolean()
+  allow_past?: boolean;
+
+  /** A new time or deal next to another open task of the deal on purpose (TASK_DUPLICATE). */
+  @IsOptional()
+  @IsBoolean()
+  allow_duplicate?: boolean;
 }

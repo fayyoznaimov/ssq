@@ -3,7 +3,7 @@
         <div>
             <h1 class="text-xl">Файлы</h1>
             <!-- the API lists an agent's files only: of the deals they may see, their own uploads, mail attachments with the mail switch -->
-            <h2 class="text-sm text-gray-500">{{ limited ? 'Файлы доступных вам сделок и ваши загрузки' : 'Список файлов' }}</h2>
+            <h2 class="text-sm text-gray-500">{{ limited ? 'Файлы доступных вам сделок и ваши загрузки' : 'Всего: ' + formatNumber(files.count ?? 0, 0, '0') }}</h2>
         </div>
         <div class="flex flex-wrap gap-5 justify-between">
             <div class="flex items-center gap-4">
@@ -83,17 +83,25 @@
                 id="files"
             >
                 <template #name="{item}: {item: MyFile}">
-                    <div class="flex items-center justify-between">
-                        <span>{{ item.name }}</span>
-                        <BaseButtonIcon size="sm" @click="download(item)" :disabled="isLoadingMap[item.id]">
+                    <div class="flex items-center justify-between gap-2 min-w-0">
+                        <div class="flex items-center gap-2 min-w-0">
+                            <Icon :name="iconOf(item)" class="size-5 shrink-0 text-muted-500" />
+                            <div class="flex flex-col min-w-0">
+                                <a :href="uploadUrl(item.path)" target="_blank" rel="noopener" class="truncate hover:underline" :title="item.name">{{ titleOf(item) }}</a>
+                                <span class="text-xs text-muted-400 truncate">{{ sourceOf(item) }} · {{ sizeOf(item) }}</span>
+                            </div>
+                        </div>
+                        <BaseButtonIcon size="sm" class="shrink-0" @click="download(item)" :disabled="isLoadingMap[item.id]" aria-label="Скачать">
                             <Icon v-if="isLoadingMap[item.id]" name="lucide:loader-circle" class="animate-spin"/>
                             <Icon v-else name="ph:download-simple" />
                         </BaseButtonIcon>
                     </div>
                 </template>
                 <template #entities="{item}: {item: MyFile}">
-                    <div class="flex gap-1">
-                        <NuxtLink v-for="deal in item.deals" :href="'/deals/' + deal.id" class="underline">{{ deal.label }}</NuxtLink>
+                    <div class="flex flex-col gap-0.5">
+                        <NuxtLink v-for="deal in dealsOf(item)" :key="deal.id" :to="'/deals/' + deal.id" class="underline truncate">{{ deal.label }}</NuxtLink>
+                        <NuxtLink v-if="item.message?.client" :to="'/lists/contacts/' + item.message.client.id" class="text-muted-500 hover:underline truncate">{{ item.message.client.username }}</NuxtLink>
+                        <span v-if="!dealsOf(item).length && !item.message?.client" class="text-muted-400">—</span>
                     </div>
                 </template>
             </BaseTable>
@@ -126,7 +134,8 @@ import type { MyFile } from '~/types/file';
 import moment from 'moment';
 import { UserRole, type User } from '~/types/user';
 import { Unit, toBytes } from '~/utils/byte';
-import { downloadFile, uploadUrl } from '~/utils/files';
+import { downloadFile, getFileIcon, uploadUrl } from '~/utils/files';
+import { formatDateTime, formatNumber } from '~/utils/format';
 import { promiseResult } from '~/utils/result';
 
 definePageMeta({
@@ -236,64 +245,106 @@ const fileSources = [
     },
 ]
 
+const SOURCES: Record<string, string> = {
+    [FileSource.FromEmails]: 'Почта',
+    [FileSource.FromComments]: 'Комментарий',
+    [FileSource.FromFilesTab]: 'Вкладка файлов',
+    [FileSource.FromMessages]: 'Сообщение',
+};
+
+// the history row that holds the file says more than «Сообщение»: which messenger
+const MESSAGE_KINDS: Record<number, string> = { 12: 'Telegram', 16: 'WhatsApp', 5: 'Комментарий' };
+
+function sourceOf(item: MyFile) {
+    const kind = item.message ? MESSAGE_KINDS[item.message.type] : undefined;
+    if (kind && item.from !== FileSource.FromEmails) return kind;
+    return SOURCES[item.from] ?? '—';
+}
+
+/** «Голосовое · Akbar · 21 нояб. 2026, 18:36» for the files a messenger names "voice_message", "Photo"... */
+const GENERIC_NAMES: Record<string, string> = {
+    voice_message: 'Голосовое', voice: 'Голосовое', photo: 'Фото', video_note: 'Видеосообщение',
+    video: 'Видео', audio: 'Аудио', sticker: 'Стикер', document: 'Документ', animation: 'Анимация',
+};
+function titleOf(item: MyFile) {
+    const generic = GENERIC_NAMES[String(item.name ?? '').trim().toLowerCase()];
+    if (!generic) return item.name || 'Файл';
+    const who = item.message?.client?.username || item.uploaded_by?.username;
+    return [generic, who, formatDateTime(item.message?.at || item.created_at)].filter(Boolean).join(' · ');
+}
+
+function iconOf(item: MyFile) {
+    const ext = String(item.extension || '').toLowerCase();
+    const name = String(item.name || '').toLowerCase();
+    if (/^\.(jpe?g|png|gif|webp|heic|bmp)$/.test(ext) || name === 'photo') return 'ph:image';
+    if (/^\.(mp3|ogg|oga|opus|m4a|wav|amr|aac)$/.test(ext) || name.startsWith('voice')) return 'ph:microphone';
+    if (/^\.(mp4|webm|mov|mkv|3gp)$/.test(ext) || name.startsWith('video')) return 'ph:video';
+    return getFileIcon(ext ? 'file' + ext : '');
+}
+
+function sizeOf(item: MyFile) {
+    const n = Number(item.size);
+    return n > 0 ? formatBytes(n) : '—';
+}
+
+function dealsOf(item: MyFile) {
+    const deals: { id: number; label: string }[] = [...(item.deals ?? [])];
+    const fromMessage = item.message?.deal;
+    if (fromMessage && !deals.some((d) => d.id === fromMessage.id)) deals.push(fromMessage);
+    return deals;
+}
+
+// the date second, the client and the deal next to it; the name no longer takes half the screen
 const columns: Column[] = [
     {
         label: 'Имя',
         name: 'name',
         headerStyle: {
-            width: '500px',
-            minWidth: '200px'
+            width: '320px',
+            minWidth: '220px'
         },
         resizable: true,
     },
     {
-        label: 'Владелец',
-        name: 'uploaded_by',
+        label: 'Дата',
+        name: 'created_at',
         resizable: true,
-        field(item) {
-            return item.uploaded_by?.username || 'Неизвестно';
+        field(item: MyFile) {
+            return formatDateTime(item.message?.at || item.created_at);
         }
+    },
+    {
+        label: 'Клиент / сделка',
+        name: 'entities',
+        resizable: true,
     },
     {
         label: 'Источник',
         name: 'from',
         resizable: true,
-        field(item: MyFile) {
-            let out = 'Неизвестно';
-            if (item.from === FileSource.FromEmails) out = 'Почта';
-            if (item.from === FileSource.FromComments) out = 'Комментарий';
-            if (item.from === FileSource.FromFilesTab) out = 'Вкладка файлов';
-            if (item.from === FileSource.FromMessages) out = 'Сообщение';
-
-            return out;
-        }
+        field: sourceOf,
     },
     {
-        label: 'Связанные сущности',
-        name: 'entities',
+        label: 'Кто загрузил',
+        name: 'uploaded_by',
         resizable: true,
-    },
-    {
-        label: 'Тип',
-        name: 'extension',
-        resizable: true,
-        field(item: MyFile) {
-            return item.extension || 'Неизвестно';
+        field(item) {
+            return item.uploaded_by?.username || '—';
         }
     },
     {
         label: 'Размер',
         name: 'size',
         resizable: true,
-        field(item: MyFile) {
-            return formatBytes(Number(item.size));
-        }
+        field: sizeOf,
     },
     {
-
-        label: 'Дата создания',
-        name: 'created_at',
-        dateFormat: 'MMM Do, HH:mm'
+        label: 'Тип',
+        name: 'extension',
+        resizable: true,
+        field(item: MyFile) {
+            return item.extension ? item.extension.replace(/^\./, '').toUpperCase() : '—';
+        }
     },
 ];
 

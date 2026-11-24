@@ -28,13 +28,13 @@ export class CreateCompanyFillerDto implements ChildFiller {
  */
 export class CompanyContactDto {
   @Trim()
-  @IsString()
-  @Length(2, 255)
+  @IsString({ message: 'Имя контакта: текст' })
+  @Length(2, 255, { message: 'Имя контакта: от 2 до 255 символов' })
   username: string;
 
   @EmptyToUndefined()
   @IsOptional()
-  @IsEmail()
+  @IsEmail({}, { message: 'Неверный формат почты' })
   @Length(3, 255)
   email?: string;
 
@@ -49,8 +49,8 @@ export class CompanyContactDto {
 
 export class CreateCompanyDto extends CompanyRequisitesDto {
   @Trim()
-  @IsString()
-  @Length(3, 255)
+  @IsString({ message: 'Название компании: текст' })
+  @Length(3, 255, { message: 'Название компании: от 3 до 255 символов' })
   name: string;
 
   @IsBoolean()
@@ -60,7 +60,7 @@ export class CreateCompanyDto extends CompanyRequisitesDto {
   @EmptyToUndefined()
   @IsOptional()
   @IsString()
-  @IsEmail()
+  @IsEmail({}, { message: 'Неверный формат почты' })
   @Length(3, 255)
   email: string;
 

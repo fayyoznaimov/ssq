@@ -87,6 +87,11 @@ function release(): void {
   if (next) next();
 }
 
+/** How busy the CLI is: the AI queue (src/ai) starts background work only while a slot stays free for people. */
+export function claudeCliLoad(): { running: number; waiting: number; max: number } {
+  return { running, waiting: queue.length, max: MAX_PARALLEL };
+}
+
 @Injectable()
 export class ClaudeCliClient {
   private readonly bin = process.env.CLAUDE_BIN || 'claude';

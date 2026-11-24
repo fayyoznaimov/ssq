@@ -9,7 +9,7 @@
                     <ClientParts :deal="item" class="mt-0.5 block text-xs" />
                 </template>
             </NuxtLink>
-            <span class="shrink-0 text-muted-600 text-xs dark:text-muted-400">{{ moment(item?.created_at).format('DD.MM.YY') }}</span>
+            <span class="shrink-0 text-muted-600 text-xs dark:text-muted-400" :title="'Создана ' + formatDateTime(item?.created_at)">{{ formatDay(item?.created_at) }}</span>
         </div>
         <div class="mt-1.5 flex items-center justify-between gap-2">
             <Money
@@ -24,7 +24,7 @@
 </template>
 
 <script setup lang="ts">
-import moment from 'moment';
+import { formatDateTime, formatDay } from '~/utils/format';
 
 import Money from '~/components/common/Money.vue';
 import ClientParts, { isClientLabel } from '~/components/deal/ClientParts.vue';
