@@ -192,6 +192,11 @@ DELETE FROM deal WHERE id IN (SELECT id FROM _d);
 DELETE FROM user_filler WHERE user_id IN (SELECT id FROM _u);
 DELETE FROM company_filler WHERE company_id IN (SELECT id FROM _c);
 DELETE FROM product_filler WHERE product_id IN (SELECT id FROM _p);
+-- the values of the set's fields first: a field with values is not deleted by the database (ON DELETE RESTRICT)
+DELETE FROM company_filler WHERE filler_id IN (SELECT id FROM filler WHERE field LIKE 'AUDIT-%');
+DELETE FROM user_filler WHERE filler_id IN (SELECT id FROM filler WHERE field LIKE 'AUDIT-%');
+DELETE FROM deal_filler WHERE filler_id IN (SELECT id FROM filler WHERE field LIKE 'AUDIT-%');
+DELETE FROM product_filler WHERE filler_id IN (SELECT id FROM filler WHERE field LIKE 'AUDIT-%');
 DELETE FROM filler WHERE field LIKE 'AUDIT-%';
 DELETE FROM bot_account WHERE user_id IN (SELECT id FROM _u);
 DELETE FROM bot_link_code WHERE user_id IN (SELECT id FROM _u);
@@ -509,8 +514,19 @@ def main():
         check("blanking a required deal field on edit -> 400", status == 400, "%s %s" % (status, message_of((status, body))))
         check("the value is untouched", scalar("SELECT value FROM deal_filler WHERE id = %s" % df_id) == "A")
 
-    # the required fields are gone for the rest of the run
-    sql("DELETE FROM filler WHERE id IN (%d, %d, %d, %d)" % (f_req_co, f_req_user, f_req_prod, f_req_deal))
+    # the required fields are gone for the rest of the run. They have values now (the records created above):
+    # the database refuses a DELETE of such a field (DB-3, ON DELETE RESTRICT), the CRM deletes it with its values
+    req_fields = (f_req_co, f_req_user, f_req_prod, f_req_deal)
+    deleted = [http("DELETE", "/fillers/%d" % f)[0] for f in req_fields]
+    in_list = ", ".join(str(f) for f in req_fields)
+    check("DB-3: DELETE /fillers/:id of the required fields that have values -> 200, the fields and their values are gone",
+          deleted == [200] * 4 and count("SELECT count(*) FROM filler WHERE id IN (%s)" % in_list) == 0
+          and count("SELECT (SELECT count(*) FROM company_filler WHERE filler_id IN ({0})) + (SELECT count(*) FROM user_filler WHERE filler_id IN ({0}))"
+                    " + (SELECT count(*) FROM product_filler WHERE filler_id IN ({0})) + (SELECT count(*) FROM deal_filler WHERE filler_id IN ({0}))"
+                    .format(in_list)) == 0, deleted)
+    if count("SELECT count(*) FROM filler WHERE id IN (%s)" % in_list):  # the API failed: the rest of the run needs them gone
+        sql("".join("DELETE FROM %s WHERE filler_id IN (%s);" % (t, in_list) for t in ("company_filler", "user_filler", "product_filler", "deal_filler"))
+            + "DELETE FROM filler WHERE id IN (%s);" % in_list)
 
     # ================================================================= contacts
     # a local number nobody has (Telegram / WhatsApp / calls compare the last 9 digits): a contact's phone
@@ -1155,7 +1171,11 @@ def main():
     group_active = count(
         "SELECT count(*) FROM task t WHERE t.closed_at IS NULL AND t.end_time >= now() AND t.group_id = %d "
         "AND t.agent_id IS DISTINCT FROM %d AND (t.start_time, t.end_time) OVERLAPS ('%s'::timestamp, '%s 23:59:59'::timestamp) "
-        "AND NOT EXISTS (SELECT 1 FROM deal d WHERE d.id = t.deal_id AND d.deleted_at IS NOT NULL)"
+        "AND NOT EXISTS (SELECT 1 FROM deal d WHERE d.id = t.deal_id AND d.deleted_at IS NOT NULL) "
+        # DB-11: nor of a company or contact in the trash (task/task-shown.ts)
+        "AND (t.deal_id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM company c WHERE c.id = t.company_id AND c.deleted_at IS NOT NULL)) "
+        "AND (t.deal_id IS NOT NULL OR t.company_id IS NOT NULL OR NOT EXISTS "
+        "(SELECT 1 FROM \"user\" u WHERE u.id = t.ctr_agent_id AND u.deleted_at IS NOT NULL))"
         % (group_id, agent["id"], (now - 7 * day).strftime("%Y-%m-%d"), (now + 7 * day).strftime("%Y-%m-%d")))
     check("active_tasks = 1 + the group's open tasks ahead (open, deadline ahead) — was counting closed tasks",
           str(stats.get("active_tasks")) == str(1 + group_active), (stats, group_active))
@@ -1231,8 +1251,111 @@ def main():
     check("client: 'Добавить поле' (a new custom field) is shown to admin only on the contact and product pages",
           contact_vue.count('v-if="currentUser?.role === UserRole.Admin"') >= 1 and product_vue.count('v-if="currentUser?.role === UserRole.Admin"') >= 1)
 
+    db_rules_checks(admin_id, agent["id"], task_type_id, stage_id)
+
     # the records created through the API are removed by cleanup (AUDIT- prefix)
     _ = (new_company, deal_agent)
+
+
+def sql_error(query):
+    """None when the statement runs, the error of the database when it is refused."""
+    try:
+        sql(query)
+        return None
+    except RuntimeError as error:
+        return str(error)
+
+
+def db_rules_checks(admin_id, agent_id, task_type_id, stage_id):
+    """Fix wave 1b, DB-3 / DB-11 / DB-15: what a delete takes with it, the trash of a company, the invariants."""
+    section("A company goes to the trash with its contacts; their tasks hide and come back (DB-11)")
+    tag = P + "-db"
+    co = int(scalar("INSERT INTO company (name, is_old, created_by) VALUES ('%s-co', false, %d) RETURNING id" % (tag, admin_id)))
+    c1 = int(scalar("INSERT INTO \"user\" (username, email, role, company_id) VALUES ('%s-c1', 'audit-mod-db1-%s@example.test', "
+                    "'ctr_agent', %d) RETURNING id" % (tag, RUN, co)))
+    # deleted on its own a day ago: it stays deleted when the company comes back
+    c2 = int(scalar("INSERT INTO \"user\" (username, email, role, company_id, deleted_at) VALUES ('%s-c2', 'audit-mod-db2-%s@example.test', "
+                    "'ctr_agent', %d, now() - interval '1 day') RETURNING id" % (tag, RUN, co)))
+    start = datetime.datetime.now() + datetime.timedelta(days=1)
+
+    def task(label, column, value):
+        return int(scalar(
+            "INSERT INTO task (label, start_time, end_time, type_id, agent_id, \"createdById\", %s) "
+            "VALUES ('%s', '%s', '%s', %d, %d, %d, %d) RETURNING id"
+            % (column, label, ts(start), ts(start + datetime.timedelta(hours=1)), task_type_id, agent_id, admin_id, value)))
+
+    t_co = task("%s-task-co" % tag, "company_id", co)
+    t_c1 = task("%s-task-c1" % tag, "ctr_agent_id", c1)
+
+    def listed():
+        status, body = http("GET", "/tasks?type=all&limit=1000&assigned_to[]=%d" % agent_id)
+        return {t["id"] for t in (body or {}).get("data", [])} if status == 200 else None
+
+    before = listed()
+    check("DB-11: the tasks of a live company and contact are listed", before is not None and {t_co, t_c1} <= before, before)
+    status, body = http("DELETE", "/companies/%d" % co)
+    check("DELETE /companies/:id -> 200", status == 200, "%s %s" % (status, message_of((status, body))))
+    row = sql("SELECT (u.deleted_at = c.deleted_at)::text, coalesce(u.deleted_by, 0) FROM \"user\" u JOIN company c ON c.id = u.company_id "
+              "WHERE u.id = %d" % c1)
+    check("DB-11: its contact went to the trash with it, at the same moment, by who deleted the company",
+          row and row[0][0] == "true" and int(row[0][1]) == admin_id, row)
+    check("DB-11: a contact deleted before keeps its own time",
+          count("SELECT count(*) FROM \"user\" WHERE id = %d AND deleted_at < now() - interval '1 hour'" % c2) == 1)
+    after = listed()
+    check("DB-11: the tasks of the company and of its contact are not listed while they are in the trash",
+          after is not None and not ({t_co, t_c1} & after), after)
+    status, body = http("GET", "/companies/trash?q=%s-co&limit=50" % tag)
+    trashed = [c for c in (body or {}).get("data", []) if c.get("id") == co] if status == 200 else []
+    check("DB-11: the trash says the company has 1 contact (the one deleted with it)",
+          trashed and trashed[0].get("contact_count") == 1, trashed or "%s %s" % (status, message_of((status, body))))
+    status, body = http("PATCH", "/companies/%d/restore" % co, {})
+    check("PATCH /companies/:id/restore -> 200", status == 200, "%s %s" % (status, message_of((status, body))))
+    check("DB-11: its contact is back; the one deleted before is not",
+          count("SELECT count(*) FROM \"user\" WHERE id = %d AND deleted_at IS NULL AND deleted_by IS NULL" % c1) == 1
+          and count("SELECT count(*) FROM \"user\" WHERE id = %d AND deleted_at IS NOT NULL" % c2) == 1)
+    back = listed()
+    check("DB-11: the tasks are listed again", back is not None and {t_co, t_c1} <= back, back)
+
+    section("A delete does not take business data with it (DB-3)")
+    f_co = int(scalar("INSERT INTO filler (target, field) VALUES ('company', '%s-field') RETURNING id" % tag))
+    sql("INSERT INTO company_filler (company_id, filler_id, value) VALUES (%d, %d, 'x')" % (co, f_co))
+    error = sql_error("DELETE FROM filler WHERE id = %d" % f_co)
+    check("DB-3: the database refuses to delete a custom field that has values (was ON DELETE CASCADE)",
+          error and "foreign key" in error and count("SELECT count(*) FROM company_filler WHERE filler_id = %d" % f_co) == 1, error)
+    status, body = http("DELETE", "/fillers/%d" % f_co)
+    check("DB-3: DELETE /fillers/:id (after the web showed how many values go) deletes the field and its values -> 200",
+          status == 200 and count("SELECT count(*) FROM filler WHERE id = %d" % f_co) == 0
+          and count("SELECT count(*) FROM company_filler WHERE filler_id = %d" % f_co) == 0, "%s %s" % (status, message_of((status, body))))
+    status, _ = http("DELETE", "/fillers/%d" % f_co)
+    check("DELETE /fillers/:id of a field that is gone -> 404", status == 404, status)
+
+    gone = int(scalar("INSERT INTO company (name, is_old, created_by) VALUES ('%s-co-gone', false, %d) RETURNING id" % (tag, admin_id)))
+    c3 = int(scalar("INSERT INTO \"user\" (username, role, company_id) VALUES ('%s-c3', 'ctr_agent', %d) RETURNING id" % (tag, gone)))
+    error = sql_error("DELETE FROM company WHERE id = %d" % gone)
+    check("DB-3: a company removed for good leaves its contacts, without a company (was ON DELETE CASCADE)",
+          error is None and count("SELECT count(*) FROM \"user\" WHERE id = %d AND company_id IS NULL" % c3) == 1, error)
+
+    product = int(scalar("INSERT INTO product (name, created_by) VALUES ('%s-prod', %d) RETURNING id" % (tag, admin_id)))
+    deal = int(scalar("INSERT INTO deal (label, display_id, budget, stage_id, created_by) VALUES ('%s-deal', %d, 0, %d, %d) RETURNING id"
+                      % (tag, 900000000 + secrets.randbelow(90000000), stage_id, admin_id)))
+    sql("INSERT INTO deal_product (deal_id, product_id, quantity, price) VALUES (%d, %d, 1, 1)" % (deal, product))
+    error = sql_error("DELETE FROM product WHERE id = %d" % product)
+    check("DB-3: a product in a deal is not removed for good with the deal's line (products are deleted softly)",
+          error and "foreign key" in error and count("SELECT count(*) FROM deal_product WHERE product_id = %d" % product) == 1, error)
+
+    section("The database keeps the invariants (DB-15)")
+    f_tmp = int(scalar("INSERT INTO filler (target, field) VALUES ('company', '%s-field-2') RETURNING id" % tag))
+    error = sql_error("INSERT INTO company_filler (company_id, filler_id, value) VALUES (NULL, %d, 'x')" % f_tmp)
+    check("DB-15: a custom field value without its company is refused (NOT NULL)", error and "null value" in error, error)
+    error = sql_error("INSERT INTO deal_product (deal_id, product_id, quantity, price) VALUES (NULL, %d, 1, 1)" % product)
+    check("DB-15: a product line without its deal is refused (NOT NULL)", error and "null value" in error, error)
+    error = sql_error("INSERT INTO task (label, start_time, end_time, type_id, agent_id) VALUES ('%s-task-bad', now(), now() - interval '1 hour', %d, %d)"
+                      % (tag, task_type_id, agent_id))
+    check("DB-15: a task that ends before it starts is refused (CHK_task_times)", error and "CHK_task_times" in error, error)
+    error = sql_error("INSERT INTO filler (target, field) VALUES ('task', '%s-field-bad')" % tag)
+    check("DB-15: a custom field of an unknown target is refused (CHK_filler_target)", error and "CHK_filler_target" in error, error)
+    error = sql_error("UPDATE \"user\" SET role = 'boss' WHERE id = %d" % c3)
+    check("DB-15: an unknown role is refused (CHK_user_role)", error and "CHK_user_role" in error, error)
 
 
 def run():

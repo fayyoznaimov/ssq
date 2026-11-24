@@ -7,8 +7,9 @@
 // like the real CLI, calls the tools written in the manager's message as
 // [[tool NAME {json}]] and answers with their results. Records the call in
 // /tmp/fake-claude-mcp-last.json.
-// AI features (src/ai, system prompt with "crm-ai:turn" / "crm-ai:summary"): answers schema-valid JSON
-// built from AUDIT-* markers in the messages (see ai() below) and appends one line per call to
+// AI features (src/ai, system prompt with "crm-ai:turn" / "crm-ai:summary"; src/ai-insights with "crm-ai:inbound",
+// "crm-ai:review", "crm-ai:digest", "crm-ai:lost", "crm-ai:market", "crm-ai:market-summary"): answers schema-valid
+// JSON built from AUDIT-* markers in the messages (see ai() below) and appends one line per call to
 // /tmp/fake-claude-ai.log (local/checks/ai_check.py reads it).
 const fs = require('fs');
 
@@ -161,6 +162,14 @@ async function assistant(content) {
 //   AUDIT-ANSWER:<item id>  AUDIT-DONE:<item id>   an open question answered / a promise fulfilled
 //   AUDIT-AI-LIMIT (the CLI reports the usage limit), AUDIT-AI-BAD (an answer without JSON),
 //   AUDIT-AI-SLOW:<seconds> (answers that much later)
+// src/ai-insights:
+//   inbound  AUDIT-CAT:<lead|client|supplier|personal|spam|other> AUDIT-TYPE:<wholesale|chain|hotel|export|retail>
+//            AUDIT-COUNTRY:<country> AUDIT-WANTS:<text> (AUDIT-LANG too); the quote: the start of the first message
+//   review   AUDIT-SCORE:<criterion>=<0|1|2> and AUDIT-MISTAKE:<criterion>|<better> in a manager's message (all 2 else)
+//   lost     AUDIT-LOST:<reason of the list> in a message (the quote: its start); none: «причина не видна»
+//   market   AUDIT-OFFER:supplier=…;country=…;product=…;size=…;grammage=…;price=…;currency=…;unit=…;moq=…;delivery=…;
+//            quality=…;payment=… (who=competitor for a client's message, our for a manager's; who=client_target too)
+//   digest, market-summary: lines with the numbers they were given
 function marks(text, name) {
   const out = [];
   const re = new RegExp(String.raw`AUDIT-${name}:(.+?)(?=\s+AUDIT-[A-Z]|$)`, 'g');
@@ -236,10 +245,92 @@ function summaryAnswer(messages, openItems) {
   };
 }
 
+// the start of a message as it reached the prompt: a quote the CRM finds in that message
+const opening = (m, n = 60) => String((m && m.text) || '').slice(0, n).trim();
+
+function inboundAnswer(messages) {
+  const text = messages.map((m) => m.text).join('\n');
+  const first = messages[0];
+  const pick = (name, fallback = null) => {
+    const found = marks(text, name)[0];
+    return found === undefined ? fallback : found;
+  };
+  return {
+    category: pick('CAT', 'lead'),
+    client_type: pick('TYPE'),
+    country: pick('COUNTRY'),
+    language: pick('LANG', 'ru'),
+    wants: pick('WANTS', `AUDIT хочет: ${opening(first, 40)}`),
+    quote: opening(first),
+    quote_event_id: first ? first.id : null,
+    reason: 'AUDIT разбор обращения',
+  };
+}
+
+const CRITERIA = ['greeting', 'need', 'answered_all', 'politeness', 'next_step', 'literacy'];
+
+function reviewAnswer(messages) {
+  const scores = Object.fromEntries(CRITERIA.map((c) => [c, 2]));
+  const mistakes = [];
+  for (const m of messages.filter((x) => x.from === 'manager')) {
+    for (const pair of marks(m.text, 'SCORE')) {
+      const [key, value] = pair.split('=').map((x) => x.trim());
+      if (CRITERIA.includes(key)) scores[key] = value === 'null' ? null : Number(value);
+    }
+    for (const mistake of marks(m.text, 'MISTAKE')) {
+      const [criterion, better] = mistake.split('|').map((x) => x.trim());
+      mistakes.push({ criterion, quote: opening(m, 40), event_id: m.id, better: better || 'AUDIT лучше так' });
+    }
+  }
+  return { scores, mistakes, summary: `AUDIT день: сообщений ${messages.length}` };
+}
+
+function lostAnswer(messages) {
+  for (const m of messages) {
+    const reason = marks(m.text, 'LOST')[0];
+    if (reason) return { reason, comment: 'AUDIT причина из переписки', quote: opening(m, 50), event_id: m.id, confidence: 'high' };
+  }
+  return { reason: null, comment: 'AUDIT: причина не видна', quote: null, event_id: null, confidence: 'low' };
+}
+
+function marketAnswer(messages) {
+  const offers = [];
+  for (const m of messages) {
+    for (const spec of marks(m.text, 'OFFER')) {
+      const offer = { who: m.from === 'manager' ? 'our' : 'competitor', quote: opening(m, 50), event_id: m.id };
+      for (const pair of spec.split(';')) {
+        const eq = pair.indexOf('=');
+        if (eq > 0) offer[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+      }
+      if (offer.price !== undefined && offer.price !== '') offer.price = Number(offer.price);
+      offers.push(offer);
+    }
+  }
+  return { offers };
+}
+
+function marketSummaryAnswer(groups, mentions, voices) {
+  return {
+    lines: [`AUDIT рынок: товаров ${groups.length}, высказываний ${mentions.length}, сигналов ${voices.length}`],
+    dearer: groups.filter((g) => typeof g.diff_pct === 'number' && g.diff_pct < 0).map((g) => ({ product: g.product, note: `AUDIT конкуренты дешевле на ${-g.diff_pct}%` })),
+    cheaper: groups.filter((g) => typeof g.diff_pct === 'number' && g.diff_pct >= 0).map((g) => ({ product: g.product, note: `AUDIT конкуренты дороже на ${g.diff_pct}%` })),
+    said: mentions.filter((m) => m.quote).slice(0, 3).map((m) => `AUDIT: ${m.quote}`),
+  };
+}
+
+function digestAnswer(numbers, managers) {
+  return {
+    lines: [`AUDIT: новых сделок ${numbers.new_deals || 0}, звонков ${numbers.calls || 0}`, `AUDIT: менеджеров в цифрах ${managers.length}`],
+  };
+}
+
+// the longest marker first: "crm-ai:market-summary" also contains "crm-ai:market"
+const MODES = ['market-summary', 'turn', 'summary', 'inbound', 'review', 'digest', 'lost', 'market'];
+
 async function ai(system, content) {
   const text = content.find((b) => b.type === 'text')?.text || '';
   const out = (event) => process.stdout.write(JSON.stringify(event) + '\n');
-  const mode = system.includes('crm-ai:turn') ? 'turn' : system.includes('crm-ai:summary') ? 'summary' : 'other';
+  const mode = MODES.find((m) => system.includes(`crm-ai:${m}`)) || 'other';
   const deal = blockLines(text, 'deal')[0] || {};
   const turn = blockLines(text, 'turn');
   const messages = blockLines(text, 'messages');
@@ -277,9 +368,19 @@ async function ai(system, content) {
   }
   const slow = /AUDIT-AI-SLOW:(\d+)/.exec(joined);
   if (slow) await new Promise((resolve) => setTimeout(resolve, Math.min(60, Number(slow[1])) * 1000));
+  const answers = {
+    turn: () => turnAnswer(turn, openItems),
+    summary: () => summaryAnswer(messages, openItems),
+    inbound: () => inboundAnswer(messages),
+    review: () => reviewAnswer(messages),
+    lost: () => lostAnswer(messages),
+    market: () => marketAnswer(messages),
+    digest: () => digestAnswer(blockLines(text, 'numbers')[0] || {}, blockLines(text, 'managers')),
+    'market-summary': () => marketSummaryAnswer(blockLines(text, 'groups'), blockLines(text, 'mentions'), blockLines(text, 'voices')),
+  };
   const answer = joined.includes('AUDIT-AI-BAD')
     ? 'Извините, не могу разобрать эту переписку.'
-    : '```json\n' + JSON.stringify(mode === 'turn' ? turnAnswer(turn, openItems) : summaryAnswer(messages, openItems)) + '\n```';
+    : '```json\n' + JSON.stringify((answers[mode] || answers.summary)()) + '\n```';
   out({ type: 'assistant', message: { content: [{ type: 'text', text: answer }] } });
   out({ type: 'result', subtype: 'success', is_error: false, result: answer });
 }

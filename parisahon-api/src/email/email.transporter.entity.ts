@@ -6,6 +6,7 @@ import {
   ManyToOne,
   PrimaryGeneratedColumn,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { User } from '../user/user.entity';
 import { Exclude } from 'class-transformer';
 
@@ -31,9 +32,9 @@ export class EmailTransporter {
    * When the mail server last accepted this address and password (checked on every save). Only a
    * checked mailbox shows its letters to its owner; one saved before the check existed does not.
    */
-  @Column({ type: 'timestamp', nullable: true, default: null })
+  @Column({ type: TIME, nullable: true, default: null })
   verified_at: Date;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }

@@ -7,6 +7,7 @@ import {
   JoinColumn,
   Index,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { Deal } from '../deal/deal.entity';
 import { User } from '../user/user.entity';
 import { Group } from '../group/group.entity';
@@ -68,7 +69,7 @@ export class Event {
   @PrimaryGeneratedColumn()
   id: number;
 
-  @Index()
+  // no index of its own: IDX_event_type_created (type, created_at) serves it (1795724000000-key-indexes)
   @Column({ type: 'smallint' })
   type: EventTypes;
 
@@ -86,7 +87,7 @@ export class Event {
   @Column({ type: 'bigint', nullable: true, default: null })
   duration: number;
 
-  @Column({ type: 'timestamp', nullable: true, default: null })
+  @Column({ type: TIME, nullable: true, default: null })
   replied_at: Date;
 
   @ManyToOne(() => Deal, (deal) => deal.events, { nullable: true })
@@ -163,6 +164,6 @@ export class Event {
   @Column({ type: 'varchar', length: 64, nullable: true, default: null })
   source_ref: string | null;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }

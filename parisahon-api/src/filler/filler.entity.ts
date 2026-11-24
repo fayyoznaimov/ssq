@@ -4,7 +4,9 @@ import {
   Column,
   CreateDateColumn,
   OneToMany,
+  Check,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { CompanyFiller } from '../company/company.filler.entity';
 import { UserFiller } from '../user/user.filler.entity';
 import { DealFiller } from '../deal/deal.filler.entity';
@@ -16,7 +18,11 @@ import { ProductFiller } from '../product/product.filler.entity';
  * to be universal across all deals, companies, users.
  *
  * This table represents the field name, while CompanyFiller/UserFiller/DealFiller/ProductFiller represent values.
+ * A field with values is not deleted by the database (their filler_id is ON DELETE RESTRICT): FillerService.delete
+ * deletes the values first.
  */
+// one of FillableTablesEnum: migration 1795722000000-child-keys-checks
+@Check('CHK_filler_target', `"target" IN ('company', 'deal', 'user', 'product')`)
 @Entity()
 export class Filler {
   @PrimaryGeneratedColumn()
@@ -43,7 +49,7 @@ export class Filler {
   @OneToMany(() => ProductFiller, (productFiller) => productFiller.filler)
   product_fillers: ProductFiller[];
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }
 

@@ -453,11 +453,28 @@ def main():
     NS = deal_or_die(create_deal("nostage"), "deal without stage")
     http("DELETE", "/deals/%d" % NS["id"])
     records = count("SELECT count(*) FROM deal_stage_record WHERE deal_id = %d" % NS["id"])
-    sql("UPDATE deal SET stage_id = NULL WHERE id = %d" % NS["id"])
-    r = http("POST", "/deals/trash/%d/restore" % NS["id"])
-    check("a deal without a stage is restored into the default stage",
-          r[0] in (200, 201) and row(NS["id"])["stage"] == default_stage
-          and count("SELECT count(*) FROM deal_stage_record WHERE deal_id = %d" % NS["id"]) == records + 1, (r, row(NS["id"])))
+    stage_not_null = scalar("SELECT is_nullable FROM information_schema.columns WHERE table_schema = current_schema() "
+                            "AND table_name = 'deal' AND column_name = 'stage_id'") == "NO"
+    if stage_not_null:
+        # DB-15 (migration 1795722000000-child-keys-checks): every deal is in a stage, the database
+        # refuses a deal without one, so a deal in the trash always comes back into its own stage
+        try:
+            sql("UPDATE deal SET stage_id = NULL WHERE id = %d" % NS["id"])
+            refused = False
+        except RuntimeError as error:
+            refused = "not-null" in str(error) or "null value" in str(error)
+        check("the database refuses a deal without a stage (deal.stage_id NOT NULL)", refused, row(NS["id"]))
+        r = http("POST", "/deals/trash/%d/restore" % NS["id"])
+        check("a restored deal comes back into its own stage, no extra stage record",
+              r[0] in (200, 201) and row(NS["id"])["stage"] == stage_created and not row(NS["id"])["deleted"]
+              and count("SELECT count(*) FROM deal_stage_record WHERE deal_id = %d" % NS["id"]) == records, (r, row(NS["id"])))
+    else:
+        # a database where the migration could not set NOT NULL (no stage to put stageless deals in)
+        sql("UPDATE deal SET stage_id = NULL WHERE id = %d" % NS["id"])
+        r = http("POST", "/deals/trash/%d/restore" % NS["id"])
+        check("a deal without a stage is restored into the default stage",
+              r[0] in (200, 201) and row(NS["id"])["stage"] == default_stage
+              and count("SELECT count(*) FROM deal_stage_record WHERE deal_id = %d" % NS["id"]) == records + 1, (r, row(NS["id"])))
 
     # ================================================================= rights
     section("Rights")

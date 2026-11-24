@@ -3,6 +3,8 @@ import DatePicker from '@vuepic/vue-datepicker';
 import moment from 'moment';
 import BaseTable from '~/components/common/BaseTable.vue';
 import { type Column } from '~/components/common/types';
+import AiInboundSection from '~/components/ai-insights/InboundSection.vue';
+import AiQualitySection from '~/components/ai-insights/QualitySection.vue';
 
 definePageMeta({
     authRoute: true,
@@ -273,5 +275,9 @@ const lateWarning = computed(() => (report.value?.summary.in_sla_share ?? 100) <
                 </li>
             </ul>
         </BaseCard>
+
+        <!-- the AI (src/ai-insights): the first messages of new contacts, the nightly review of the dialogs; hidden while off -->
+        <AiInboundSection :from="dateRange[0]" :till="dateRange[1]" />
+        <AiQualitySection :from="dateRange[0]" :till="dateRange[1]" />
     </div>
 </template>

@@ -7,6 +7,7 @@ import {
   PrimaryGeneratedColumn,
   Index,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { Filler } from '../filler/filler.entity';
 import { Deal } from './deal.entity';
 
@@ -18,12 +19,18 @@ export class DealFiller {
 
   @ManyToOne(() => Deal, (deal) => deal.deal_fillers, {
     onDelete: 'CASCADE',
+    // NOT NULL (migration 1795722000000-child-keys-checks); a value dropped from its owner's list is deleted
+    nullable: false,
+    orphanedRowAction: 'delete',
   })
   @JoinColumn({ name: 'deal_id' })
   deal: Deal;
 
+  // a value without its field is meaningless and a field with values is not deleted by the database
+  // (ON DELETE RESTRICT, migration 1795721000000-delete-rules): DELETE /fillers/:id removes the values itself
   @ManyToOne(() => Filler, (filler) => filler.deal_fillers, {
-    onDelete: 'CASCADE',
+    onDelete: 'RESTRICT',
+    nullable: false,
   })
   @JoinColumn({ name: 'filler_id' })
   filler: Filler;
@@ -31,6 +38,6 @@ export class DealFiller {
   @Column({ type: 'varchar', length: 255 })
   value: string;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }

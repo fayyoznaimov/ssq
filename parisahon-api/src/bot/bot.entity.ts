@@ -7,6 +7,7 @@ import {
   OneToOne,
   PrimaryColumn,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { User } from '../user/user.entity';
 import { Task } from '../task/task.entity';
 
@@ -35,7 +36,7 @@ export class BotAccount {
   @Column({ type: 'date', nullable: true })
   digest_on: string | null;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   linked_at: Date;
 }
 
@@ -52,7 +53,7 @@ export class BotLinkCode {
   @Column()
   user_id: number;
 
-  @Column({ type: 'timestamp' })
+  @Column({ type: TIME })
   expires_at: Date;
 }
 
@@ -71,9 +72,9 @@ export class BotReminder {
   task: Task;
 
   /** the start time of the task that was reminded */
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: TIME, nullable: true })
   start_time: Date | null;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   sent_at: Date;
 }

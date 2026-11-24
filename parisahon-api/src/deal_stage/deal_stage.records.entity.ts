@@ -7,6 +7,7 @@ import {
   PrimaryGeneratedColumn,
   Index,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { DealStage } from './deal_stage.entity';
 import { Deal } from 'src/deal/deal.entity';
 import { User } from 'src/user/user.entity';
@@ -19,16 +20,20 @@ import { User } from 'src/user/user.entity';
  */
 @Index('IDX_deal_stage_record_deal', ['deal'])
 @Index('IDX_deal_stage_record_from_stage', { synchronize: false })
+// time in a stage, the stage reports (stage_id, created_at): migration 1795724000000-key-indexes
+@Index('IDX_deal_stage_record_stage', { synchronize: false })
 @Entity({ name: 'deal_stage_record' })
 export class DealStageRecord {
   @PrimaryGeneratedColumn()
   id: number;
 
-  @ManyToOne(() => Deal, (deal) => deal.stage_records)
+  // NOT NULL (migration 1795722000000-child-keys-checks); history is never changed by the cascade of a
+  // deal's or a stage's list: a row missing from a loaded list stays as it is
+  @ManyToOne(() => Deal, (deal) => deal.stage_records, { nullable: false, orphanedRowAction: 'disable' })
   @JoinColumn({ name: 'deal_id' })
   deal: Deal;
 
-  @ManyToOne(() => DealStage, (dealStage) => dealStage.deal_records)
+  @ManyToOne(() => DealStage, (dealStage) => dealStage.deal_records, { nullable: false, orphanedRowAction: 'disable' })
   @JoinColumn({ name: 'stage_id' })
   stage: DealStage;
 
@@ -43,6 +48,6 @@ export class DealStageRecord {
   @Column({ type: 'bigint', name: 'moved_after_minutes', nullable: true })
   moved_after_minutes: number;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }

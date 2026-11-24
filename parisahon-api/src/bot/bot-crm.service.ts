@@ -11,6 +11,7 @@ import { COMPANY_REQUISITE_FIELDS } from '../company/dto/company.requisites.dto'
 import { TASK_DUPLICATE, TASK_IN_PAST, TaskService } from '../task/task.service';
 import { CreateTaskDto, UpdateTaskDto, ViableAssignTargets, ViableLinkTargets } from '../task/dto/create.task.dto';
 import { taskVisibilitySql } from '../task/task-access';
+import { taskShownSql } from '../task/task-shown';
 import { EventTypes } from '../events/event.entity';
 import { EventsService } from '../events/events.service';
 import { RoleEnum } from '../user/user.entity';
@@ -185,7 +186,7 @@ function chatLine(channel: string, state: any, outgoing: boolean | null | undefi
   return `${channel}, ${direction}: ${body || '(без текста)'}`;
 }
 
-/** "2026-11-17 15:00" in the server's time zone (the app runs with TZ=Asia/Karachi, UTC+5 like Tashkent). */
+/** "2026-11-17 15:00" in the server's time zone (TZ, Asia/Tashkent by default: helper/time-zone.ts). */
 export function localStamp(value: Date | string | null | undefined, withTime = true): string | null {
   if (!value) return null;
   const d = value instanceof Date ? value : new Date(value);
@@ -475,7 +476,8 @@ export class BotCrmService {
     const where = [
       't.closed_at IS NULL',
       '(t.agent_id = $1 OR ($2::int IS NOT NULL AND t.agent_id IS NULL AND t.group_id = $2::int))',
-      'NOT EXISTS (SELECT 1 FROM deal dd WHERE dd.id = t.deal_id AND dd.deleted_at IS NOT NULL)',
+      // not of a deal, company or contact in the trash (task/task-shown.ts)
+      taskShownSql('t'),
     ];
     const period = options.period ?? 'today';
     if (period === 'today') {
@@ -557,7 +559,7 @@ export class BotCrmService {
     const rows = await this.dataSource.query(
       `SELECT ${TASK_COLUMNS}, t.closed_at
        ${TASK_JOINS}
-       WHERE t.id = $1 AND NOT EXISTS (SELECT 1 FROM deal dd WHERE dd.id = t.deal_id AND dd.deleted_at IS NOT NULL)`,
+       WHERE t.id = $1 AND ${taskShownSql('t')}`,
       [taskId],
     );
     const r = rows[0];

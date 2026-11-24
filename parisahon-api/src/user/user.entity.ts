@@ -10,7 +10,9 @@ import {
   ManyToMany,
   UpdateDateColumn,
   DeleteDateColumn,
+  Check,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { Deal } from '../deal/deal.entity';
 import { Group } from '../group/group.entity';
 import { Exclude } from 'class-transformer';
@@ -75,6 +77,8 @@ interface Permission {
 // the e-mail is unique among accounts that are not deleted, case and spaces not counted (partial index on
 // lower(btrim(email)): migrations 1795240000000-user-email-active, 1795630000000-people-unique)
 @Index('IDX_user_email_active', { synchronize: false })
+// one of the four roles (RoleEnum): migration 1795722000000-child-keys-checks
+@Check('CHK_user_role', `"role" IN ('admin', 'manager', 'agent', 'ctr_agent')`)
 @Entity()
 export class User {
   @PrimaryGeneratedColumn()
@@ -111,9 +115,11 @@ export class User {
   @OneToMany(() => Recording, (recording) => recording.user)
   recordings: Recording[];
 
+  // a company removed for good leaves its contacts without a company (it used to take them along:
+  // migration 1795721000000-delete-rules); the CRM itself deletes companies softly, with their contacts
   @ManyToOne(() => Company, (company) => company.users, {
     nullable: true,
-    onDelete: 'CASCADE',
+    onDelete: 'SET NULL',
   })
   @JoinColumn({ name: 'company_id' })
   company: Company;
@@ -234,10 +240,10 @@ export class User {
   @JoinColumn({ name: 'updated_by' })
   updated_by: User;
 
-  @UpdateDateColumn()
+  @UpdateDateColumn({ type: TIME })
   updated_at: Date;
 
-  @DeleteDateColumn({ name: 'deleted_at' })
+  @DeleteDateColumn({ name: 'deleted_at', type: TIME })
   deleted_at: Date;
 
   @ManyToOne(() => User, (user) => user.deleted_by, {
@@ -247,6 +253,6 @@ export class User {
   @JoinColumn({ name: 'deleted_by' })
   deleted_by: User;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }

@@ -290,7 +290,9 @@ def main():
         check("upload under a temporary name + rename is forwarded once, under the final name",
               got.count(final) == 1 and not any(name.endswith(".tmp") for name in got), got)
         check("MFMT is accepted", mfmt.startswith("213"), mfmt)
-        epoch = psql(f"select extract(epoch from recorded_at at time zone 'Asia/Karachi')::bigint from call_upload where user_id = {A['id']} and file_name = '{final}'")
+        # a moment as it is (timestamptz, migration 1795729000000-timestamptz), a local time of the CRM's zone before it
+        epoch = psql("select extract(epoch from case when pg_typeof(recorded_at) = 'timestamptz'::regtype then recorded_at::timestamptz "
+                     f"else recorded_at at time zone 'Asia/Tashkent' end)::bigint from call_upload where user_id = {A['id']} and file_name = '{final}'")
         check("the file's time (set by the phone with MFMT) is the call's time in the queue", epoch == str(int(when.timestamp())), (epoch, int(when.timestamp())))
         check("a file in a subfolder is forwarded under its own name", got.count(nested) == 1, got)
         check("the same bytes again under another name: no second upload", f"{TAG} копия.wav" not in got and len(got) == 3, got)

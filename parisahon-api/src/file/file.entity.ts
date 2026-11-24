@@ -11,12 +11,15 @@ import {
   PrimaryGeneratedColumn,
   Index,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { Deal } from '../deal/deal.entity';
 import { User } from '../user/user.entity';
 import { Email } from '../email/email.entity';
 import { WhichFiles } from '../trigger/dto/assign.trigger.dto';
 
 @Index('IDX_file_email', ['email'])
+// the files an employee uploaded (the desktop): migration 1795724000000-key-indexes
+@Index('IDX_file_uploaded_by', { synchronize: false })
 @Entity()
 export class File {
   @PrimaryGeneratedColumn()
@@ -41,9 +44,11 @@ export class File {
   @JoinTable({ name: 'deal_file' })
   deals: Deal[];
 
+  // an attachment is a file of its deal too: a letter with attachments is not removed for good by the
+  // database (letters are deleted softly; migration 1795721000000-delete-rules), its files would vanish
   @ManyToOne(() => Email, (email) => email.files, {
     nullable: true,
-    onDelete: 'CASCADE',
+    onDelete: 'RESTRICT',
   })
   @JoinColumn({ name: 'email_id' })
   email: Email;
@@ -55,7 +60,7 @@ export class File {
   @JoinColumn({ name: 'uploaded_by' })
   uploaded_by: User;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 
   /** ".pdf": lower case with the dot; null for none or garbage */

@@ -8,6 +8,7 @@ import {
   OneToMany,
   PrimaryGeneratedColumn,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { EmailTo } from './email_to.entity';
 import { EmailCc } from './email_cc.entity';
 import { User } from '../user/user.entity';
@@ -22,6 +23,8 @@ import { File } from '../file/file.entity';
 @Index('IDX_email_mailbox_uid', { synchronize: false })
 @Index('IDX_email_mailbox_sent', { synchronize: false })
 @Index('IDX_email_user', { synchronize: false })
+// the letters an employee sent (the mailbox): migration 1795724000000-key-indexes
+@Index('IDX_email_sent_by', { synchronize: false })
 @Entity()
 export class Email {
   @PrimaryGeneratedColumn()
@@ -132,7 +135,7 @@ export class Email {
   @Column({ type: 'text', nullable: true })
   body: string;
 
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: TIME, nullable: true })
   sent_at: Date;
 
   @Column({ type: 'boolean', default: false })
@@ -151,6 +154,6 @@ export class Email {
   })
   from_mailbox: string;
 
-  @DeleteDateColumn({ name: 'deleted_at' })
+  @DeleteDateColumn({ name: 'deleted_at', type: TIME })
   deleted_at: Date;
 }

@@ -113,7 +113,7 @@ export function formatMoney(value: unknown): string {
   return formatNumber(value, 2);
 }
 
-/** 25.11.2026 18:00 in the zone of the CRM (process TZ, Asia/Karachi); a date without time — 25.11.2026 */
+/** 25.11.2026 18:00 in the zone of the CRM (process TZ, Asia/Tashkent by default); a date without time — 25.11.2026 */
 export function formatDateTime(value: unknown): string {
   const text = String(value);
   if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return `${text.slice(8, 10)}.${text.slice(5, 7)}.${text.slice(0, 4)}`;

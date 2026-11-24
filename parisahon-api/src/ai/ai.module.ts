@@ -31,6 +31,7 @@ import { AiController } from './ai.controller';
   ],
   providers: [AiQueueService, AiTaskService, AiTurnService, AiSummaryService, AiDealService],
   controllers: [AiDealController, AiController],
-  exports: [AiDealService],
+  // AiQueueService: the one queue, budget and pause of all AI (src/ai-insights registers its jobs there)
+  exports: [AiDealService, AiQueueService],
 })
 export class AiModule {}

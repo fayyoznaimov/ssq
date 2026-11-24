@@ -56,7 +56,7 @@ FTP_RETAIN_DAYS=30
 FTP_SETTLE_SEC=2
 FTP_SCAN_SEC=2
 LOG_LEVEL=info
-TZ=Asia/Karachi
+TZ=Asia/Tashkent
 ENV
 chmod 600 "$OUT"
 echo "local/dev/ftp.env written"

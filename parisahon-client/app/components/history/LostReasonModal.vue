@@ -8,6 +8,8 @@
                 Сделка № {{ request.deal.display_id ?? request.deal.id }}<template v-if="request.deal.label"> «{{ request.deal.label }}»</template>.
                 Причина попадёт в историю сделки и в отчёты.
             </p>
+            <!-- the AI's proposal from the conversation (src/ai-insights), taken into the form by «Принять» -->
+            <AiLostHint v-if="request?.deal?.id" :key="request.deal.id" :deal-id="request.deal.id" @apply="applyAi" />
             <div class="flex flex-wrap gap-2" role="radiogroup" aria-label="Причина">
                 <button
                     v-for="item in reasons"
@@ -44,6 +46,7 @@ import BaseButton from '~/components/base/BaseButton.vue';
 import Modal from '~/components/common/Modal.vue';
 import BaseTextarea from '~/components/form/BaseTextarea.vue';
 import { promiseResult } from '~/utils/result';
+import AiLostHint from '~/components/ai-insights/AiLostHint.vue';
 import { DEFAULT_LOST_REASONS } from './history';
 import { LOST_REASON_MODAL, type LostReasonAnswer, type LostReasonRequest, lostReasonModalMounted } from './lostReason';
 
@@ -88,6 +91,13 @@ function finish(answer: LostReasonAnswer) {
 
 function onHidden() {
     finish(null);
+}
+
+/** «Принять» of the AI's proposal: the reason and the comment go into the form (saved by «Сохранить причину») */
+function applyAi(value: { reason: string; comment: string }) {
+    if (reasons.value.includes(value.reason)) reason.value = value.reason;
+    if (!comment.value.trim()) comment.value = value.comment;
+    error.value = '';
 }
 
 function close() {

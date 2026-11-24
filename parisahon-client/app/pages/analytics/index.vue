@@ -38,6 +38,7 @@ const reports = [
     { to: '/analytics/calls', icon: 'ph:phone', title: 'Звонки', text: 'Входящие и исходящие звонки и их длительность' },
     { to: '/analytics/products', icon: 'ph:package', title: 'По товарам', text: 'Какие товары и на какую сумму продаются в сделках' },
     { to: '/analytics/control', icon: 'ph:timer', title: 'Контроль менеджеров', text: 'Как быстро отвечают клиентам, кто ждёт ответа' },
+    { to: '/analytics/market', icon: 'ph:scales', title: 'Рынок', text: 'Цены и условия конкурентов со слов клиентов против наших цен; сводка ИИ' },
     { to: '/analytics/events', icon: 'ph:list-bullets', title: 'История событий', text: 'Кто что изменил и что произошло: события сделок, изменения данных, прав и настроек, входы' },
 ];
 </script>

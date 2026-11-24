@@ -1,4 +1,6 @@
 import 'dotenv/config';
+// the CRM's time zone (TZ, Asia/Tashkent by default) before anything else reads a date
+import { APP_TIME_ZONE } from './helper/time-zone';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { ValidationPipe } from '@nestjs/common';
@@ -11,7 +13,8 @@ import * as process from 'process';
 import { corsOrigin } from './helper/cors';
 
 async function bootstrap() {
-  process.env.TZ = 'Asia/Karachi';
+  // one setting for the whole CRM: the environment's TZ (it used to be overridden here by Asia/Karachi)
+  process.env.TZ = APP_TIME_ZONE;
   const app = await NestFactory.create(AppModule);
 
   app.setGlobalPrefix('/api/v1');

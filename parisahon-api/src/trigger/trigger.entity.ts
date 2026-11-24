@@ -7,6 +7,7 @@ import {
   PrimaryGeneratedColumn,
   Index,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { DealStage } from '../deal_stage/deal_stage.entity';
 import {
   ApplyTriggerWhenEnum,
@@ -35,8 +36,10 @@ export class Trigger {
   @PrimaryGeneratedColumn()
   id: number;
 
+  // every trigger belongs to a stage (NOT NULL: migration 1795722000000-child-keys-checks)
   @ManyToOne(() => DealStage, (dealStage) => dealStage.triggers, {
     onDelete: 'CASCADE',
+    nullable: false,
   })
   @JoinColumn({ name: 'deal_stage_id' })
   deal_stage: DealStage;
@@ -51,8 +54,10 @@ export class Trigger {
   @Column({ type: 'varchar', length: 255, name: 'apply_when', nullable: false })
   apply_when: ApplyTriggerWhenEnum;
 
+  // not used by the current triggers (their people are in `data`); a person removed for good no longer
+  // takes the trigger along: migration 1795721000000-delete-rules
   @ManyToOne(() => User, (user) => user.targeted_triggers, {
-    onDelete: 'CASCADE',
+    onDelete: 'SET NULL',
     nullable: true,
   })
   @JoinColumn({ name: 'user_id' })
@@ -74,6 +79,6 @@ export class Trigger {
   data: any;
 
   // deals that entered the stage before this moment do not get the delayed runs of the trigger
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }

@@ -71,19 +71,28 @@ def port_checks(report):
         check("/deals: the name and the client of a row are links to the deal", (deals.get("probe") or 0) > 0, f"links: {deals.get('probe')}")
 
     # empty forms: the save is refused before any request (nothing is created), the toast names the fields
-    # that are required and not the optional ones (DEAL-3: a deal needs only its responsible, the company,
-    # its e-mail and phone are optional; a company needs its name, the phone is optional)
-    for path, button, field, optional_fields in [
-        (NEW_COMPANY, 'form button[type="submit"].nui-button-primary', "«Название компании»", ["«Номер телефона»"]),
-        ("/deals/new", 'button[type="submit"][form="deal-form"]', "«Ответственный»",
-         ["«Компания»", "«Электронная почта компании»", "«Телефон компании»", "«Бюджет»"]),
-    ]:
-        rep, proc = screens([path], SCREEN_CLICK=button, SCREEN_OUT=os.path.join(ROOT, "local", "dev", "screens", "ui", "save"))
-        row = next((r for r in rep or [] if r["size"] == "pc"), None)
-        toast = next((l for l in (row or {}).get("text", "").splitlines() if "Не сохранено" in l), "")
-        check(f"{path}: an empty form is not sent, the toast names its fields",
-              "Не сохранено. Проверьте" in toast and field in toast and not any(f in toast for f in optional_fields),
-              toast or ("no toast" if row else (proc.stderr or proc.stdout)[-300:]))
+    # that are required and not the optional ones (a company needs its name, the phone is optional)
+    rep, proc = screens([NEW_COMPANY], SCREEN_CLICK='form button[type="submit"].nui-button-primary',
+                        SCREEN_OUT=os.path.join(ROOT, "local", "dev", "screens", "ui", "save"))
+    row = next((r for r in rep or [] if r["size"] == "pc"), None)
+    toast = next((l for l in (row or {}).get("text", "").splitlines() if "Не сохранено" in l), "")
+    check(f"{NEW_COMPANY}: an empty form is not sent, the toast names its fields",
+          "Не сохранено. Проверьте" in toast and "«Название компании»" in toast and "«Номер телефона»" not in toast,
+          toast or ("no toast" if row else (proc.stderr or proc.stdout)[-300:]))
+    # a new deal needs only its responsible (DEAL-3), and the form fills it with the current user (SCR6, wave 1b):
+    # the untouched form is saved, the deal opens with «Сделка создана», no toast about the optional company fields
+    before = one("select coalesce(max(id), 0) from deal")
+    rep, proc = screens(["/deals/new"], SCREEN_CLICK='button[type="submit"][form="deal-form"]',
+                        SCREEN_OUT=os.path.join(ROOT, "local", "dev", "screens", "ui", "save"))
+    row = next((r for r in rep or [] if r["size"] == "pc"), None)
+    text = (row or {}).get("text", "")
+    made = one(f"select count(*) from deal where id > {before or 0} and deleted_at is null")
+    check("/deals/new: the responsible is the current user, so the untouched form saves and the deal opens",
+          "Сделка создана" in text and "Не сохранено" not in text and made not in ("", "0"),
+          f"new deals {made}; " + (next((l for l in text.splitlines() if "Не сохранено" in l), "") or ("no row" if not row else "no «Сделка создана»")))
+    if before:
+        # the deals this check made (two: pc and phone) go to the trash, the stand's own deals stay
+        one(f"update deal set deleted_at = now() where id > {before} and (label ~ '^#[0-9]+$' or coalesce(label, '') = '') and deleted_at is null returning id")
 
 
 def main():
@@ -94,7 +103,7 @@ def main():
         ("/lists/contacts/{}", "select id from \"user\" where role = 'ctr_agent' and deleted_at is null and username not like 'AUDIT%' order by id desc limit 1"),
         ("/lists/products/{}", "select id from product where deleted_at is null order by id desc limit 1"),
         ("/lists/calls/{}", "select id from \"user\" where role = 'agent' and deleted_at is null order by id limit 1"),
-        ("/mails/index/{}", "select id from email where deleted_at is null order by id desc limit 1"),
+        ("/mails/{}", "select id from email where deleted_at is null order by id desc limit 1"),
         ("/settings/groups/{}", "select id from \"group\" order by id limit 1"),
         ("/settings/users/{}", "select id from \"user\" where role <> 'ctr_agent' and deleted_at is null order by id limit 1"),
     ]:

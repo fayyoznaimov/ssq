@@ -7,6 +7,7 @@ import { Request } from 'express';
 import { AuthUser } from 'src/auth/auth.guard';
 import { periodBounds } from 'src/analytics/period';
 import { StageKind } from 'src/deal_stage/stage-kind';
+import { taskShownSql } from '../task/task-shown';
 
 const STAFF_ROLES = [RoleEnum.ADMIN, RoleEnum.MANAGER, RoleEnum.AGENT];
 
@@ -97,8 +98,8 @@ export class DesktopService {
       who.kind === 'all' ? 'TRUE' : who.kind === 'me' ? `${a}.agent_id = ${me}` : `${a}.agent_id = ANY(${users}::int[])`;
     const eventWho = (a: string, column: 'user_id' | 'target_user_id') =>
       who.kind === 'all' ? 'TRUE' : who.kind === 'me' ? `${a}.${column} = ${me}` : `${a}.${column} = ANY(${users}::int[])`;
-    const notInTrash = (a: string) =>
-      `NOT EXISTS (SELECT 1 FROM deal dd WHERE dd.id = ${a}.deal_id AND dd.deleted_at IS NOT NULL)`;
+    // a task of a deal, company or contact in the trash is not counted (task/task-shown.ts)
+    const notInTrash = (a: string) => taskShownSql(a);
     const inPeriod = (column: string) => `${column} >= ${from}::timestamp AND ${column} <= ${till}::timestamp`;
 
     const rows = await this.dataSource.query(

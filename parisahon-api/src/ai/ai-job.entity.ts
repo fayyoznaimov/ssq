@@ -1,4 +1,5 @@
 import { Column, CreateDateColumn, Entity, Index, JoinColumn, ManyToOne, PrimaryColumn, PrimaryGeneratedColumn } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { User } from '../user/user.entity';
 
 export type AiJobStatus = 'queued' | 'running' | 'done' | 'failed' | 'skipped';
@@ -49,7 +50,7 @@ export class AiJob {
   @Column({ type: 'smallint', default: 0 })
   attempts: number;
 
-  @Column({ type: 'timestamp', default: () => 'now()' })
+  @Column({ type: TIME, default: () => 'now()' })
   run_after: Date;
 
   @Column({ type: 'jsonb', nullable: true })
@@ -70,13 +71,13 @@ export class AiJob {
   @JoinColumn({ name: 'requested_by' })
   requested_by: User | null;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: TIME, nullable: true })
   started_at: Date | null;
 
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: TIME, nullable: true })
   finished_at: Date | null;
 
   @Column({ type: 'integer', nullable: true })
@@ -102,7 +103,7 @@ export class AiUsage {
   @Column({ type: 'integer', default: 0 })
   limit_hits: number;
 
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: TIME, nullable: true })
   paused_until: Date | null;
 
   @Column({ type: 'varchar', length: 255, nullable: true })

@@ -144,6 +144,15 @@ export default defineAppConfig({
                                 to: "/analytics/control",
                                 subject: "Control"
                             },
+                            {
+                                name: "Рынок",
+                                icon: {
+                                    name: "ph:scales",
+                                    class: "w-5 h-5"
+                                },
+                                to: "/analytics/market",
+                                subject: "Market"
+                            },
                         ]
                     },
                     {

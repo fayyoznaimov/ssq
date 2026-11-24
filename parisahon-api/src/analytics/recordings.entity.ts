@@ -8,6 +8,7 @@ import {
   PrimaryGeneratedColumn,
   Index,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 
 // This table is being created for statistical purposes only
 @Index('IDX_recording_user', ['user'])
@@ -23,9 +24,11 @@ export class Recording {
   @Column({ name: 'duration', type: 'bigint', nullable: false })
   duration: number;
 
+  // the recordings stay when an employee is removed for good (employees are deleted softly):
+  // migration 1795721000000-delete-rules
   @ManyToOne(() => User, (user) => user.recordings, {
     nullable: false,
-    onDelete: 'CASCADE',
+    onDelete: 'RESTRICT',
   })
   @JoinColumn({ name: 'user_id' })
   user: User; // Not meant for ctr_agents
@@ -39,6 +42,6 @@ export class Recording {
   @Column({ type: 'varchar', length: 255, nullable: true, name: 'from_number' })
   from_number: string;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }

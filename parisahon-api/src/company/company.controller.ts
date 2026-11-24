@@ -202,10 +202,11 @@ export class CompanyController {
     return this.companyService.restore(id);
   }
 
+  /** The company and its contacts go to the trash (they come back together: PATCH :id/restore). */
   @Delete(':id')
   @RecordAccess('company', 'delete')
-  async delete(@Param('id', ParseIntPipe) id: number): Promise<void> {
-    return this.companyService.delete(id);
+  async delete(@Param('id', ParseIntPipe) id: number, @Req() request: Request): Promise<void> {
+    return this.companyService.delete(id, request['user']);
   }
 
   @Delete('fillers/:id')

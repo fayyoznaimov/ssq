@@ -5,6 +5,7 @@ import {
   OneToMany,
   PrimaryGeneratedColumn,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { ProductFiller } from './product.filler.entity';
 import { DealProduct } from '../deal/deal-product.entity';
 import { User } from '../user/user.entity';
@@ -51,9 +52,9 @@ export class Product {
   @JoinColumn({ name: 'updated_by' })
   updated_by: User;
 
-  @DeleteDateColumn({ name: 'deleted_at' })
+  @DeleteDateColumn({ name: 'deleted_at', type: TIME })
   deleted_at: Date;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }

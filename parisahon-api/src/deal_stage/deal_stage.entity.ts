@@ -9,6 +9,7 @@ import {
   Index,
   Check,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { Deal } from '../deal/deal.entity';
 import { Trigger } from '../trigger/trigger.entity';
 import { DealStageCollection } from './deal_stage.collection.entity';
@@ -64,6 +65,6 @@ export class DealStage {
   @OneToMany(() => Trigger, (trigger) => trigger.deal_stage)
   triggers: Trigger[];
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }

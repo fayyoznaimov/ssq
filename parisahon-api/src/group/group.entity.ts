@@ -5,6 +5,7 @@ import {
   CreateDateColumn,
   OneToMany,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { User } from '../user/user.entity';
 import { Task } from '../task/task.entity';
 import { Event } from '../events/event.entity';
@@ -38,6 +39,6 @@ export class Group {
   })
   objectives: Objective;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }

@@ -1,4 +1,5 @@
 import { Column, Entity, Index, JoinColumn, ManyToOne, PrimaryColumn } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { User } from '../user/user.entity';
 import { Email } from './email.entity';
 
@@ -24,6 +25,6 @@ export class EmailRead {
   @JoinColumn({ name: 'user_id' })
   user: User;
 
-  @Column({ type: 'timestamp', default: () => 'now()' })
+  @Column({ type: TIME, default: () => 'now()' })
   read_at: Date;
 }

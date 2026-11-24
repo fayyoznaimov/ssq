@@ -2,7 +2,18 @@ import datetime
 import os
 import pytz
 
-from .config import LOGS_DIR
+from .config import LOGS_DIR, env
+
+# the CRM's time zone, one setting for every service (the API: helper/time-zone.ts): TZ, Asia/Tashkent by default
+DEFAULT_TIME_ZONE = 'Asia/Tashkent'
+
+
+def crm_timezone():
+    """TZ of the environment when pytz knows it, otherwise Asia/Tashkent (UTC+5, as the Asia/Karachi of before)."""
+    try:
+        return pytz.timezone(env('TZ', DEFAULT_TIME_ZONE).strip())
+    except pytz.UnknownTimeZoneError:
+        return pytz.timezone(DEFAULT_TIME_ZONE)
 
 
 class Logger:
@@ -10,7 +21,7 @@ class Logger:
 
     def __init__(self, log_file):
         self.log_file = log_file
-        self.timezone = pytz.timezone('Asia/Karachi')
+        self.timezone = crm_timezone()
 
     def log(self, level, message):
         current_time = datetime.datetime.now(tz=self.timezone)

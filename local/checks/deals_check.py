@@ -254,6 +254,11 @@ DELETE FROM file WHERE name LIKE 'AUDIT-%';
 DELETE FROM deal WHERE id IN (SELECT id FROM _d);
 DELETE FROM deal_stage WHERE id IN (SELECT id FROM _s);
 DELETE FROM collection WHERE id IN (SELECT id FROM _col);
+-- the values of the set's fields first: a field with values is not deleted by the database (ON DELETE RESTRICT)
+DELETE FROM company_filler WHERE filler_id IN (SELECT id FROM filler WHERE field LIKE 'AUDIT-%');
+DELETE FROM user_filler WHERE filler_id IN (SELECT id FROM filler WHERE field LIKE 'AUDIT-%');
+DELETE FROM deal_filler WHERE filler_id IN (SELECT id FROM filler WHERE field LIKE 'AUDIT-%');
+DELETE FROM product_filler WHERE filler_id IN (SELECT id FROM filler WHERE field LIKE 'AUDIT-%');
 DELETE FROM filler WHERE field LIKE 'AUDIT-%';
 DELETE FROM deal_user WHERE "userId" IN (SELECT id FROM _u);
 DELETE FROM "user" WHERE id IN (SELECT id FROM _u);

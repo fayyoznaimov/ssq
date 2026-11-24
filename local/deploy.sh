@@ -173,7 +173,7 @@ SESSION_ENCRYPTION_KEY=$key
 SESSIONS_DIR=$TARGET/whatsapp-sessions
 UPLOADS_DIR=$TARGET/api/public/uploads
 FFMPEG_BIN=$TARGET/bin/ffmpeg
-TZ=Asia/Karachi
+TZ=Asia/Tashkent
 ENV
     )
     sed -i -E '/^WHATSAPP_SERVICE_(URL|TOKEN)=/d' "$TARGET/api.env"
@@ -296,7 +296,7 @@ FTP_RETAIN_DAYS=30
 FTP_SETTLE_SEC=2
 FTP_SCAN_SEC=2
 LOG_LEVEL=info
-TZ=Asia/Karachi
+TZ=Asia/Tashkent
 ENV
     )
   fi

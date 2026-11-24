@@ -1,7 +1,7 @@
 /**
  * Texts of the bot about tasks: dates with the weekday, Russian plurals, button labels and the
  * dates a manager types («завтра 15:00», «25.11 10:30», «пт 9:00»). The server runs in the CRM's
- * time zone (TZ=Asia/Karachi), so the local getters of Date are the manager's local time.
+ * time zone (TZ, Asia/Tashkent by default), so the local getters of Date are the manager's local time.
  */
 
 const WEEKDAYS = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];

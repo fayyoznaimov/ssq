@@ -15,6 +15,8 @@ import { decimalText } from './decimal';
  * Creating a separate entity for many to many relationship to gain better control over data
  */
 @Index('IDX_deal_product_deal', ['deal'])
+// the deals of a product, and the check when a product is removed: migration 1795724000000-key-indexes
+@Index('IDX_deal_product_product', { synchronize: false })
 @Check('CHK_deal_product_amounts', `"quantity" >= 0 AND "price" >= 0`)
 @Entity({ name: 'deal_product' })
 export class DealProduct {
@@ -23,14 +25,19 @@ export class DealProduct {
 
   @ManyToOne(() => Deal, (deal) => deal.deal_products, {
     onDelete: 'CASCADE',
+    // NOT NULL: migration 1795722000000-child-keys-checks
+    nullable: false,
     // A product removed from a deal is deleted, not left behind with deal_id = NULL
     orphanedRowAction: 'delete',
   })
   @JoinColumn({ name: 'deal_id' })
   deal: Deal;
 
+  // a product in deals is not removed for good with its lines (products are deleted softly):
+  // migration 1795721000000-delete-rules
   @ManyToOne(() => Product, (product) => product.deal_products, {
-    onDelete: 'CASCADE',
+    onDelete: 'RESTRICT',
+    nullable: false,
   })
   @JoinColumn({ name: 'product_id' })
   product: Product;

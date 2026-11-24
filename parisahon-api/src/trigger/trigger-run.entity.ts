@@ -6,7 +6,9 @@ import {
   JoinColumn,
   ManyToOne,
   PrimaryGeneratedColumn,
+  Check,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { Trigger } from './trigger.entity';
 import { Deal } from '../deal/deal.entity';
 
@@ -45,6 +47,8 @@ export enum TriggerRunStatus {
 @Index('IDX_trigger_run_pending', { synchronize: false })
 // (trigger, deal, run_key) is unique where run_key is set: migration 1795690000000-trigger-processes
 @Index('IDX_trigger_run_key', { synchronize: false })
+// one of TriggerRunStatus: migration 1795722000000-child-keys-checks
+@Check('CHK_trigger_run_status', `"status" IN ('pending', 'running', 'done', 'failed', 'skipped')`)
 export class TriggerRun {
   @PrimaryGeneratedColumn()
   id: number;
@@ -57,13 +61,13 @@ export class TriggerRun {
   @JoinColumn({ name: 'deal_id' })
   deal: Deal;
 
-  @Column({ type: 'timestamp' })
+  @Column({ type: TIME })
   run_at: Date;
 
   @Column({ type: 'varchar', length: 16, default: TriggerRunStatus.PENDING })
   status: TriggerRunStatus;
 
-  @Column({ type: 'timestamp', nullable: true, default: null })
+  @Column({ type: TIME, nullable: true, default: null })
   executed_at: Date;
 
   @Column({ type: 'text', nullable: true, default: null })
@@ -82,6 +86,6 @@ export class TriggerRun {
   @Column({ type: 'varchar', length: 120, nullable: true, default: null })
   run_key: string | null;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }

@@ -47,6 +47,7 @@ import { Access } from '../auth/access';
 import { AuthUser } from '../auth/auth.guard';
 import { StageKind } from '../deal_stage/stage-kind';
 import { normalizeEmail, normalizePhone, phoneDigits, phoneKey, phoneKeySql } from '../helper/phone';
+import { AuditJournal } from '../audit/audit-journal';
 
 /**
  * The deals of every company: its own (deal.company_id) and those of its contacts — the same rule as
@@ -1241,12 +1242,38 @@ export class CompanyService {
     }
   }
 
-  async delete(id: number): Promise<void> {
-    const result = await this.companyRepository.softDelete(id);
-
-    if (result.affected === 0) {
-      throw new NotFoundException(`Company with id ${id} does not exist!`);
-    }
+  /**
+   * DELETE /companies/:id: the company goes to the trash together with its contacts (DB-11: a contact of a
+   * deleted company used to stay in the lists, the search and the matching of calls and messages, and
+   * the tasks of a company or contact in the trash are hidden like those of a deal). One moment for all
+   * of them (the transaction's now()), so restore() brings back exactly these contacts. The deals stay
+   * where they are (the trash shows how many) and are the company's again when it comes back.
+   */
+  async delete(id: number, performer?: AuthUser | null): Promise<void> {
+    await this.dataSource.transaction(async (manager) => {
+      const [company] = await manager.query(
+        `SELECT id FROM company WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`,
+        [id],
+      );
+      if (!company) {
+        throw new NotFoundException(`Company with id ${id} does not exist!`);
+      }
+      // the journal (src/audit): «Удаление в корзину» of each contact, in this transaction
+      await AuditJournal.around(
+        manager,
+        'user',
+        `t.company_id = $1 AND t.role = 'ctr_agent' AND t.deleted_at IS NULL`,
+        [id],
+        () =>
+          manager.query(
+            `UPDATE "user" SET deleted_at = now(), deleted_by = $2
+              WHERE company_id = $1 AND role = 'ctr_agent' AND deleted_at IS NULL`,
+            [id, performer?.sub ?? null],
+          ),
+      );
+      // CURRENT_TIMESTAMP of the same transaction: the same moment as the contacts'
+      await manager.softDelete(Company, id);
+    });
   }
 
   /**
@@ -1266,7 +1293,8 @@ export class CompanyService {
     if (text) where.push(`c.name ILIKE ${bind(`%${text}%`)}`);
     const rows: any[] = await this.dataSource.query(
       `SELECT c.id, c.name, c.phone, c.email, c.inn, c.deleted_at, c.created_at,
-              (SELECT count(*) FROM "user" u WHERE u.company_id = c.id AND u.role = 'ctr_agent' AND u.deleted_at IS NULL) AS contact_count,
+              (SELECT count(*) FROM "user" u WHERE u.company_id = c.id AND u.role = 'ctr_agent'
+                  AND (u.deleted_at IS NULL OR u.deleted_at = c.deleted_at)) AS contact_count,
               (SELECT count(*) FROM deal d WHERE d.company_id = c.id AND d.deleted_at IS NULL) AS deal_count,
               COUNT(*) OVER () AS total_count
          FROM company c
@@ -1305,7 +1333,16 @@ export class CompanyService {
     await this.assertNameIsFree(rows[0].name, id);
     await this.assertInnIsFree(rows[0].inn, id);
     try {
-      await this.companyRepository.restore(id);
+      await this.dataSource.transaction(async (manager) => {
+        // the contacts that went to the trash with the company (the same moment, see delete) come back with it;
+        // a contact deleted on its own before stays deleted
+        const withCompany = (a: string) =>
+          `${a}.company_id = $1 AND ${a}.role = 'ctr_agent' AND ${a}.deleted_at = (SELECT c.deleted_at FROM company c WHERE c.id = $1)`;
+        await AuditJournal.around(manager, 'user', withCompany('t'), [id], () =>
+          manager.query(`UPDATE "user" u SET deleted_at = NULL, deleted_by = NULL WHERE ${withCompany('u')}`, [id]),
+        );
+        await manager.restore(Company, id);
+      });
     } catch (error) {
       if ((error as { code?: string })?.code === '23505') throw new ConflictException(this.duplicateMessage(error));
       throw error;

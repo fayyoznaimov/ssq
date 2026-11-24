@@ -262,6 +262,11 @@ DELETE FROM deal_user WHERE "dealId" IN (SELECT id FROM _d) OR "userId" IN (SELE
 DELETE FROM deal WHERE id IN (SELECT id FROM _d);
 DELETE FROM deal_stage WHERE id IN (SELECT id FROM _s);
 DELETE FROM product WHERE name LIKE 'AUDIT-audit-%';
+-- the values of the set's fields first: a field with values is not deleted by the database (ON DELETE RESTRICT)
+DELETE FROM company_filler WHERE filler_id IN (SELECT id FROM filler WHERE field LIKE 'AUDIT-audit-%');
+DELETE FROM user_filler WHERE filler_id IN (SELECT id FROM filler WHERE field LIKE 'AUDIT-audit-%');
+DELETE FROM deal_filler WHERE filler_id IN (SELECT id FROM filler WHERE field LIKE 'AUDIT-audit-%');
+DELETE FROM product_filler WHERE filler_id IN (SELECT id FROM filler WHERE field LIKE 'AUDIT-audit-%');
 DELETE FROM filler WHERE field LIKE 'AUDIT-audit-%';
 DELETE FROM recorder_token WHERE user_id IN (SELECT id FROM _u);
 DELETE FROM bot_account WHERE user_id IN (SELECT id FROM _u);

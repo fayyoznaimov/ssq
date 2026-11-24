@@ -10,6 +10,7 @@ import {
   JoinColumn,
   DeleteDateColumn,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { CompanyFiller } from './company.filler.entity';
 import { User } from '../user/user.entity';
 import { Deal } from '../deal/deal.entity';
@@ -23,6 +24,8 @@ import { Notification } from 'src/notification/notification.entity';
 @Index('IDX_company_phone_key', { synchronize: false })
 // the ИНН is unique among the companies that are not deleted, when filled (1795630000000-people-unique)
 @Index('IDX_company_inn_live', { synchronize: false })
+// the company of which a contact is the primary contact: migration 1795724000000-key-indexes
+@Index('IDX_company_primary_contact', { synchronize: false })
 @Entity()
 export class Company {
   @PrimaryGeneratedColumn()
@@ -100,12 +103,12 @@ export class Company {
   @JoinColumn({ name: 'updated_by' })
   updated_by: User;
 
-  @UpdateDateColumn()
+  @UpdateDateColumn({ type: TIME })
   updated_at: Date;
 
-  @DeleteDateColumn({ name: 'deleted_at' })
+  @DeleteDateColumn({ name: 'deleted_at', type: TIME })
   deleted_at: Date;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }

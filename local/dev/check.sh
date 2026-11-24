@@ -23,6 +23,7 @@ sets_for() {
     parisahon-api/src/file/*|parisahon-client/app/components/deal/files-tab.vue|parisahon-client/app/pages/lists/files/*|parisahon-client/app/utils/files.ts|parisahon-client/app/composables/useUpload.ts) echo files platform ;;
     parisahon-api/src/events/*) echo deals history telegram whatsapp ;;
     parisahon-api/src/ai/*|parisahon-api/src/ai/*/*|parisahon-client/app/components/ai/*|parisahon-client/app/composables/useDealAi.ts) echo ai ;;
+    parisahon-api/src/ai-insights/*|parisahon-api/src/ai-insights/*/*|parisahon-client/app/components/ai-insights/*|parisahon-client/app/pages/analytics/market.vue) echo ai ;;
     parisahon-api/src/audit/*|parisahon-api/src/audit/*/*|parisahon-client/app/components/audit/*) echo audit ;;
     local/fake-claude/*) echo recognition bot ai ;;
     parisahon-api/src/recognition/*|parisahon-client/app/components/company/CardRecognition*) echo recognition bot ai ;;

@@ -5,6 +5,7 @@ import {
   CreateDateColumn,
   OneToMany,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { DealStage } from './deal_stage.entity';
 
 @Entity({ name: 'collection' })
@@ -23,6 +24,6 @@ export class DealStageCollection {
   @Column({ type: 'bool', default: false, nullable: false })
   is_active: boolean;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }

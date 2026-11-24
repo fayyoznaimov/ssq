@@ -1,4 +1,5 @@
 import { Column, CreateDateColumn, Entity, Index, JoinColumn, ManyToOne, PrimaryGeneratedColumn } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { Deal } from '../deal/deal.entity';
 import { Task } from '../task/task.entity';
 import { User } from '../user/user.entity';
@@ -36,11 +37,11 @@ export class ConversationTurn {
   to_event_id: number;
 
   /** the client's first message of the turn */
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: TIME, nullable: true })
   client_at: Date | null;
 
   /** the manager's last answer of the turn */
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: TIME, nullable: true })
   answered_at: Date | null;
 
   /** "telegram,whatsapp,email": the channels of the messages */
@@ -71,7 +72,7 @@ export class ConversationTurn {
   @Column({ type: 'varchar', length: 32 })
   prompt_version: string;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }
 
@@ -119,7 +120,7 @@ export class ConversationItem {
   has_email: boolean;
 
   /** promises: the promised time (local); due_has_time false = only the day was named */
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: TIME, nullable: true })
   due_at: Date | null;
 
   @Column({ type: 'boolean', default: false })
@@ -131,7 +132,7 @@ export class ConversationItem {
   @Column({ type: 'varchar', length: 32, nullable: true })
   close_reason: string | null;
 
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: TIME, nullable: true })
   closed_at: Date | null;
 
   @ManyToOne(() => User, { nullable: true, onDelete: 'SET NULL' })
@@ -142,9 +143,9 @@ export class ConversationItem {
   @JoinColumn({ name: 'task_id' })
   task: Task | null;
 
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: TIME, nullable: true })
   tasked_at: Date | null;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 }

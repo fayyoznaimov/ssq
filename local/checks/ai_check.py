@@ -22,6 +22,21 @@ What it proves:
     person goes before queued background jobs), a broken answer is tried again later, the usage limit of the
     subscription pauses all AI (503 for people, the job keeps its try);
   - rights: a deal another agent cannot see -> 404, view-only -> 403 on «Принять» / «Снять», /ai/status managers only.
+The second wave (src/ai-insights; its detectors read only the deals AUDIT-ai-i2-<run>, AI_INSIGHTS_TEST_PREFIX defaults
+to AI_TEST_DEAL_PREFIX + "i2-" on a stand; each part is skipped while its switch is off — the stand template turns
+them on: AI_INBOUND, AI_DIGEST_MORNING, AI_DIGEST_EVENING, AI_SUPERVISOR; AI_MARKET and AI_LOST_REASON are on with the AI):
+  - «Разбор нового обращения»: the first message of a new contact is read once — category, client type, country,
+    «что хочет клиент» with a quote; a note in the history (nothing of a letter), the responsible manager told in the
+    bot, spam kept; the owner's list «не заявки», the correction of the category, «просмотрено» for the owner only;
+  - «Рынок»: a turn with «конкурент» / «дорого» is read once for the competitors' offers (price, MOQ, delivery,
+    supplier, country, the client's words); GET /ai/market per product against our prices, the filters, the rights;
+    the AI summary made once for the same data, nothing for a user who sees no such deals;
+  - the digests: the morning one (waiting clients, overdue tasks, promises of today) once a day, the evening one
+    (the day's numbers and the AI's lines) to managers only; a run by hand is the admin's;
+  - «Причина проигрыша»: the AI proposes a reason of the list with the client's words, cached; it never writes it;
+    the manager confirms it with PATCH /deals/:id/lost; the rights;
+  - «ИИ-супервайзер»: yesterday's dialog reviewed once (scores, the manager's words, «как сказать лучше»),
+    «Качество диалогов» (advisory) for managers, the weekly tips in the bot.
 Creates its own users, deals, fields and messages (AUDIT-ai-<run>), removes them and puts back the AI counters of
 today (ai_usage) as they were. Usage: py local/checks/ai_check.py      (exit code 1 on any FAIL)
 """
@@ -34,6 +49,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -285,6 +301,343 @@ def bot_tool(user, chat, deal_id):
     except Exception:
         return None
     return next((c for c in record.get("calls", []) if c.get("name") == "deal_summary"), None)
+
+
+# --------------------------------------------------------------------------- src/ai-insights (the second wave of the AI)
+
+# The deals of these checks: the detectors of src/ai-insights look only at "<AI_TEST_DEAL_PREFIX>i2-" on a test stand
+# (AI_INSIGHTS_TEST_PREFIX), so the deals of the core's checks above are left alone; the core's turn analysis
+# still reads these (they start with AUDIT-ai- too).
+I2 = "AUDIT-ai-i2-" + RUN
+I2_STATE = {"digest_job": None, "products": []}
+
+
+def add_i2_deal(name, agent_id, stage=None, closed=False):
+    if STAGE[0] is None:
+        STAGE[0] = scalar("select s.id from deal_stage s left join collection c on c.id = s.collection_id "
+                          "order by (c.is_active is true) desc, s.id limit 1") or "NULL"
+    deal_id = int(scalar(
+        "insert into deal (label, display_id, budget, stage_id, agent_id, closed_at) values (%s, %d, 1000000, %s, %d, %s) returning id"
+        % (q(f"{I2} {name}"), random.randint(10**8, 2 * 10**9), stage or STAGE[0], agent_id, "now()" if closed else "NULL")))
+    DEALS.append(deal_id)
+    return deal_id
+
+
+def add_message_at(deal_id, channel, outgoing, text, at_sql):
+    """A message of the deal at a moment given in SQL (e.g. yesterday noon)."""
+    etype, state = (12 if channel == "tg" else 16), {"message": text, "outgoing": bool(outgoing), "files": []}
+    return int(scalar(
+        "insert into event (type, outgoing, deal_id, after_state, created_at) values (%d, %s, %d, %s::jsonb, %s) returning id"
+        % (etype, "true" if outgoing else "false", deal_id, q(json.dumps(state, ensure_ascii=False)), at_sql)))
+
+
+def tg_seq():
+    status, body = http("GET", f"{TG}/_test/log?since=0")
+    return body["seq"] if status == 200 and isinstance(body, dict) else 0
+
+
+def tg_sent(chat, contains, since, timeout=30):
+    """The bot's message to the chat since log seq `since` that contains the text (None after `timeout`)."""
+    def found():
+        status, body = http("GET", f"{TG}/_test/log?since={since}")
+        for e in (body or {}).get("entries", []) if status == 200 else []:
+            if e.get("method") == "sendMessage" and e.get("chat_id") == str(chat) and contains in (e.get("text") or ""):
+                return e
+        return None
+    return wait_for(found, timeout, 0.5)
+
+
+def make_user(admin, key, role, deal_rights, mail, group):
+    full = {"view": 3, "create": 3, "update": 3, "delete": 3, "export": 3}
+    person = {"email": f"audit-ai-{RUN}-{key}@example.test", "password": secrets.token_urlsafe(12), "username": f"{TAG}-{key}",
+              "role": role, "group_id": group,
+              "permissions": {"deal": deal_rights, "contact": full, "company": full, "task": {"update": 1, "delete": 0},
+                              "mail": mail, "file": True}}
+    status, created = api("POST", "/users", person, admin)
+    if status != 201 or not isinstance(created, dict):
+        raise SystemExit(f"cannot create user {key}: {status} {created}")
+    person["id"] = created["id"]
+    USERS.append(created["id"])
+    person["token"] = api("POST", "/auth/login", {"email": person["email"], "password": person["password"]})[1]["access_token"]
+    return person
+
+
+def link_bot(person):
+    """Links the user to a new chat of the fake Telegram; the chat id, or None."""
+    chat = 7_000_000_000 + random.randint(1, 900_000_000)
+    status, made = api("POST", "/bot/link", {}, person["token"])
+    code = made["url"].split("start=")[1] if status == 201 and isinstance(made, dict) and "start=" in made.get("url", "") else ""
+    if not code:
+        return None
+    tg_send(chat, "/start " + code)
+    return chat if tg_reply(chat, "вы вошли как", 30) is not None else None
+
+
+def insights(admin, people, groups, feats, wait, answered):
+    """«Рынок», «Разбор нового обращения», the digests, «Причина проигрыша», «ИИ-супервайзер» (src/ai-insights)."""
+    A, B, N = people["a"], people["b"], people["n"]
+    print("== src/ai-insights: the switches")
+    status, st = api("GET", "/ai/insights/status", token=admin)
+    if not check("GET /ai/insights/status (admin) -> 200 with the switches", status == 200 and isinstance(st, dict) and "features" in st, (status, st)):
+        return
+    f = st["features"]
+    status, _ = api("GET", "/ai/insights/status", token=A["token"])
+    check("... an agent -> 403", status == 403, status)
+    own = {"view": 1, "create": 3, "update": 1, "delete": 0, "export": 0}
+    all_rights = {"view": 3, "create": 3, "update": 3, "delete": 3, "export": 3}
+    I = make_user(admin, "i", "agent", own, True, groups[0])
+    M = make_user(admin, "m", "manager", all_rights, True, groups[0])
+    today = scalar("select to_char(current_date, 'YYYY-MM-DD')")
+    yesterday = scalar("select to_char(current_date - 1, 'YYYY-MM-DD')")
+    status, link = api("GET", "/bot/link", token=I["token"])
+    bot_on = status == 200 and isinstance(link, dict) and link.get("enabled") and http("GET", f"{TG}/_test/log?since=0")[0] == 200
+    chat_i = link_bot(I) if bot_on else None
+    chat_m = link_bot(M) if bot_on else None
+    if bot_on:
+        check("the bot is linked for the agent and the manager of these checks", chat_i and chat_m, (chat_i, chat_m))
+    else:
+        skip("the messages of the bot", "the CRM bot or the fake Telegram is not on this stand")
+
+    # ------------------------------------------------------------------ «Разбор нового обращения»
+    d_new = d_spam = None
+    if f.get("inbound"):
+        print("== «Разбор нового обращения»")
+        seq = tg_seq() if chat_i else 0
+        d_new = add_i2_deal("новый клиент", I["id"])
+        m_new = add_message(d_new, "tg", False, f"{I2} Здравствуйте! Нужно 3000 полотенец 70х140 для отеля AUDIT-CAT:lead AUDIT-TYPE:hotel "
+                            "AUDIT-COUNTRY:Казахстан AUDIT-WANTS:3000 полотенец 70х140 для отеля", 6)
+        d_spam = add_i2_deal("спам", I["id"])
+        add_message(d_spam, "wa", False, f"{I2} Продвижение сайтов недорого AUDIT-CAT:spam", 6)
+        d_mail = add_i2_deal("письмо", I["id"])
+        add_message(d_mail, "mail", False, f"{I2} mail-secret-{RUN} Просим КП на халаты AUDIT-CAT:lead AUDIT-COUNTRY:Россия", 6, subject=f"{I2} КП")
+        reading = lambda deal_id: rows(f"select category, ai_category, coalesce(client_type, ''), coalesce(country, ''), coalesce(wants, ''), "
+                                       f"coalesce(quote, ''), coalesce(quote_event_id::text, ''), has_email, channel, coalesce(note_event_id::text, ''), "
+                                       f"notified_at is not null from deal_inbound where deal_id = {deal_id}")
+        ok = wait_for(lambda: reading(d_new) and reading(d_spam) and reading(d_mail), wait)
+        r = (reading(d_new) or [[""] * 11])[0]
+        check("the first message of a new contact is read: заявка, отель, Казахстан, «что хочет клиент», the quote of the message",
+              ok and r[0] == "lead" and r[1] == "lead" and r[2] == "hotel" and r[3] == "Казахстан" and r[4].startswith("3000 полотенец")
+              and r[5].startswith(I2) and r[6] == str(m_new) and r[8] == "telegram", r)
+        calls = ai_calls("inbound", d_new)
+        check("... one CLI call, no tools, the message fenced as data", len(calls) == 1 and calls[0].get("noTools") and calls[0].get("fenced")
+              and calls[0].get("systemSaysData"), calls)
+        note = rows(f"select after_state->'data'->>'comment' from event where deal_id = {d_new} and type = 5")
+        check("... a note «ИИ: новое обращение …» in the deal history", r[9] and any(n[0].startswith("ИИ: новое обращение") and "Заявка" in n[0] for n in note), note)
+        check("spam is kept as a deal (nothing deleted), classified «spam»", (reading(d_spam) or [[""]])[0][0] == "spam"
+              and scalar(f"select count(*) from deal where id = {d_spam} and deleted_at is null") == "1", reading(d_spam))
+        mail_note = scalar(f"select coalesce(string_agg(after_state::text, ' '), '') from event where deal_id = {d_mail} and type = 5")
+        check("a letter: the note in the history carries nothing of the letter", (reading(d_mail) or [[""] * 8])[0][7] == "t"
+              and "mail-secret" not in mail_note and "халат" not in mail_note and "ИИ: новое обращение (письмо)" in mail_note, mail_note[:300])
+        if chat_i:
+            sent = tg_sent(chat_i, "Новое обращение", seq, 30)
+            check("the responsible manager is told in the bot: the category, what the client wants, the deal",
+                  sent and "Заявка" in sent["text"] and "3000 полотенец" in sent["text"]
+                  and "№" + scalar(f"select display_id from deal where id = {d_new}") in sent["text"]
+                  and wait_for(lambda: (reading(d_new) or [[""] * 11])[0][10] == "t", 10), sent)
+            spam_sent = tg_sent(chat_i, "не заявка", seq, 10)
+            check("... spam is told as «не заявка», the deal kept", spam_sent is not None, spam_sent)
+        status, view = api("GET", f"/deals/{d_new}/ai/inbound", token=I["token"])
+        check("GET /deals/:id/ai/inbound (the responsible agent) -> the reading", status == 200 and (view.get("inbound") or {}).get("category") == "lead"
+              and (view["inbound"].get("wants") or "").startswith("3000"), (status, view))
+        status, _ = api("GET", f"/deals/{d_new}/ai/inbound", token=B["token"])
+        check("... another agent who cannot see the deal -> 404", status == 404, status)
+        status, view = api("GET", f"/deals/{d_mail}/ai/inbound", token=N["token"])
+        check("... a reader without the «Почта» right: the category of a letter, not its words",
+              status == 200 and (view.get("inbound") or {}).get("category") == "lead" and view["inbound"].get("wants") is None
+              and view["inbound"].get("quote") is None, (status, view))
+        status, listed = api("GET", f"/ai/inbound?from_date={today}&till_date={today}&category=not_lead", token=admin)
+        ids = [x["deal"]["id"] for x in (listed or {}).get("rows", [])] if status == 200 else []
+        check("GET /ai/inbound (the owner): «не заявки» — the spam deal is listed, the request is not", d_spam in ids and d_new not in ids, (status, ids))
+        status, _ = api("GET", "/ai/inbound", token=I["token"])
+        check("... an agent -> 403", status == 403, status)
+        status, body = api("PATCH", f"/deals/{d_spam}/ai/inbound", {"category": "other"}, I["token"])
+        check("PATCH /deals/:id/ai/inbound: the responsible agent corrects the category (the AI's stays)",
+              status == 200 and body.get("category") == "other" and body.get("ai_category") == "spam" and body.get("corrected"), (status, body))
+        status, _ = api("PATCH", f"/deals/{d_spam}/ai/inbound", {"reviewed": True}, I["token"])
+        check("... «просмотрено» is the owner's: an agent -> 403", status == 403, status)
+        status, body = api("PATCH", f"/deals/{d_spam}/ai/inbound", {"reviewed": True}, admin)
+        check("... the admin -> 200, «просмотрено»", status == 200 and body.get("status") == "reviewed", (status, body))
+        status, _ = api("PATCH", f"/deals/{d_spam}/ai/inbound", {"category": "nonsense"}, admin)
+        check("... an unknown category -> 400", status == 400, status)
+        status, _ = api("PATCH", f"/deals/{d_spam}/ai/inbound", {"category": "lead"}, N["token"])
+        check("... view-only -> 403", status == 403, status)
+        time.sleep(4)
+        check("the same first message is never read twice", len(ai_calls("inbound", d_new)) == 1, len(ai_calls("inbound", d_new)))
+    else:
+        skip("«Разбор нового обращения»", "AI_INBOUND is off on this stand")
+
+    # ------------------------------------------------------------------ «Рынок»
+    if f.get("market") and feats.get("turns"):
+        print("== «Рынок»")
+        product = int(scalar(f"insert into product (name, price) values ({q(I2 + ' Полотенце 70x140')}, 32000) returning id"))
+        I2_STATE["products"].append(product)
+        d_mk = add_i2_deal("рынок", I["id"])
+        psql(f"insert into deal_product (deal_id, product_id, quantity, price) values ({d_mk}, {product}, 1000, 30000)")
+        c1 = add_message(d_mk, "tg", False,
+                         f"{I2} У турков 2.1$ за штуку, местные дают по 27 000, сделаете 25 000? AUDIT-FLAG:competitor AUDIT-FLAG:price_objection "
+                         "AUDIT-PARAM:target_price=25000 сум;size=70x140 "
+                         "AUDIT-OFFER:supplier=Turk Tekstil;country=Турция;product=полотенце;size=70x140;price=2.1;currency=USD;unit=шт;moq=1000 шт;delivery=30 дней "
+                         "AUDIT-OFFER:supplier=Local Tex;country=Узбекистан;product=полотенце;size=70x140;price=27000;currency=UZS;unit=шт", 45)
+        add_message(d_mk, "tg", True, f"{I2} Наша цена 30 000 сум за штуку. AUDIT-P:Отправить КП@{today}T23:59", answered)
+        mentions = lambda: rows(f"select supplier, coalesce(country, ''), coalesce(price::text, ''), coalesce(currency, ''), coalesce(moq, ''), "
+                                f"coalesce(quote, ''), coalesce(event_id::text, ''), kind from market_mention where deal_id = {d_mk} order by id")
+        ok = wait_for(lambda: len(mentions()) >= 2 and mentions(), wait * 2)
+        got = {r[0]: r for r in (mentions() or [])}
+        check("a turn with «конкурент» / «дорого» is read for the market: the competitors' offers with their terms and the client's words",
+              ok and got.get("Turk Tekstil", [""] * 8)[1] == "Турция" and got["Turk Tekstil"][2] == "2.10" and got["Turk Tekstil"][3] == "USD"
+              and got["Turk Tekstil"][4] == "1000 шт" and got["Turk Tekstil"][5].startswith(I2) and got["Turk Tekstil"][6] == str(c1)
+              and got.get("Local Tex", [""] * 8)[2] == "27000.00" and got["Local Tex"][7] == "competitor", mentions())
+        check("... one background CLI call for the turn", len(ai_calls("market", d_mk)) == 1, ai_calls("market", d_mk))
+        status, rep = api("GET", f"/ai/market?from_date={today}&till_date={today}", token=I["token"])
+        mine = [m for m in (rep or {}).get("mentions", []) if m["deal"]["id"] == d_mk] if status == 200 else []
+        group = next((g for g in (rep or {}).get("groups", []) if g.get("product_id") == product), {}) if status == 200 else {}
+        usd_rate = "USD" in (rep or {}).get("compared_currencies", []) if status == 200 else False
+        check("GET /ai/market: per product our price (deal 30 000, price list 32 000) against the competitors (27 000 -> −10%)",
+              status == 200 and rep.get("enabled") and len(mine) == 2 and group.get("deals_avg") == 30000 and group.get("catalogue") == 32000
+              and (usd_rate or (group.get("market_median") == 27000 and group.get("diff_pct") == -10)), (status, group, mine[:1]))
+        check("... the price in another currency is shown, not compared without a rate (AI_MARKET_RATES)",
+              any(m["supplier"] == "Turk Tekstil" and m["price"] == 2.1 and m["currency"] == "USD" for m in mine)
+              and (group.get("not_compared", 0) >= 1 or "USD" in rep.get("compared_currencies", [])), group)
+        voices = [v for v in rep.get("voices", []) if v["deal"]["id"] == d_mk] if status == 200 else []
+        check("... the signals of the turn: «Дорого», «Конкурент», the price the client wants, the client's words",
+              voices and {f_["flag"] for f_ in voices[0]["flags"]} >= {"competitor", "price_objection"}
+              and voices[0].get("target_price") == "25000 сум" and (voices[0].get("quote") or "").startswith(I2), voices)
+        status, rep = api("GET", f"/ai/market?from_date={today}&till_date={today}&country=" + urllib.parse.quote("Турция"), token=I["token"])
+        check("... the country filter", status == 200 and [m["supplier"] for m in rep["mentions"] if m["deal"]["id"] == d_mk] == ["Turk Tekstil"],
+              (status, rep.get("mentions") if isinstance(rep, dict) else rep))
+        status, rep = api("GET", f"/ai/market?from_date={today}&till_date={today}&product=" + urllib.parse.quote("простыня"), token=I["token"])
+        check("... the product filter", status == 200 and not [m for m in rep["mentions"] if m["deal"]["id"] == d_mk], status)
+        status, rep = api("GET", f"/ai/market?from_date={today}&till_date={today}", token=B["token"])
+        check("... another agent who cannot see the deal: nothing of it", status == 200
+              and not [m for m in rep.get("mentions", []) if m["deal"]["id"] == d_mk]
+              and not [v for v in rep.get("voices", []) if v["deal"]["id"] == d_mk], status)
+        before = len(ai_calls("market-summary"))
+        status, summary = api("POST", "/ai/market/summary", {"from_date": today, "till_date": today}, I["token"])
+        check("POST /ai/market/summary: «где мы дороже / дешевле» made now from the data the user sees",
+              status == 200 and summary.get("status") == "done" and (summary.get("data") or {}).get("lines", [""])[0].startswith("AUDIT рынок")
+              and len(ai_calls("market-summary")) == before + 1, (status, summary))
+        status, again = api("POST", "/ai/market/summary", {"from_date": today, "till_date": today}, I["token"])
+        check("... the same data again -> from the cache, no CLI call", status == 200 and again.get("cached") is True
+              and len(ai_calls("market-summary")) == before + 1, (status, again))
+        status, summary = api("POST", "/ai/market/summary", {"from_date": today, "till_date": today}, B["token"])
+        check("... a user who sees no such deals: nothing to summarise, no CLI call", status == 200 and summary.get("status") == "empty"
+              and len(ai_calls("market-summary")) == before + 1, (status, summary))
+    else:
+        skip("«Рынок»", "AI_MARKET or AI_TURNS is off on this stand")
+
+    # ------------------------------------------------------------------ the morning digest
+    if f.get("digest_morning") and chat_i:
+        print("== the morning digest")
+        if d_new is None:
+            d_new = add_i2_deal("ждёт ответа", I["id"])
+            add_message(d_new, "tg", False, f"{I2} Есть полотенца 50x90?", 30)
+        psql(f"insert into task (label, start_time, end_time, type_id, agent_id, deal_id) values ({q(I2 + ' позвонить клиенту')}, "
+             f"now() - interval '2 days', now() - interval '1 day', (select id from task_type order by id limit 1), {I['id']}, {d_new})")
+        seq = tg_seq()
+        status, body = api("POST", "/ai/insights/run", {"job": "morning", "user_ids": [I["id"]]}, admin)
+        sent = tg_sent(chat_i, "Доброе утро", seq, 30)
+        text = (sent or {}).get("text", "")
+        promised = scalar(f"select count(*) from conversation_item where deal_id in ({ids_sql(DEALS)}) and kind = 'promise' and status = 'open' "
+                          f"and due_at::date = current_date")
+        check("the morning digest in the bot: the clients waiting for an answer, the overdue tasks (and the promises of today)",
+              status == 200 and body.get("sent") == 1 and "Ждут вашего ответа" in text and "Просроченные задачи" in text
+              and I2 + " позвонить клиенту" in text and (promised == "0" or "Отправить КП" in text), (status, body, text[:600]))
+        status, body = api("POST", "/ai/insights/run", {"job": "morning", "user_ids": [I["id"]]}, admin)
+        check("... once a day: a second run sends nothing", status == 200 and body.get("sent") == 0, (status, body))
+        status, _ = api("POST", "/ai/insights/run", {"job": "morning"}, M["token"])
+        check("... a run by hand is the admin's: a manager -> 403", status == 403, status)
+    else:
+        skip("the morning digest", "AI_DIGEST_MORNING is off or the bot is not on this stand")
+
+    # ------------------------------------------------------------------ the evening digest
+    if f.get("digest_evening") and chat_m:
+        print("== the evening digest")
+        day_key = today.replace("-", "")
+        I2_STATE["digest_job"] = None if scalar(f"select id from ai_job where kind = 'digest' and entity = 'day' and entity_id = {day_key}") else "new"
+        before = len(ai_calls("digest"))
+        seq = tg_seq()
+        status, body = api("POST", "/ai/insights/run", {"job": "evening", "user_ids": [M["id"], I["id"]], "wait_sec": 60}, admin, timeout=150)
+        sent = tg_sent(chat_m, "Итоги дня", seq, 30)
+        text = (sent or {}).get("text", "")
+        check("the evening digest to a manager: the day's numbers and «что важно» by the AI (one call a day)",
+              status == 200 and body.get("done") and body.get("sent") == 1 and "Новых сделок" in text and "Звонков" in text
+              and ("Что важно (ИИ)" in text or "Разбор ИИ не готов" in text)
+              and (I2_STATE["digest_job"] is None or ("AUDIT: новых сделок" in text and len(ai_calls("digest")) == before + 1)), (status, body, text[:600]))
+        if I2_STATE["digest_job"] == "new":
+            I2_STATE["digest_job"] = scalar(f"select id from ai_job where kind = 'digest' and entity = 'day' and entity_id = {day_key}")
+        check("... not to an agent", tg_sent(chat_i, "Итоги дня", seq, 3) is None)
+    else:
+        skip("the evening digest", "AI_DIGEST_EVENING is off or the bot is not on this stand")
+
+    # ------------------------------------------------------------------ «Причина проигрыша»
+    if f.get("lost_reason"):
+        print("== «Причина проигрыша»")
+        lost_stage = scalar("select id from deal_stage where kind = 'lost' order by id limit 1")
+        d_lost = add_i2_deal("проигрыш", I["id"], stage=lost_stage, closed=True)
+        q1 = add_message(d_lost, "wa", False, f"{I2} Спасибо, но у турков дешевле, берём там AUDIT-LOST:Цена", 60)
+        add_message(d_lost, "wa", True, f"{I2} Жаль, можем обсудить скидку", 55)
+        before = len(ai_calls("lost", d_lost))
+        status, prop = api("POST", f"/deals/{d_lost}/ai/lost-reason", {}, I["token"])
+        data = (prop or {}).get("data") or {} if isinstance(prop, dict) else {}
+        check("POST /deals/:id/ai/lost-reason: the AI proposes «Цена» with the client's words (one call)",
+              status == 200 and prop.get("status") == "done" and data.get("reason") == "Цена" and (data.get("quote") or "").startswith(I2)
+              and data.get("event_id") == q1 and (prop.get("ref") or {}).get("from") == "client" and len(ai_calls("lost", d_lost)) == before + 1,
+              (status, prop))
+        check("... the AI does not write the reason itself", scalar(f"select coalesce(lost_reason, '') from deal where id = {d_lost}") == "")
+        status, again = api("POST", f"/deals/{d_lost}/ai/lost-reason", {}, I["token"])
+        check("... the same conversation again -> from the cache", status == 200 and again.get("cached") is True
+              and len(ai_calls("lost", d_lost)) == before + 1, (status, again))
+        status, view = api("GET", f"/deals/{d_lost}/ai/lost-reason", token=N["token"])
+        check("... GET (view-only) -> the proposal; POST (view-only) -> 403", status == 200 and view.get("status") == "done"
+              and api("POST", f"/deals/{d_lost}/ai/lost-reason", {}, N["token"])[0] == 403, (status, view))
+        status, _ = api("POST", f"/deals/{d_lost}/ai/lost-reason", {}, B["token"])
+        check("... another agent who cannot see the deal -> 404", status == 404, status)
+        open_deal = d_new or add_i2_deal("открытая", I["id"])
+        status, _ = api("POST", f"/deals/{open_deal}/ai/lost-reason", {}, I["token"])
+        check("... a deal that is not lost -> 400", status == 400, status)
+        status, saved = api("PATCH", f"/deals/{d_lost}/lost", {"reason": data.get("reason") or "Цена", "comment": data.get("comment") or ""}, I["token"])
+        check("the manager confirms it with «Сохранить причину» (PATCH /deals/:id/lost)", status == 200
+              and scalar(f"select lost_reason from deal where id = {d_lost}") == "Цена", (status, saved))
+    else:
+        skip("«Причина проигрыша»", "AI_LOST_REASON is off on this stand")
+
+    # ------------------------------------------------------------------ «ИИ-супервайзер»
+    if f.get("supervisor"):
+        print("== «ИИ-супервайзер»")
+        d_sv = add_i2_deal("диалог вчера", I["id"])
+        add_message_at(d_sv, "tg", False, f"{I2} Сколько стоят полотенца?", "current_date - interval '1 day' + interval '12 hours'")
+        add_message_at(d_sv, "tg", True, f"{I2} Цена 38000 AUDIT-SCORE:need=0 AUDIT-MISTAKE:need|Подскажите, какой размер и количество нужны?",
+                       "current_date - interval '1 day' + interval '12 hours 10 minutes'")
+        status, body = api("POST", "/ai/insights/run", {"job": "supervisor", "deal_ids": [d_sv]}, admin)
+        check("a review of yesterday's dialog is queued by hand (admin)", status == 200 and body.get("queued") == 1, (status, body))
+        review = lambda: rows(f"select score, scores->>'need', mistakes->0->>'criterion', coalesce(mistakes->0->>'quote', ''), "
+                              f"coalesce(mistakes->0->>'better', ''), coalesce(agent_id::text, ''), to_char(day, 'YYYY-MM-DD') "
+                              f"from conversation_review where deal_id = {d_sv}")
+        ok = wait_for(review, wait)
+        r = (review() or [[""] * 7])[0]
+        check("conversation_review: the scores of the checklist, the manager's words and «как сказать лучше», the manager, the day",
+              ok and r[1] == "0" and r[0] and int(r[0]) < 100 and r[2] == "need" and r[3].startswith(I2) and r[4].startswith("Подскажите")
+              and r[5] == str(I["id"]) and r[6] == yesterday, r)
+        status, body = api("POST", "/ai/insights/run", {"job": "supervisor", "deal_ids": [d_sv]}, admin)
+        check("... a dialog is reviewed once", status == 200 and body.get("queued") == 0 and len(ai_calls("review", d_sv)) == 1, (status, body))
+        status, quality = api("GET", f"/ai/quality?from_date={yesterday}&till_date={yesterday}", token=admin)
+        agent = next((a for a in (quality or {}).get("agents", []) if a["id"] == I["id"]), {}) if status == 200 else {}
+        check("GET /ai/quality: «Качество диалогов» per manager — advisory, the criteria, the mistakes with «лучше»",
+              status == 200 and quality.get("advisory") is True and agent.get("dialogs") == 1 and agent.get("criteria", {}).get("need") == 0
+              and agent.get("mistakes") and agent["mistakes"][0]["better"].startswith("Подскажите"), (status, agent))
+        status, _ = api("GET", "/ai/quality", token=I["token"])
+        check("... an agent -> 403", status == 403, status)
+        if f.get("supervisor_tips") and chat_i:
+            seq = tg_seq()
+            status, body = api("POST", "/ai/insights/run", {"job": "tips", "user_ids": [I["id"]]}, admin)
+            sent = tg_sent(chat_i, "как сказать лучше", seq, 30)
+            text = (sent or {}).get("text", "")
+            check("the weekly «ошибки и как сказать лучше» in the bot (advisory)", status == 200 and body.get("sent") == 1
+                  and "Лучше: «Подскажите" in text and "на оценки не влияют" in text, (status, body, text[:500]))
+        else:
+            skip("the weekly tips", "AI_SUPERVISOR_TIPS is off or the bot is not on this stand")
+    else:
+        skip("«ИИ-супервайзер»", "AI_SUPERVISOR is off on this stand")
 
 
 # --------------------------------------------------------------------------- the run
@@ -609,6 +962,9 @@ def main():
         else:
             skip("the bot tool deal_summary", "the CRM bot or the fake Telegram is not on this stand")
 
+        # ------------------------------------------------------------------ src/ai-insights
+        insights(admin, people, groups, feats, wait, answered)
+
         # ------------------------------------------------------------------ the queue: budget, dedupe of a skipped job
         print("== the daily budget of background jobs; a skipped job is not asked again")
         psql("insert into ai_usage (day, background_calls) values (current_date, %d) "
@@ -724,12 +1080,19 @@ def cleanup():
         "begin",
         # the AI's own rows: the jobs of the deals (no foreign key), the turns and items go with the deals
         f"delete from ai_job where (entity = 'deal' and entity_id in ({deal_rows})) or requested_by in ({users})",
+        f"delete from ai_job where kind = 'market' and entity = 'turn' and entity_id in (select id from conversation_turn where deal_id in ({deal_rows}))",
+        f"delete from ai_job where id = {int(I2_STATE['digest_job'])}" if str(I2_STATE.get("digest_job") or "").isdigit() else "select 1",
+        f"delete from market_mention where deal_id in ({deal_rows})",
+        f"delete from deal_inbound where deal_id in ({deal_rows})",
+        f"delete from conversation_review where deal_id in ({deal_rows})",
+        f"delete from ai_notice where user_id in ({users})",
         f"delete from conversation_item where deal_id in ({deal_rows})",
         f"delete from conversation_turn where deal_id in ({deal_rows})",
         f"delete from event where deal_id in ({deal_rows}) or user_id in ({users}) or after_state::text like {q('%' + TAG + '%')}",
         f"delete from task where deal_id in ({deal_rows}) or label like {q(TAG + '%')}",
         f"delete from deal_filler where deal_id in ({deal_rows})",
         f"delete from deal where id in ({deal_rows})",
+        f"delete from product where id in ({ids_sql(I2_STATE['products'])}) or name like {q(I2 + '%')}",
         f"delete from deal_filler where filler_id in (select id from filler where field like {q(TAG + '%')})",
         f"delete from filler where field like {q(TAG + '%')}",
         f"delete from bot_link_code where user_id in ({users})",
@@ -738,7 +1101,7 @@ def cleanup():
         "commit",
     ]))
     restore_usage()
-    left = scalar(f"select (select count(*) from deal where label like {q(TAG + '%')}) + (select count(*) from \"user\" where email like {q('audit-ai-' + RUN + '-%')})"
+    left = scalar(f"select (select count(*) from deal where label like {q(TAG + '%')} or label like {q(I2 + '%')}) + (select count(*) from \"user\" where email like {q('audit-ai-' + RUN + '-%')})"
                   f" + (select count(*) from filler where field like {q(TAG + '%')}) + (select count(*) from task where deal_id in ({deals}))"
                   f" + (select count(*) from ai_job where entity = 'deal' and entity_id in ({deals}))")
     check("test rows removed, the AI counters of today put back", left == "0" and (USAGE.get("row") is None or (usage_today() or [None])[0] == USAGE["row"][0]), left)

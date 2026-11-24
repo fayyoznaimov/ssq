@@ -12,6 +12,9 @@
                 <span>{{ notice.text }}</span>
             </p>
 
+            <!-- «Первое обращение»: the AI's reading of the new contact's first message (src/ai-insights) -->
+            <DealInboundCard :deal-id="props.deal?.id" :can-update="data.can_update" />
+
             <!-- «Сводка сделки» -->
             <section v-if="data.features.summary" :class="card">
                 <header class="mb-2 flex flex-wrap items-center justify-between gap-2">
@@ -235,6 +238,7 @@ import moment from 'moment';
 
 import type { AiAccepted, AiItem, AiParam, DealAi } from '~/composables/useDealAi';
 import AiRefs from './AiRefs.vue';
+import DealInboundCard from '~/components/ai-insights/DealInboundCard.vue';
 
 const props = defineProps<{ ai: DealAi; deal?: Record<string, any> | null }>();
 

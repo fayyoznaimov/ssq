@@ -22,6 +22,7 @@ export const ANALYTICS_SUBJECTS = [
     'Consolidated',
     'Calls',
     'Control',
+    'Market',
 ];
 
 /** How far a right reaches, as the API counts it (src/auth/access.ts). */

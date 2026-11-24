@@ -12,6 +12,7 @@ import {
   OneToMany,
   Check,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { User } from '../user/user.entity';
 import { DealStage } from '../deal_stage/deal_stage.entity';
 import { Company } from '../company/company.entity';
@@ -68,11 +69,12 @@ export class Deal {
   @OneToMany(() => Event, (event) => event.deal)
   events: Event[];
 
-  @ManyToOne(() => DealStage, (dealStage) => dealStage.deals)
+  // every deal is in a stage (NOT NULL: migration 1795722000000-child-keys-checks)
+  @ManyToOne(() => DealStage, (dealStage) => dealStage.deals, { nullable: false })
   @JoinColumn({ name: 'stage_id' })
   stage: DealStage;
 
-  @Column({ type: 'timestamp', nullable: true, default: null })
+  @Column({ type: TIME, nullable: true, default: null })
   last_stage_change: Date;
 
   @ManyToOne(() => User, (user) => user.assigned_deals, {
@@ -109,10 +111,10 @@ export class Deal {
   @JoinColumn({ name: 'repeat_of_id' })
   repeat_of: Deal;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 
-  @Column({ type: 'timestamp', nullable: true, default: null })
+  @Column({ type: TIME, nullable: true, default: null })
   closed_at: Date;
 
   /** Why the deal was lost (a reason of src/history/lost-reasons.ts) and the comment: PATCH /deals/:id/lost */
@@ -127,7 +129,7 @@ export class Deal {
    * TypeORM hides rows with deleted_at from find*, QueryBuilder and joins.
    * Raw SQL has to filter by "deleted_at IS NULL" on its own.
    */
-  @DeleteDateColumn({ name: 'deleted_at' })
+  @DeleteDateColumn({ name: 'deleted_at', type: TIME })
   deleted_at: Date;
 
   /** Who moved the deal to the trash (DELETE /deals/:id), null while it is not there */

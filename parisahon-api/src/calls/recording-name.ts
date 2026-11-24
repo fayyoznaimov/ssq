@@ -15,7 +15,7 @@
 export interface RecordingName {
   number: string | null;
   outgoing: boolean | null;
-  // the moment of the call, in the zone of the CRM (the API runs with TZ=Asia/Karachi)
+  // the moment of the call, in the zone of the CRM (TZ, Asia/Tashkent by default: helper/time-zone.ts)
   recorded_at: Date | null;
   // "phone", "whatsapp", "telegram", ...
   app: string | null;

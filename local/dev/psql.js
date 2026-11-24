@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Stand-in for `psql` on the server (there is no psql binary there, only the
 // embedded Postgres of the trial copy). Covers what local/checks/*.py use:
-//   psql [-h host] [-p port] [-U user] [-d db] [-q] [-A] [-t] [-At] [-v ON_ERROR_STOP=1] (-c SQL | -f - | -f FILE)
+//   psql [-h host] [-p port] [-U user] [-d db] [-q] [-A] [-t] [-At] [-F sep] [-v ON_ERROR_STOP=1] (-c SQL | -f - | -f FILE)
 // Output as `psql -A`: rows as col1|col2, NULL as empty, no header with -t,
 // command tags (INSERT 0 1, UPDATE 3, ...) unless -q. Errors: "ERROR: ..." on
 // stderr and exit code 1 (ON_ERROR_STOP behaviour, always).
@@ -37,6 +37,7 @@ let sql = null;
 let file = null;
 let quiet = false;
 let tuplesOnly = false;
+let sep = '|';
 const args = process.argv.slice(2);
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
@@ -46,6 +47,7 @@ for (let i = 0; i < args.length; i++) {
   else if (a === '-d') opts.database = args[++i];
   else if (a === '-c') sql = args[++i];
   else if (a === '-f') file = args[++i];
+  else if (a === '-F') sep = args[++i];
   else if (a === '-v') i++; // -v ON_ERROR_STOP=1 : always on here
   else if (/^-[AtqX]+$/.test(a)) {
     if (a.includes('q')) quiet = true;
@@ -85,8 +87,8 @@ const tag = (r) => {
     const shown = file !== null ? results : results.slice(-1);
     for (const r of shown) {
       if (r.fields && r.fields.length) {
-        if (!tuplesOnly) out += r.fields.map((f) => f.name).join('|') + '\n';
-        for (const row of r.rows) out += row.map((v) => (v === null || v === undefined ? '' : String(v))).join('|') + '\n';
+        if (!tuplesOnly) out += r.fields.map((f) => f.name).join(sep) + '\n';
+        for (const row of r.rows) out += row.map((v) => (v === null || v === undefined ? '' : String(v))).join(sep) + '\n';
         if (!tuplesOnly) out += `(${r.rows.length} row${r.rows.length === 1 ? '' : 's'})\n`;
       } else if (!quiet) {
         const t = tag(r);

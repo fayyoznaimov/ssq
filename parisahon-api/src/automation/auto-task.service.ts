@@ -38,7 +38,10 @@ export class AutoTaskService {
     task.company = deal.company ?? null;
     task.allDay = false;
     task.type = await defaultTaskType(this.tasks.manager);
-    task.start_time = new Date();
+    // a due time already past (a promise of the client read late) gives an overdue task that starts then too:
+    // a task never ends before it starts (CHK_task_times, migration 1795722000000-child-keys-checks)
+    const now = new Date();
+    task.start_time = dueAt.getTime() < now.getTime() ? dueAt : now;
     task.end_time = dueAt;
     const saved = await this.tasks.save(task);
 

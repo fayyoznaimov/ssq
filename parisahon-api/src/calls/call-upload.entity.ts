@@ -6,7 +6,9 @@ import {
   JoinColumn,
   ManyToOne,
   PrimaryGeneratedColumn,
+  Check,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { User } from '../user/user.entity';
 import { Recording } from '../analytics/recordings.entity';
 
@@ -26,16 +28,19 @@ export enum CallUploadStatus {
  * `recording` row, links it to the deals of the client with that number and
  * records the outcome here; a broken file fails alone.
  */
-@Index('IDX_call_upload_user', ['user'])
+// (user_id, file_hash) serves the lookups by user too: the index of user_id alone is gone (1795724000000-key-indexes)
 @Index('IDX_call_upload_hash', ['user', 'file_hash'])
 @Entity('call_upload')
 @Index('IDX_call_upload_status', ['status', 'received_at'])
+// one of CallUploadStatus: migration 1795722000000-child-keys-checks
+@Check('CHK_call_upload_status', `"status" IN ('pending', 'done', 'failed', 'discarded', 'duplicate')`)
 export class CallUpload {
   @PrimaryGeneratedColumn()
   id: number;
 
-  // the manager whose phone recorded the call
-  @ManyToOne(() => User, { onDelete: 'CASCADE', nullable: false })
+  // the manager whose phone recorded the call; the queue stays when an employee is removed for good
+  // (employees are deleted softly): migration 1795721000000-delete-rules
+  @ManyToOne(() => User, { onDelete: 'RESTRICT', nullable: false })
   @JoinColumn({ name: 'user_id' })
   user: User;
 
@@ -63,7 +68,7 @@ export class CallUpload {
   file_hash: string;
 
   // the moment of the call (from the name of the file, else the time of the file on the phone)
-  @Column({ type: 'timestamp', nullable: true, default: null })
+  @Column({ type: TIME, nullable: true, default: null })
   recorded_at: Date;
 
   // the name from the manager's phone book, when the recorder gives no number (messenger calls)
@@ -80,9 +85,9 @@ export class CallUpload {
   @JoinColumn({ name: 'recording_id' })
   recording: Recording;
 
-  @CreateDateColumn({ name: 'received_at' })
+  @CreateDateColumn({ name: 'received_at', type: TIME })
   received_at: Date;
 
-  @Column({ type: 'timestamp', nullable: true, default: null })
+  @Column({ type: TIME, nullable: true, default: null })
   processed_at: Date;
 }

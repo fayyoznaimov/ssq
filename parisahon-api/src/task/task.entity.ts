@@ -7,7 +7,9 @@ import {
   ManyToOne,
   OneToMany,
   PrimaryGeneratedColumn,
+  Check,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { User } from '../user/user.entity';
 import { Company } from '../company/company.entity';
 import { Group } from '../group/group.entity';
@@ -32,6 +34,12 @@ export const DefaultTaskRelations = [
 @Index('IDX_task_open_agent', { synchronize: false })
 @Index('IDX_task_open_deal', { synchronize: false })
 @Index('IDX_task_created', { synchronize: false })
+// tasks I gave (the desktop), tasks of a contact, open tasks of a group: migration 1795724000000-key-indexes
+@Index('IDX_task_created_by', { synchronize: false })
+@Index('IDX_task_ctr_agent', { synchronize: false })
+@Index('IDX_task_open_group', { synchronize: false })
+// a task does not end before it starts (TaskService.setTimes says so in words): 1795722000000-child-keys-checks
+@Check('CHK_task_times', `"end_time" >= "start_time"`)
 @Entity()
 export class Task {
   @PrimaryGeneratedColumn()
@@ -87,22 +95,22 @@ export class Task {
   @Column({ type: 'text', nullable: true })
   result: string;
 
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: TIME, nullable: true })
   closed_at: Date;
 
   @Index()
-  @Column({ type: 'timestamp' })
+  @Column({ type: TIME })
   start_time: Date;
 
   @Index()
-  @Column({ type: 'timestamp' })
+  @Column({ type: TIME })
   end_time: Date;
 
   // Snake case due to FE requirements
   @Column({ type: 'boolean', default: false })
   allDay: boolean;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 
   @ManyToOne(() => User, (user) => user.created_tasks, {

@@ -16,6 +16,9 @@ export class EmailCc {
 
   @ManyToOne(() => Email, (email) => email.cc, {
     onDelete: 'CASCADE',
+    // NOT NULL (migration 1795722000000-child-keys-checks); a recipient dropped from the letter's list is deleted
+    nullable: false,
+    orphanedRowAction: 'delete',
   })
   @JoinColumn({ name: 'email_id' })
   email: Email;

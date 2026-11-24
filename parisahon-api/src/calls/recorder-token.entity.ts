@@ -7,6 +7,7 @@ import {
   ManyToOne,
   PrimaryGeneratedColumn,
 } from 'typeorm';
+import { TIME } from '../helper/time-column';
 import { User } from '../user/user.entity';
 
 /**
@@ -31,13 +32,13 @@ export class RecorderToken {
   @JoinColumn({ name: 'created_by' })
   created_by: User;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: TIME })
   created_at: Date;
 
-  @Column({ type: 'timestamp', nullable: true, default: null })
+  @Column({ type: TIME, nullable: true, default: null })
   revoked_at: Date;
 
-  @Column({ type: 'timestamp', nullable: true, default: null })
+  @Column({ type: TIME, nullable: true, default: null })
   last_upload_at: Date;
 
   // FTP logins with this token must use FTPS (explicit TLS); the FTP receiver refuses a plain one

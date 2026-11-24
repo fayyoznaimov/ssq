@@ -48,7 +48,7 @@ MAX_FILE_MB=50
 POLL_SEC=10
 LOG_LEVEL=info
 BAILEYS_LOG_LEVEL=warn
-TZ=Asia/Karachi
+TZ=Asia/Tashkent
 ENV
 chmod 600 "$OUT"
 echo "local/dev/whatsapp.env written"

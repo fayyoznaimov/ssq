@@ -11,6 +11,10 @@ import { CompanyFiller } from '../company/company.filler.entity';
 import { UserFiller } from '../user/user.filler.entity';
 import { DealFiller } from '../deal/deal.filler.entity';
 import { ProductFiller } from '../product/product.filler.entity';
+import { AuditJournal } from '../audit/audit-journal';
+
+/** the tables of the values of a custom field */
+const VALUE_TABLES = ['company_filler', 'user_filler', 'deal_filler', 'product_filler'];
 
 @Injectable()
 export class FillerService {
@@ -193,7 +197,7 @@ export class FillerService {
 
   /**
    * GET /fillers/:id/usage: how many companies, contacts, deals and products have a value of the field.
-   * Deleting a field deletes all of its values (ON DELETE CASCADE): the web asks for this number first.
+   * Deleting a field deletes all of its values (FillerService.delete): the web asks for this number first.
    */
   async usage(id: number): Promise<{ id: number; field: string; target: string; values: number }> {
     const filler = await this.fillerRepository.findOneBy({ id });
@@ -210,14 +214,26 @@ export class FillerService {
     return { id: filler.id, field: filler.field, target: filler.target, values: Number(rows[0]?.total ?? 0) };
   }
 
+  /**
+   * DELETE /fillers/:id: the field and its values in every company, contact, deal and product, in one
+   * transaction, each value in the journal. The web said how many values go (GET /fillers/:id/usage).
+   * The values are deleted here on purpose: the database refuses to delete a field that still has values
+   * (ON DELETE RESTRICT, migration 1795721000000-delete-rules), so no other way loses them silently.
+   */
   async delete(id: number): Promise<void> {
-    const result = await this.fillerRepository.delete(id);
-
-    if (result.affected === 0) {
-      throw new NotFoundException();
-    }
-
-    return;
+    await this.fillerRepository.manager.transaction(async (manager) => {
+      // a value saved meanwhile waits for this lock, then finds the field gone
+      const [filler] = await manager.query('SELECT id FROM filler WHERE id = $1 FOR UPDATE', [id]);
+      if (!filler) {
+        throw new NotFoundException();
+      }
+      for (const table of VALUE_TABLES) {
+        await AuditJournal.around(manager, table, 't.filler_id = $1', [id], () =>
+          manager.query(`DELETE FROM "${table}" WHERE filler_id = $1`, [id]),
+        );
+      }
+      await manager.delete(Filler, id);
+    });
   }
 
   // Every target is always present (an empty list when it has no fields):

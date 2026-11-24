@@ -118,7 +118,7 @@ export class MessengerHealthService implements OnApplicationBootstrap, OnApplica
     const name = channel === 'telegram' ? 'Telegram' : 'WhatsApp';
     if (!reachable) return out('unknown', `${name}-сервис не отвечает`);
     const long = since !== null && Date.now() - since >= LONG_MS;
-    const when = since ? ` с ${new Date(since).toLocaleString('ru-RU', { timeZone: process.env.TZ || 'Asia/Karachi', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}` : '';
+    const when = since ? ` с ${new Date(since).toLocaleString('ru-RU', { timeZone: process.env.TZ || 'Asia/Tashkent', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}` : '';
     switch (session?.status ?? 'none') {
       case 'connected':
         return out('ok', `${name} подключён${session?.phone ? `: ${session.phone}` : ''}`);

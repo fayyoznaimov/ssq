@@ -67,7 +67,7 @@ services:
       STT_LANGUAGES: ru,en
       STT_MIN_PROB: "0.8"
       HF_HUB_DISABLE_TELEMETRY: "1"
-      TZ: Asia/Karachi
+      TZ: Asia/Tashkent
     volumes:
       - ./parisahon-stt:/app
       - ./stt-venv:/venv

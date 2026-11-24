@@ -3,6 +3,7 @@ import { DataSource } from 'typeorm';
 import { loadStaffUser } from './bot-access';
 import { BotService } from './bot.service';
 import { BotCrmService, TaskView, localStamp } from './bot-crm.service';
+import { taskShownSql } from '../task/task-shown';
 
 /** TypeORM returns [rows, count] for INSERT ... ON CONFLICT DO UPDATE ... RETURNING on Postgres. */
 function returned(result: any): any[] {
@@ -70,10 +71,9 @@ export class BotReminderService implements OnApplicationBootstrap, OnApplication
     const rows: { id: number; start_time: Date }[] = await this.dataSource.query(
       `SELECT t.id, t.start_time
        FROM task t
-       LEFT JOIN deal d ON d.id = t.deal_id
        WHERE t.closed_at IS NULL AND NOT t."allDay"
          AND t.start_time > $1 AND t.start_time <= $2
-         AND (d.id IS NULL OR d.deleted_at IS NULL)
+         AND ${taskShownSql('t')}
          AND NOT EXISTS (SELECT 1 FROM bot_reminder r WHERE r.task_id = t.id AND r.start_time = t.start_time)
          AND EXISTS (SELECT 1 FROM bot_account ba JOIN "user" bu ON bu.id = ba.user_id
                       WHERE bu.deleted_at IS NULL

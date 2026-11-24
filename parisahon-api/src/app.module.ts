@@ -38,6 +38,7 @@ import { BotModule } from './bot/bot.module';
 import { AutomationModule } from './automation/automation.module';
 import { CallsModule } from './calls/calls.module';
 import { AiModule } from './ai/ai.module';
+import { AiInsightsModule } from './ai-insights/ai-insights.module';
 import { AuditModule } from './audit/audit.module';
 import { HistoryModule } from './history/history.module';
 import { AuthGuard } from './auth/auth.guard';
@@ -78,6 +79,8 @@ import { AuthGuard } from './auth/auth.guard';
     AutomationModule,
     CallsModule,
     AiModule,
+    // more AI on the core's queue: «Рынок», new requests, digests, the reason of a loss, the supervisor (src/ai-insights)
+    AiInsightsModule,
     // the readable client history of the deal page: header, the whole client, the reason of a loss (src/history)
     HistoryModule,
     // the journal «кто что изменил» and the request context of every request (src/audit)

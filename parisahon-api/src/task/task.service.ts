@@ -33,6 +33,7 @@ import { NotificationGateWay } from 'src/gateway/notification.gateway';
 import { AuthUser } from '../auth/auth.guard';
 import { Access } from '../auth/access';
 import { contactSql, taskVisibilitySql } from './task-access';
+import { taskShownSql } from './task-shown';
 import { defaultTaskType } from '../task_type/default-task-type';
 
 const PLAIN_DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -80,7 +81,7 @@ const PAST_GRACE_MS = 5 * 60_000;
 
 const WEEKDAYS = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
 
-/** "пт 20.11.2026 10:00" in the server's zone (Asia/Karachi); without the time for an all-day task. */
+/** "пт 20.11.2026 10:00" in the CRM's zone (TZ, Asia/Tashkent by default); without the time for an all-day task. */
 export function taskStamp(value: Date | string, withTime = true): string {
   const d = new Date(value);
   const pad = (n: number) => String(n).padStart(2, '0');
@@ -250,10 +251,8 @@ export class TaskService {
         qb = qb.andWhere('t0.closed_at IS NULL');
     }
 
-    // Tasks of (soft) deleted deals stay in the database, but are not listed
-    qb = qb.andWhere(
-      'NOT EXISTS (SELECT 1 FROM deal dd WHERE dd.id = t0.deal_id AND dd.deleted_at IS NOT NULL)',
-    );
+    // Tasks of a deal, company or contact in the trash stay in the database, but are not listed (task-shown.ts)
+    qb = qb.andWhere(taskShownSql('t0'));
 
     const visible = taskVisibilitySql(user, 't0');
     if (visible) {
